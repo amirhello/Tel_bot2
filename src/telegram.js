@@ -80,3 +80,29 @@ export async function downloadFile(token, fileId) {
   if (!res.ok) throw new Error("file download failed");
   return new Uint8Array(await res.arrayBuffer());
 }
+
+/**
+ * Send an audio file so it plays in the chat. WAV is not a format every client likes for
+ * `sendAudio`, so a refusal falls back to `sendDocument` — the user still gets the sound.
+ */
+export async function sendAudioFile(token, chatId, bytes, fileName, mime, replyTo) {
+  const blob = () => new Blob([bytes], { type: mime });
+
+  const post = (method, field) => {
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    if (replyTo) form.append("reply_parameters", JSON.stringify({ message_id: replyTo, allow_sending_without_reply: true }));
+    form.append(field, blob(), fileName);
+    return fetch(api(token, method), { method: "POST", body: form })
+      .then((r) => r.json())
+      .catch(() => null);
+  };
+
+  const first = await post("sendAudio", "audio");
+  if (first?.ok) return first;
+
+  const second = await post("sendDocument", "document");
+  if (second?.ok) return second;
+
+  throw new Error(`sendAudio failed: ${first?.description ?? second?.description ?? "unknown"}`);
+}

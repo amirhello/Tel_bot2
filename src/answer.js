@@ -4,9 +4,10 @@ import { appendArchive, archiveRecord } from "archive";
 import { PoolExhausted, complete } from "llm";
 import { collectMedia } from "media";
 import { DEFAULT_PERSONAS, buildSystemPrompt, buildUserContent, replyContext } from "prompt";
-import { botId, sendChatAction, sendLong, sendText } from "telegram";
+import { botId, sendAudioFile, sendChatAction, sendLong, sendText } from "telegram";
 import { isCommand, isSupportedChat, shouldAnswer } from "trigger";
 import { bumpStats, loadConfig, loadStats, usedToday } from "store";
+import { speak } from "voice";
 const ERRORS = [
   "الان یه کم درگیرم. یه بار دیگه بفرست، شاید سر جا شد.",
   "یه چیزی قاطی شد. دوباره بزن، درستش می‌کنم.",
@@ -23,7 +24,8 @@ const HELP =
   "سلام، من **سید** هستم.\n\n" +
   "• توی گروه کافیه کلمه **سید** رو توی پیامت بنویسی.\n" +
   "• یا روی هر پیامی ریپلای کنی و بنویسی «سید این چی میگه؟» تا همون پیام رو برات بخونم.\n" +
-  "• عکس، ویدیو و ویس هم می‌فهمم، اگر خیلی سنگین نباشه.\n\n" +
+  "• عکس، ویدیو و ویس هم می‌فهمم، اگر خیلی سنگین نباشه.\n" +
+  "• به **ویس نوت**‌ها جواب **صوتی** می‌دهم.\n\n" +
   "I'm __MODE__ mode right now.";
 
 const jobs = new Map();
@@ -143,9 +145,24 @@ async function reply(env, msg, cfg) {
     maxTokens: cfg.maxTokens,
   });
 
+  // A voice note deserves a voice back: the text answer above becomes a Live API turn
+  // and comes back as audio. Anything that goes wrong here is caught by processMessage
+  // and reported with one of the friendly ERRORS — never with a silent gap.
+  if (voiceReply(msg, cfg)) {
+    const wav = await speak(env, cfg, answer);
+    await sendChatAction(token, chatId, "upload_voice");
+    await sendAudioFile(token, chatId, wav, "sayyad.wav", "audio/wav", msg.message_id);
+    await bumpStats(env, { replies: 1 });
+    return;
+  }
+
   await sendLong(token, chatId, answer, msg.message_id);
   await bumpStats(env, { replies: 1 });
 }
+
+/** Voice notes are answered with voice — unless either switch (input or voice) is off. */
+const voiceReply = (msg, cfg) =>
+  !!msg.voice && cfg.media?.audio?.enabled !== false && cfg.voice?.enabled !== false;
 
 /** Refuse politely once the daily budget is gone, and never call the model. */
 async function overDailyCap(env, cfg, msg) {
