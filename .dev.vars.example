@@ -1,0 +1,9 @@
+# Local development only — never deploy this file.
+# Copy to `.dev.vars` and fill in. `npx wrangler dev` reads it automatically.
+TELEGRAM_BOT_TOKEN=123456:replace-me
+OPENROUTER_API_KEY=sk-or-v1-replace-me
+ADMIN_PASSWORD=choose-a-password
+
+# Optional, only for nicer OpenRouter dashboard labels.
+# OPENROUTER_HTTP_REFERER=https://your-site.example
+# OPENROUTER_APP_TITLE=Sayyad

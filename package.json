@@ -1,0 +1,18 @@
+{
+  "name": "sayyad-bot",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Sayyad — a modular Telegram bot on Cloudflare Workers, Gemini + any OpenAI-compatible provider",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node build.mjs && node test/run-all.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "secret": "wrangler secret put",
+    "kv:create": "wrangler kv namespace create CONFIG"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
