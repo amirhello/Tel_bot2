@@ -132,7 +132,24 @@ const voiceNote = (over = {}) => ({
 
 await t("spokenText strips markdown down to words", () => {
   const s = spokenText("## عنوان\n**سلام** [دنیا](https://x) `کد` و\n- گزینه\n```\nکد\n```");
-  assert.equal(s, "عنوان سلام دنیا کد و گزینه");
+  assert.equal(s, "عنوان سلام دنیا کد و گزینه کد");
+});
+
+await t("spokenText keeps fenced code readable instead of swallowing it", () => {
+  assert.equal(spokenText("ببین ```\nconsole.log(1)\n``` خب"), "ببین console.log(1) خب");
+});
+
+await t("a per-call timeout wins over the module default", async () => {
+  setup(() => {});
+  await assert.rejects(() => speak(env({ GEMINI_API_KEY: "k" }), {}, "x", { timeoutMs: 50 }), /timed out/);
+  // the default is untouched: a later call still waits the full 25 s budget... briefly
+  setLiveTimeout(40);
+  try {
+    setup(() => {});
+    await assert.rejects(() => speak(env({ GEMINI_API_KEY: "k" }), {}, "x"), /timed out/);
+  } finally {
+    setLiveTimeout(25_000);
+  }
 });
 
 await t("spokenText never grows past the spoken limit", () => {

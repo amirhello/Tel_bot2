@@ -34,7 +34,7 @@ export function setLiveTimeout(ms) {
  */
 export function spokenText(text) {
   return String(text ?? "")
-    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/```/g, " ")
     .replace(/`([^`]*)`/g, "$1")
     .replace(/\*\*([^*]+)\*\*/g, "$1")
     .replace(/__([^_]+)__/g, "$1")
@@ -103,12 +103,14 @@ function base64Bytes(b64) {
  * A turn that produced *some* audio but died before `turnComplete` still counts as a
  * success — a slightly short answer beats an error message.
  */
-export async function speak(env, cfg, text) {
+export async function speak(env, cfg, text, opts = {}) {
   const key = env.GEMINI_API_KEY;
   if (!key) throw new Error("live voice: GEMINI_API_KEY is not set");
 
   const words = spokenText(text);
   if (!words) throw new Error("live voice: nothing to say");
+
+  const timeoutMs = opts.timeoutMs ?? liveTimeoutMs;
 
   const model = cfg?.voice?.model || DEFAULT_MODEL;
   const res = await fetch(`${LIVE_ENDPOINT}?key=${encodeURIComponent(key)}`, {
@@ -138,7 +140,7 @@ export async function speak(env, cfg, text) {
 
     const hardTimer = setTimeout(
       () => finish(chunks.length ? null : new Error("live voice: timed out"), chunks.length ? pcmToWav(concat(chunks)) : undefined),
-      liveTimeoutMs,
+      timeoutMs,
     );
 
     /** The turn is over when the server says so, or when the audio goes quiet. */

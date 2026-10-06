@@ -18,6 +18,10 @@ const ERRORS = [
 const RATE_LIMITED = "سقف درخواست پر شد. چند دقیقه صبر کن و دوباره بفرست.";
 const DAILY_LIMIT = "امروز از سقف روزانه‌ام رد شدیم. فردا دوباره در خدمتم.";
 
+// Speaking runs late in the waitUntil window, so cap it well below the 30 s budget:
+// the WAV upload afterwards needs a few seconds of its own.
+const VOICE_BUDGET_MS = 26_000;
+
 const MODE_NAME = { rude: "Savage", polite: "Polite", smart: "Know-it-all" };
 
 const HELP =
@@ -149,9 +153,20 @@ async function reply(env, msg, cfg) {
   // and comes back as audio. Anything that goes wrong here is caught by processMessage
   // and reported with one of the friendly ERRORS — never with a silent gap.
   if (voiceReply(msg, cfg)) {
-    const wav = await speak(env, cfg, answer);
-    await sendChatAction(token, chatId, "upload_voice");
-    await sendAudioFile(token, chatId, wav, "sayyad.wav", "audio/wav", msg.message_id);
+    const startAt = Date.now();
+    const elapsed = () => Date.now() - startAt;
+    // Telegram's indicator dies after ~5 s, so heartbeat one until the audio ships —
+    // the upload itself can take a few seconds on a big file.
+    const keep = setInterval(() => sendChatAction(token, chatId, "upload_voice").catch(() => {}), 4000);
+    try {
+      // Speaking costs wall-clock too: bail out well before waitUntil ends (30 s), or the
+      // worker is killed mid-sentence and the user gets nothing at all.
+      if (elapsed() > VOICE_BUDGET_MS) throw new Error("live voice: over the time budget");
+      const wav = await speak(env, cfg, answer, { timeoutMs: Math.max(3000, VOICE_BUDGET_MS - elapsed()) });
+      await sendAudioFile(token, chatId, wav, "sayyad.wav", "audio/wav", msg.message_id);
+    } finally {
+      clearInterval(keep);
+    }
     await bumpStats(env, { replies: 1 });
     return;
   }

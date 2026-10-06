@@ -1789,7 +1789,7 @@ function setLiveTimeout(ms) {
  */
 function spokenText(text) {
   return String(text ?? "")
-    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/```/g, " ")
     .replace(/`([^`]*)`/g, "$1")
     .replace(/\*\*([^*]+)\*\*/g, "$1")
     .replace(/__([^_]+)__/g, "$1")
@@ -1858,12 +1858,14 @@ function base64Bytes(b64) {
  * A turn that produced *some* audio but died before `turnComplete` still counts as a
  * success — a slightly short answer beats an error message.
  */
-async function speak(env, cfg, text) {
+async function speak(env, cfg, text, opts = {}) {
   const key = env.GEMINI_API_KEY;
   if (!key) throw new Error("live voice: GEMINI_API_KEY is not set");
 
   const words = spokenText(text);
   if (!words) throw new Error("live voice: nothing to say");
+
+  const timeoutMs = opts.timeoutMs ?? liveTimeoutMs;
 
   const model = cfg?.voice?.model || DEFAULT_MODEL;
   const res = await fetch(`${LIVE_ENDPOINT}?key=${encodeURIComponent(key)}`, {
@@ -1893,7 +1895,7 @@ async function speak(env, cfg, text) {
 
     const hardTimer = setTimeout(
       () => finish(chunks.length ? null : new Error("live voice: timed out"), chunks.length ? pcmToWav(concat(chunks)) : undefined),
-      liveTimeoutMs,
+      timeoutMs,
     );
 
     /** The turn is over when the server says so, or when the audio goes quiet. */
@@ -1993,6 +1995,10 @@ const ERRORS = [
 /** 429 means slow down, whoever the provider is. */
 const RATE_LIMITED = "سقف درخواست پر شد. چند دقیقه صبر کن و دوباره بفرست.";
 const DAILY_LIMIT = "امروز از سقف روزانه‌ام رد شدیم. فردا دوباره در خدمتم.";
+
+// Speaking runs late in the waitUntil window, so cap it well below the 30 s budget:
+// the WAV upload afterwards needs a few seconds of its own.
+const VOICE_BUDGET_MS = 26_000;
 
 const MODE_NAME = { rude: "Savage", polite: "Polite", smart: "Know-it-all" };
 
@@ -2125,9 +2131,20 @@ async function reply(env, msg, cfg) {
   // and comes back as audio. Anything that goes wrong here is caught by processMessage
   // and reported with one of the friendly ERRORS — never with a silent gap.
   if (voiceReply(msg, cfg)) {
-    const wav = await speak(env, cfg, answer);
-    await sendChatAction(token, chatId, "upload_voice");
-    await sendAudioFile(token, chatId, wav, "sayyad.wav", "audio/wav", msg.message_id);
+    const startAt = Date.now();
+    const elapsed = () => Date.now() - startAt;
+    // Telegram's indicator dies after ~5 s, so heartbeat one until the audio ships —
+    // the upload itself can take a few seconds on a big file.
+    const keep = setInterval(() => sendChatAction(token, chatId, "upload_voice").catch(() => {}), 4000);
+    try {
+      // Speaking costs wall-clock too: bail out well before waitUntil ends (30 s), or the
+      // worker is killed mid-sentence and the user gets nothing at all.
+      if (elapsed() > VOICE_BUDGET_MS) throw new Error("live voice: over the time budget");
+      const wav = await speak(env, cfg, answer, { timeoutMs: Math.max(3000, VOICE_BUDGET_MS - elapsed()) });
+      await sendAudioFile(token, chatId, wav, "sayyad.wav", "audio/wav", msg.message_id);
+    } finally {
+      clearInterval(keep);
+    }
     await bumpStats(env, { replies: 1 });
     return;
   }
