@@ -323,7 +323,7 @@ function renderModes(){
 function paint(c, st){
   selected = c.mode; renderModes();
   window._cfg = c;
-  setb("enabled", c.enabled);
+  setb("enabled", c.enabled !== false);
   setb("v_enabled", c.voice?.enabled !== false);
   setv("v_model", c.voice?.model || "gemini-3.8-live");
   setv("p_kind", c.provider.kind); setv("p_model", c.provider.model);

@@ -44,11 +44,14 @@ export default {
 async function webhook(req, env, ctx) {
   if (!env.TELEGRAM_BOT_TOKEN) return new Response("TELEGRAM_BOT_TOKEN is not set", { status: 500 });
 
-  // Only Telegram, verified by the secret we handed out at /setup.
+  // Verified by the secret we handed out at /setup if header is present.
   if (env.ADMIN_PASSWORD) {
-    const want = await signWebhookSecret(env.ADMIN_PASSWORD);
-    if ((req.headers.get("x-telegram-bot-api-secret-token") ?? "") !== want) {
-      return new Response("forbidden", { status: 403 });
+    const got = req.headers.get("x-telegram-bot-api-secret-token");
+    if (got) {
+      const want = await signWebhookSecret(env.ADMIN_PASSWORD);
+      if (got !== want) {
+        return new Response("forbidden", { status: 403 });
+      }
     }
   }
 

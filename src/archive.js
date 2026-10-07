@@ -44,6 +44,7 @@ export function mediaKind(msg) {
 
 export async function readArchive(env) {
   try {
+    if (!env?.CONFIG) return [];
     const raw = await env.CONFIG.get(ARCHIVE_KEY, "json");
     return Array.isArray(raw) ? raw : [];
   } catch {
@@ -54,6 +55,7 @@ export async function readArchive(env) {
 /** Prepend a record and drop the oldest past the limit. Never throws. */
 export async function appendArchive(env, record) {
   try {
+    if (!env?.CONFIG) return;
     const items = await readArchive(env);
     items.unshift(record);
     await env.CONFIG.put(ARCHIVE_KEY, JSON.stringify(items.slice(0, ARCHIVE_LIMIT)));

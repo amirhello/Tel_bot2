@@ -9,8 +9,8 @@ workers_dev = true
 
 # ---------------------------------------------------------------- vars
 [vars]
-# Base64 of a 1x1 PNG, used by /diag to check the image path.
-DIAG_IMAGE = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+# Base64 of a 16x16 PNG, used by /diag to check the image path.
+DIAG_IMAGE = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAFklEQVR4nGNwa9pCEmIY1TCqYfhqAACXG3wQdHVYSAAAAABJRU5ErkJggg=="
 
 # ---------------------------------------------------------------- secrets
 # These live in Cloudflare, not in this file.

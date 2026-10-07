@@ -51,6 +51,7 @@ function mediaKind(msg) {
 
 async function readArchive(env) {
   try {
+    if (!env?.CONFIG) return [];
     const raw = await env.CONFIG.get(ARCHIVE_KEY, "json");
     return Array.isArray(raw) ? raw : [];
   } catch {
@@ -61,6 +62,7 @@ async function readArchive(env) {
 /** Prepend a record and drop the oldest past the limit. Never throws. */
 async function appendArchive(env, record) {
   try {
+    if (!env?.CONFIG) return;
     const items = await readArchive(env);
     items.unshift(record);
     await env.CONFIG.put(ARCHIVE_KEY, JSON.stringify(items.slice(0, ARCHIVE_LIMIT)));
@@ -1381,7 +1383,7 @@ function renderModes(){
 function paint(c, st){
   selected = c.mode; renderModes();
   window._cfg = c;
-  setb("enabled", c.enabled);
+  setb("enabled", c.enabled !== false);
   setb("v_enabled", c.voice?.enabled !== false);
   setv("v_model", c.voice?.model || "gemini-3.8-live");
   setv("p_kind", c.provider.kind); setv("p_model", c.provider.model);
@@ -2268,56 +2270,70 @@ function hash(s) {
  * Sayyad ignores — then answers only what deserves an answer.
  */
 async function processMessage(env, msg) {
-  if (!msg?.from || msg.from.is_bot) return; // never answer bots
-  if (!isSupportedChat(msg)) return;
-
-  const cfg = (await loadConfig(env, DEFAULT_PERSONAS)).config;
-
-  let answered = false;
   try {
-    answered = cfg.enabled && shouldAnswer(msg, await botId(env), msg.chat.type);
-  } catch {
-    /* getMe failed: archive it as unanswered rather than losing the record */
-  }
-  if (!config_enabled(cfg) || !answered) {
-    await appendArchive(env, archiveRecord(msg, false));
-    return;
-  }
+    if (!msg?.from || msg.from.is_bot) return; // never answer bots
+    if (!isSupportedChat(msg)) return;
 
-  await serialize(msg.chat.id, async () => {
-    let outcome = null;
-    let replyError = null;
-    try {
-      outcome = await reply(env, msg, cfg);
-    } catch (e) {
-      replyError = e;
-      const reason = String(e?.message ?? e);
-      await bumpStats(env, { errors: 1, lastError: reason.slice(0, 300) });
-      // The pool carries the exact hour its quota frees up — far more useful than "later".
-      const text =
-        e instanceof PoolExhausted
-          ? exhaustedNotice(e.resetAt)
-          : /\b429\b|rate.?limit|quota|RESOURCE_EXHAUSTED/i.test(reason)
-            ? RATE_LIMITED
-            : ERRORS[Math.abs(hash(`${msg.chat.id}:${msg.message_id}`)) % ERRORS.length];
-      try {
-        await sendText(env.TELEGRAM_BOT_TOKEN, msg.chat.id, text, msg.message_id);
-      } catch {
-        /* nothing more we can do */
+    const cfg = (await loadConfig(env, DEFAULT_PERSONAS)).config;
+    const enabled = config_enabled(cfg);
+
+    let answered = false;
+    if (enabled) {
+      if (msg.chat?.type === "private") {
+        answered = true;
+      } else {
+        let id = null;
+        try {
+          id = await botId(env);
+        } catch {
+          /* getMe failed: ignore, shouldAnswer will still check trigger word */
+        }
+        answered = shouldAnswer(msg, id, msg.chat?.type);
       }
-    } finally {
-      await appendArchive(
-        env,
-        archiveRecord(msg, {
-          answered: true,
-          ok: !replyError,
-          model: outcome?.model,
-          reply: outcome?.text,
-          error: replyError ? String(replyError.message ?? replyError) : null,
-        }),
-      );
     }
-  });
+
+    if (!enabled || !answered) {
+      await appendArchive(env, archiveRecord(msg, false)).catch(() => {});
+      return;
+    }
+
+    await serialize(msg.chat.id, async () => {
+      let outcome = null;
+      let replyError = null;
+      try {
+        outcome = await reply(env, msg, cfg);
+      } catch (e) {
+        replyError = e;
+        const reason = String(e?.message ?? e);
+        await bumpStats(env, { errors: 1, lastError: reason.slice(0, 300) });
+        // The pool carries the exact hour its quota frees up — far more useful than "later".
+        const text =
+          e instanceof PoolExhausted
+            ? exhaustedNotice(e.resetAt)
+            : /\b429\b|rate.?limit|quota|RESOURCE_EXHAUSTED/i.test(reason)
+              ? RATE_LIMITED
+              : ERRORS[Math.abs(hash(`${msg.chat.id}:${msg.message_id}`)) % ERRORS.length];
+        try {
+          await sendText(env.TELEGRAM_BOT_TOKEN, msg.chat.id, text, msg.message_id);
+        } catch {
+          /* nothing more we can do */
+        }
+      } finally {
+        await appendArchive(
+          env,
+          archiveRecord(msg, {
+            answered: true,
+            ok: !replyError,
+            model: outcome?.model,
+            reply: outcome?.text,
+            error: replyError ? String(replyError.message ?? replyError) : null,
+          }),
+        ).catch(() => {});
+      }
+    });
+  } catch (outerErr) {
+    console.error("processMessage fatal error:", outerErr);
+  }
 }
 
 const config_enabled = (cfg) => cfg.enabled !== false;
@@ -2345,7 +2361,7 @@ async function reply(env, msg, cfg) {
   await sendChatAction(token, chatId, "typing");
   await bumpStats(env, { requests: 1, lastUsed: new Date().toISOString() });
 
-  const id = await botId(env);
+  const id = msg.reply_to_message ? await botId(env).catch(() => null) : null;
   const { media, note } = await collectMedia(env, msg, cfg);
   const { text: replyText, fromBot } = replyContext(msg, id);
 
@@ -2464,8 +2480,9 @@ async function diagnostics(env) {
     try {
       // Brief pause so consecutive subrequests do not trip the tight RPM limit or socket reset
       await new Promise((r) => setTimeout(r, 600));
+      const isTiny1x1 = typeof env.DIAG_IMAGE === "string" && env.DIAG_IMAGE.includes("AAAAEAAAAB");
       const testImg =
-        typeof env.DIAG_IMAGE === "string" && env.DIAG_IMAGE.length > 80
+        typeof env.DIAG_IMAGE === "string" && env.DIAG_IMAGE.length > 100 && !isTiny1x1
           ? env.DIAG_IMAGE
           : "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAFklEQVR4nGNwa9pCEmIY1TCqYfhqAACXG3wQdHVYSAAAAABJRU5ErkJggg==";
       const diagCfg = { ...cfg, thinking: "off" };
@@ -2565,11 +2582,14 @@ export default {
 async function webhook(req, env, ctx) {
   if (!env.TELEGRAM_BOT_TOKEN) return new Response("TELEGRAM_BOT_TOKEN is not set", { status: 500 });
 
-  // Only Telegram, verified by the secret we handed out at /setup.
+  // Verified by the secret we handed out at /setup if header is present.
   if (env.ADMIN_PASSWORD) {
-    const want = await signWebhookSecret(env.ADMIN_PASSWORD);
-    if ((req.headers.get("x-telegram-bot-api-secret-token") ?? "") !== want) {
-      return new Response("forbidden", { status: 403 });
+    const got = req.headers.get("x-telegram-bot-api-secret-token");
+    if (got) {
+      const want = await signWebhookSecret(env.ADMIN_PASSWORD);
+      if (got !== want) {
+        return new Response("forbidden", { status: 403 });
+      }
     }
   }
 

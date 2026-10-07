@@ -54,8 +54,9 @@ export async function diagnostics(env) {
     try {
       // Brief pause so consecutive subrequests do not trip the tight RPM limit or socket reset
       await new Promise((r) => setTimeout(r, 600));
+      const isTiny1x1 = typeof env.DIAG_IMAGE === "string" && env.DIAG_IMAGE.includes("AAAAEAAAAB");
       const testImg =
-        typeof env.DIAG_IMAGE === "string" && env.DIAG_IMAGE.length > 80
+        typeof env.DIAG_IMAGE === "string" && env.DIAG_IMAGE.length > 100 && !isTiny1x1
           ? env.DIAG_IMAGE
           : "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAFklEQVR4nGNwa9pCEmIY1TCqYfhqAACXG3wQdHVYSAAAAABJRU5ErkJggg==";
       const diagCfg = { ...cfg, thinking: "off" };
