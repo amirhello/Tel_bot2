@@ -1,7 +1,7 @@
 // ============================================================================
 //  Sayyad — Telegram bot on Cloudflare Workers
 //  GENERATED FILE. Do not edit by hand: edit ./src and run "node build.mjs".
-//  Module order, resolved from the import graph: archive.js, text.js, trigger.js, prompt.js, store.js, admin.js, http.js, providerGemini.js, providerOpenai.js, llm.js, telegram.js, media.js, voice.js, answer.js, tools.js, index.js
+//  Module order, resolved from the import graph: archive.js, http.js, store.js, providerGemini.js, providerOpenai.js, llm.js, text.js, trigger.js, prompt.js, admin.js, telegram.js, media.js, voice.js, answer.js, tools.js, index.js
 // ============================================================================
 
 // ------------------------------ src/archive.js ------------------------------
@@ -60,234 +60,92 @@ async function appendArchive(env, record) {
   }
 }
 
-// ------------------------------ src/text.js ------------------------------
-// Pure text helpers. No I/O, no bindings, no imports.
+// ------------------------------ src/http.js ------------------------------
+// Shared HTTP plumbing for every provider. Keeping it separate means the provider modules
+// depend on this, not on each other, and the dispatcher never has to import them back.
 
-/** Escape text for Telegram HTML parse_mode. */
-function esc(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+/** An HTTP failure that carries its status, so callers can tell 400 from 429. */
+class ApiError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
 }
 
 /**
- * Convert the limited markdown a model emits (**bold**, *italic*, `code`, ```block```)
- * into Telegram HTML. Code is lifted out first so it is escaped exactly once.
+ * Failures worth another go. 0 means the request never got an answer (DNS, TLS, a
+ * dropped socket) — retrying that is free. 429 and 5xx are the provider saying "not right
+ * now", which is exactly what a short pause fixes.
+ *
+ * Deliberately NOT here: 400, 401, 403, 404, 422. Those never resolve themselves, and
+ * retrying only burns latency and quota.
  */
-function mdToHtml(md) {
-  const slots = [];
-  const keep = (rendered) => {
-    slots.push(rendered);
-    return `\u0000S${slots.length - 1}\u0000`;
-  };
+const TRANSIENT = new Set([0, 408, 429, 500, 502, 503, 504]);
 
-  let s = String(md ?? "");
+/** Default retry policy: anything that looks temporary. */
+const isTransient = (e) => TRANSIENT.has(e.status);
 
-  s = s.replace(/```[a-zA-Z0-9]*\n?([\s\S]*?)```/g, (_m, code) =>
-    keep(`<pre><code>${esc(code.replace(/\n$/, ""))}</code></pre>`));
-  s = s.replace(/`([^`\n]+)`/g, (_m, code) => keep(`<code>${esc(code)}</code>`));
+/** Waits between attempts. Sleeping costs no CPU on Workers, only wall-clock time. */
+const DEFAULT_BACKOFF = [700, 2000];
 
-  s = esc(s);
-  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
-  s = s.replace(/(^|[^*\w\\])\*([^*\n]+)\*/g, "$1<i>$2</i>");
-  s = s.replace(/(^|[^_\w\\])_([^_\n]+)_/g, "$1<i>$2</i>");
-  s = s.replace(/^#{1,6}\s*(.+)$/gm, "<b>$1</b>");
-  s = s.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, "$1 ($2)");
-  s = s.replace(/\u0000S(\d+)\u0000/g, (_m, i) => slots[Number(i)]);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  return s.trim();
-}
-
-/** Split a long reply into Telegram-sized chunks, preferring line then word boundaries. */
-function splitText(text, limit = 3900) {
-  const out = [];
-  let rest = String(text ?? "").trim();
-  if (!rest) return [""];
-
-  while (rest.length > limit) {
-    let cut = rest.lastIndexOf("\n", limit);
-    if (cut < limit * 0.5) cut = rest.lastIndexOf(" ", limit);
-    if (cut < limit * 0.3) cut = limit;
-    out.push(rest.slice(0, cut).trimEnd());
-    rest = rest.slice(cut).replace(/^\s+/, "");
-  }
-  out.push(rest);
-  return out.filter((p) => p.length);
-}
+const errorMessage = (json, text) =>
+  json?.error?.message ?? json?.error?.error?.message ?? json?.error?.status ?? String(text ?? "").slice(0, 200);
 
 /**
- * Normalise Persian/Arabic so the trigger word matches however it was typed:
- * ي -> ی, ك -> ک, drop tashkeel and tatweel, strip ZWNJ.
+ * POST JSON, parse the reply, and retry a transient failure a couple of times.
+ *
+ * `retries` is extra attempts, so the default sends at most 3 requests. `retryOn` lets a
+ * caller refine the policy — Gemini passes one that keeps a spent daily quota from being
+ * retried three times per model, which would burn the whole pool to learn what we already
+ * read in the first message. A non-JSON body still throws with its real status, so a
+ * Cloudflare HTML block page reads as 403 and is not retried into oblivion.
  */
-function normalizeFa(s) {
-  return String(s ?? "")
-    .replace(/[\u0610-\u061A\u0640\u064B-\u065F\u0670\u06D6-\u06ED]/g, "")
-    .replace(/[\u0649\u064A]/g, "\u06CC")
-    .replace(/\u0643/g, "\u06A9")
-    .replace(/[\u06AA\u06AB]/g, "\u06A9")
-    .replace(/[\u200C\u200E\u200F]/g, " ");
-}
+async function callJson(url, { headers, body, retries = 2, backoff = DEFAULT_BACKOFF, retryOn = isTransient }) {
+  const attempts = Math.max(0, retries) + 1;
+  let last;
 
-/** Base64-encode bytes in chunks, so a multi-megabyte buffer cannot blow the stack. */
-function toBase64(bytes) {
-  let bin = "";
-  const CH = 0x8000;
-  for (let i = 0; i < bytes.length; i += CH) {
-    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
-  }
-  return btoa(bin);
-}
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) await sleep(backoff[Math.min(attempt - 1, backoff.length - 1)]);
 
-function clampInt(v, min, max, fallback) {
-  const n = Number.parseInt(v, 10);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.min(max, Math.max(min, n));
-}
+    let error;
+    try {
+      const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+      const text = await res.text();
 
-function truncate(s, n) {
-  s = String(s ?? "");
-  return s.length > n ? s.slice(0, n) + "…" : s;
-}
+      let json;
+      let parsed = false;
+      try {
+        json = JSON.parse(text);
+        parsed = true;
+      } catch {
+        /* an HTML error page, a proxy timeout, a truncated body */
+      }
 
-/** A one-line preview for collapsed list rows. */
-function preview(s, n = 90) {
-  return String(s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
-}
+      if (parsed && res.ok && !json?.error) return json;
 
-// ------------------------------ src/trigger.js ------------------------------
-// Decides when the bot speaks, and recognises its commands.
+      error = parsed
+        ? new ApiError(`API ${res.status}: ${errorMessage(json, text)}`, res.status)
+        : new ApiError(`API returned non-JSON (${res.status}): ${text.slice(0, 200)}`, res.status);
+    } catch (e) {
+      if (e instanceof ApiError) throw e;
+      error = new ApiError(`network error: ${String(e?.message ?? e)}`, 0);
+    }
 
-
-
-const TRIGGER = "سید";
-
-const CHAT_TYPES = new Set(["private", "group", "supergroup"]);
-
-function isSupportedChat(msg) {
-  return Boolean(msg?.chat) && CHAT_TYPES.has(msg.chat.type);
-}
-
-function isCommand(text) {
-  const m = /^\/(start|help|ping)(@\S+)?/i.exec(String(text ?? "").trim());
-  return m ? m[1].toLowerCase() : null;
-}
-
-/** Groups: only when the wake word appears, or when Sayyad itself is replied to. */
-function shouldAnswer(msg, botId, chatType) {
-  if (chatType === "private") return true;
-  const text = normalizeFa(msg.text || msg.caption || "");
-  if (text.includes(TRIGGER)) return true;
-  if (msg.reply_to_message?.from?.id === botId) return true;
-  return false;
-}
-
-// ------------------------------ src/prompt.js ------------------------------
-// Personas and prompt assembly.
-//
-// The prompt is built in a provider-neutral shape: plain text plus a list of media parts.
-// Each provider module translates that shape into its own wire format.
-
-
-
-
-const REPLY_TEXT_LIMIT = 3000;
-
-const MODES = ["polite", "smart", "rude"];
-
-const MODE_LABELS = {
-  polite: "Polite",
-  smart: "Know-it-all",
-  rude: "Savage / sarcastic",
-};
-
-const BASE_RULES = `تو «سید» هستی، یک ربات تلگرام. اسم تو سید است.
-
-قوانین پایه (همیشه):
-- به همان زبانی جواب بده که کاربر نوشته است (فارسی یا انگلیسی).
-- کوتاه جواب بده. اگر موضوع پیچیده است، اول جواب مستقیم، بعد نکات کلیدی. الکی حاشیه نرو.
-- از مارک‌داون سبک استفاده کن: **بولد** برای تاکید و «- » برای بولت.
-- هرگز پیام خودت را تکرار نکن و هرگز نقش کاربر را بازی نکن.
-- اگر چیزی را نمی‌دانی یا مطمئن نیستی، صادقانه بگو و حدس الکی نزن.
-- حافظه‌ای از پیام‌های قبلی نداری؛ فقط چیزی را می‌بینی که در همین درخواست برایت فرستاده شده.
-- اگر کاربر فقط کلمه «سید» یا یک سلام بی‌حرف و معنی نوشته و درخواست مشخصی ندارد، یک جمله‌ی باحال، کوتاه و پرانرژی بگو که بپرسد چه می‌خواهد — یک سوال جالب، یا یک تیکه‌ی کوتاه. این جمله هرگز نباید تکراری و خشک باشد.`;
-
-const DEFAULT_PERSONAS = {
-  polite: `شخصیت: «ادب» — آرام، محترم، بی‌ادعا و خوش‌لحن. مثل یک آدم بالغ که با حوصله و احترام حرف می‌زند.
-- اول با یک احترام کوتاه جواب را شروع کن.
-- محترمانه و بدون شوخی تند بنویس.
-- اگر سؤال سختی بود، صبورانه و مرحله‌به‌مرحله توضیح بده.
-- هرگز توهین یا کنایه نکن.`,
-
-  smart: `شخصیت: «دانای کل» — باهوش، مغرور، مطمئن و اهل جزئیات. خودت را همه‌چیزدان می‌دانی و حرفت را هم می‌زنی.
-- جواب را با اعتماد به نفس بده، انگار هیچ ابهامی وجود ندارد.
-- ساختار: یک جمله‌ی جمع‌بندی، بعد نکات کلیدی به‌صورت بولت.
-- تحلیل عمیق و مثال مشخص بده، نه کلی‌گویی.
-- یک «نکته‌ی طلایی» در آخر اضافه کن که معمولاً کسی نمی‌گوید.
-- اگر چیزی را قطعاً نمی‌دانی، به‌جای حدس الکی، صریح بگو.`,
-
-  rude: `شخصیت: «بی‌رحم» — یک رفیق کوچه‌بازاری، بی‌شکل، بی‌پرده و پُر از فحش. زبانت دراز است و خجالت هم نمی‌کشد.
-- هر جواب با یک تیکه یا فحش کوتاه شروع می‌شود، بعد جواب واقعی.
-- فحش‌های رایج فارسی را بدون سانسور بریز: کصخل، بپاگیر، حروم‌زاده، گوه بخور، سگ‌وار، مغزکش، خارکصه، ای ساک.
-- هیچ‌وقت عذرخواهی نکن، هیچ‌وقت نگو «ببخشید»، هیچ‌وقت لحنت را نرم نکن.
-- اگر کسی گفت زیادی تند بود یا خواست مؤدب باشی، تندتر جواب بده و به ریشش بخند.
-- اگر سؤال جدی پرسید، اول یک تیکه بزن، بعد جواب درست را بده.
-- تیکه‌ات روی حرف و موضوع طرف بزن، نه روی خانواده و مذهب و ظاهرش.
-- هر پاسخ را با یک جمله‌ی ریش‌خنده‌دار تمام کن.
-- اگر کسی فقط «سید» نوشت، یک تیکه‌ی باحال بگو که بپرسد چه می‌خواهد.`,
-};
-
-/** Base rules + the selected persona + the admin's extra instructions. */
-function buildSystemPrompt(cfg) {
-  const persona = cfg.personas?.[cfg.mode] ?? DEFAULT_PERSONAS.smart;
-  const extra = String(cfg.extra ?? "").trim();
-  return [BASE_RULES, persona, extra ? `دستورهای اضافه‌ی مدیر:\n${extra}` : ""].filter(Boolean).join("\n\n");
-}
-
-/** The text of the message being replied to, if any. */
-function replyContext(msg, botId) {
-  const reply = msg.reply_to_message;
-  if (!reply) return { text: "", fromBot: false };
-  return {
-    text: truncate(reply.text || reply.caption || "", REPLY_TEXT_LIMIT),
-    fromBot: reply.from?.id === botId,
-  };
-}
-
-/**
- * Assemble the provider-neutral user turn.
- * Media arrives already encoded from the media module; nothing here knows a wire format.
- */
-function buildUserContent({ text, replyText, replyFromBot, media = [], note = "" }) {
-  const parts = [];
-
-  if (replyText) {
-    parts.push({
-      type: "text",
-      text: `${replyFromBot ? "پیام قبلی خودت" : "پیامی که کاربر به آن ریپلای کرده"}:\n> ${replyText}`,
-    });
+    if (!retryOn(error)) throw error;
+    last = error;
   }
 
-  parts.push(...media);
-  if (note) parts.push({ type: "text", text: note });
-
-  const q = String(text ?? "").trim();
-  const bare = q && normalizeFa(q) === TRIGGER;
-
-  let body;
-  if (bare) {
-    body = "کاربر فقط کلمه «سید» را صدا زده و هیچ درخواست مشخصی نکرده است.";
-  } else if (!q) {
-    body = replyText
-      ? "کاربر روی پیام بالا ریپلای کرده و توضیحی اضافه نکرده است."
-      : "کاربر پیامی بدون متن فرستاده و درخواست مشخصی ندارد.";
-  } else {
-    body = `پیام کاربر:\n> ${q}`;
-  }
-  parts.push({ type: "text", text: body });
-
-  return parts;
+  throw last;
 }
+
+/** A rejected request shape is worth retrying differently; 429 or 5xx must surface as-is. */
+const isShapeError = (e) => e instanceof ApiError && (e.status === 400 || e.status === 422);
+
+/** A missing credential is the only reason to try the other provider. */
+const isCredentialError = (e) => e instanceof ApiError && (e.status === 500 && /API key|secret/i.test(e.message));
 
 // ------------------------------ src/store.js ------------------------------
 // Everything that touches the KV namespace: config, stats and migration.
@@ -591,8 +449,611 @@ async function bumpStats(env, patch) {
   return next;
 }
 
+// ------------------------------ src/providerGemini.js ------------------------------
+// Gemini's native API — the only path that accepts video and audio.
+//
+// Wire format: { inlineData: { mimeType, data } } under
+// POST {baseUrl}/models/{model}:generateContent
+
+
+
+
+/** This model's daily quota is spent. Distinct from a per-minute 429: waiting does not help. */
+class DailyQuotaError extends ApiError {
+  constructor(model, message) {
+    super(message, 429);
+    this.name = "DailyQuotaError";
+    this.model = model;
+    this.resetAt = nextPacificMidnight();
+  }
+}
+
+/** This model's per-minute quota is spent (RPM/TPM). Parked for 60 seconds. */
+class MinuteQuotaError extends ApiError {
+  constructor(model, message, resetAt = Date.now() + 60_000) {
+    super(message, 429);
+    this.name = "MinuteQuotaError";
+    this.model = model;
+    this.resetAt = resetAt;
+  }
+}
+
+/** The provider does not know this model name. Never worth trying again today. */
+class UnknownModelError extends ApiError {
+  constructor(model, message) {
+    super(message, 404);
+    this.name = "UnknownModelError";
+    this.model = model;
+  }
+}
+
+/**
+ * "Requests per day" and "requests per minute" both surface as 429 but call for opposite
+ * reactions, so read the wording before deciding.
+ */
+function quotaKind(message) {
+  const m = String(message ?? "").toLowerCase();
+  if (/(?:^|[^a-z])(day|daily|rpd|24\s*h)(?:[^a-z]|$)/i.test(m)) return "day";
+  if (/(?:^|[^a-z])(minute|min|rpm|tpm)(?:[^a-z]|$)/i.test(m)) return "minute";
+  return "other";
+}
+
+/** Neutral part -> Gemini part. Everything binary becomes inlineData. */
+function toGeminiPart(part) {
+  if (part.type === "text") return { text: part.text };
+  if (part.type === "image" || part.type === "video" || part.type === "audio") {
+    return { inlineData: { mimeType: part.mime, data: part.data } };
+  }
+  return null;
+}
+
+/**
+ * thinkingConfig. Gemini 3 cannot be switched off, so "off" simply omits the block and
+ * lets the model use its own default.
+ */
+function thinkingConfig(cfg) {
+  if (!cfg.thinking || cfg.thinking === "off") return {};
+  return { thinkingConfig: { thinkingLevel: cfg.thinking, includeThoughts: false } };
+}
+
+function safetySettings(cfg) {
+  return Object.entries(SAFETY_CATEGORIES).map(([key, category]) => ({
+    category,
+    threshold: cfg.safety?.[key] ?? "BLOCK_NONE",
+  }));
+}
+
+function buildGeminiBody(cfg, { system, parts, maxTokens }, shape = {}) {
+  const body = {
+    systemInstruction: { parts: [{ text: system }] },
+    contents: [{ role: "user", parts: parts.map(toGeminiPart).filter(Boolean) }],
+    generationConfig: { maxOutputTokens: maxTokens, ...thinkingConfig(cfg) },
+  };
+  if (!shape.noThinking) body.generationConfig = { ...body.generationConfig, ...thinkingConfig(cfg) };
+  else delete body.generationConfig.thinkingConfig;
+  if (!shape.noSafety) body.safetySettings = safetySettings(cfg);
+  return body;
+}
+
+/** Gemini returns parts, not a single string; join every text part it produced. */
+function readGeminiText(data) {
+  const parts = data?.candidates?.[0]?.content?.parts ?? [];
+  return parts
+    .filter((p) => typeof p.text === "string" && !p.thought)
+    .map((p) => p.text)
+    .join("")
+    .trim();
+}
+
+/**
+ * A spent quota (day or minute) is not retried with backoff on the same model —
+ * we want to move on to the next model in the pool immediately.
+ */
+const retryableForGemini = (e) =>
+  isTransient(e) &&
+  quotaKind(e.message) !== "day" &&
+  quotaKind(e.message) !== "minute" &&
+  !/quota|resource_exhausted/i.test(e.message);
+
+/**
+ * Models differ in which knobs they accept — Gemma rejects thinkingConfig, some tiers
+ * refuse a custom safety level. Drop the optional blocks one at a time rather than
+ * letting the admin discover it as a broken bot.
+ */
+function shapes(cfg) {
+  const list = [{}];
+  if (cfg.thinking && cfg.thinking !== "off") list.push({ noThinking: true });
+  list.push({ noThinking: true, noSafety: true });
+  return list;
+}
+
+async function completeGemini(env, cfg, { system, parts, maxTokens }) {
+  const apiKey = env.GEMINI_API_KEY;
+  if (!apiKey) throw new ApiError("GEMINI_API_KEY secret is not set", 500);
+
+  const model = cfg.provider.model;
+  const url = `${cfg.provider.baseUrl}/models/${encodeURIComponent(model)}:generateContent`;
+  let last = new ApiError("model returned an empty answer");
+
+  for (const shape of shapes(cfg)) {
+    let data;
+    try {
+      data = await callJson(url, {
+        headers: { "x-goog-api-key": apiKey, "content-type": "application/json" },
+        body: buildGeminiBody(cfg, { system, parts, maxTokens }, shape),
+        retryOn: retryableForGemini,
+      });
+    } catch (e) {
+      if (e.status === 404) throw new UnknownModelError(model, `${model}: ${e.message}`);
+      const isQuota =
+        (e.status === 429 || e.status === 503) &&
+        (quotaKind(e.message) !== "other" || /quota|resource_exhausted/i.test(e.message));
+      if (isQuota) {
+        if (quotaKind(e.message) === "day") {
+          throw new DailyQuotaError(model, `${model}: ${e.message}`);
+        }
+        throw new MinuteQuotaError(model, `${model}: ${e.message}`);
+      }
+      // A rejected knob is worth retrying with fewer of them; anything else must surface.
+      if (!isShapeError(e) || shape === shapes(cfg).at(-1)) throw e;
+      last = e;
+      continue;
+    }
+
+    const text = readGeminiText(data);
+    if (text) return { text, usage: data.usageMetadata ?? null, model };
+
+    const blocked = data?.promptFeedback?.blockReason ?? data?.promptFeedback?.safetyRatings?.[0]?.category;
+    last = new ApiError(`Gemini returned no text${blocked ? ` (blocked: ${blocked})` : ""}`, 200);
+    break; // the request itself worked; another shape would change nothing
+  }
+
+  throw last;
+}
+
+// ------------------------------ src/providerOpenai.js ------------------------------
+// OpenAI-compatible providers: OpenRouter, justwoker, and Gemini's compatibility layer.
+//
+// Wire format: { type: "image_url" | "video_url" | "input_audio", ... }
+
+
+
+/** Neutral part -> OpenAI content part. */
+function toOpenAIPart(part) {
+  if (part.type === "text") return { type: "text", text: part.text };
+  if (part.type === "image") return { type: "image_url", image_url: { url: `data:${part.mime};base64,${part.data}` } };
+  if (part.type === "video") return { type: "video_url", video_url: { url: `data:${part.mime};base64,${part.data}` } };
+  if (part.type === "audio") return { type: "input_audio", input_audio: { data: part.data, format: audioFormat(part.mime) } };
+  return null;
+}
+
+function audioFormat(mime) {
+  const m = String(mime ?? "").toLowerCase();
+  if (m.includes("ogg")) return "ogg";
+  if (m.includes("wav")) return "wav";
+  if (m.includes("mpeg") || m.includes("mp3")) return "mp3";
+  return "wav";
+}
+
+/** Thinking hint, only when the config asks for one. */
+function thinkingBody(cfg) {
+  return cfg.thinking && cfg.thinking !== "off" ? { reasoning: { effort: cfg.thinking } } : {};
+}
+
+/** Retry shapes that some providers reject: the hint, then the newer field name. */
+function attempts(maxTokens, cfg) {
+  const list = [{ max_tokens: maxTokens }, { max_completion_tokens: maxTokens }];
+  if (cfg.thinking && cfg.thinking !== "off") list.unshift({ max_tokens: maxTokens, ...thinkingBody(cfg) });
+  return list;
+}
+
+async function completeOpenAI(env, cfg, { system, parts, maxTokens }) {
+  const apiKey = env.API_KEY || env.OPENROUTER_API_KEY;
+  if (!apiKey) throw new ApiError("no API key secret is set (API_KEY or OPENROUTER_API_KEY)", 500);
+
+  const messages = [
+    { role: "system", content: system },
+    { role: "user", content: parts.map(toOpenAIPart).filter(Boolean) },
+  ];
+
+  let last = new Error("model returned an empty answer");
+  for (const extra of attempts(maxTokens, cfg)) {
+    let data;
+    try {
+      data = await callJson(`${cfg.provider.baseUrl}/chat/completions`, {
+        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+        body: { model: cfg.provider.model, messages, ...extra },
+      });
+    } catch (e) {
+      if (!isShapeError(e)) throw e; // rate limit, auth, upstream failure — report it
+      last = e;
+      continue;
+    }
+
+    const text = readContent(data);
+    if (text) return { text, usage: data.usage ?? null, model: data.model ?? cfg.provider.model };
+    last = new Error("model returned an empty answer");
+    if (!extra.reasoning) break;
+  }
+  throw last;
+}
+
+const readContent = (data) =>
+  (data?.choices?.[0]?.message?.content ?? "")
+    .toString()
+    .replace(/<\s*think[\s\S]*?<\s*\/\s*think\s*>/g, "")
+    .trim();
+
+// ------------------------------ src/llm.js ------------------------------
+// Provider dispatcher. Picks the configured backend, walks a Gemini model pool when the
+// daily quota runs out, and falls back to the other provider when a key is missing.
+//
+// The rest of the bot never sees a provider-specific wire format: it hands over neutral
+// parts and gets back plain text.
+
+
+
+
+
+
+const PROVIDERS = { gemini: completeGemini, openai: completeOpenAI };
+
+/** In-memory parking for per-minute rate limits (RPM/TPM). Costs 0 KV writes. */
+const minuteQuota = new Map();
+
+function clearMinuteQuota() {
+  minuteQuota.clear();
+}
+
+function providerFor(cfg) {
+  const impl = PROVIDERS[cfg.provider?.kind];
+  if (!impl) throw new ApiError(`unknown provider "${cfg.provider?.kind}"`, 500);
+  return impl;
+}
+
+/** Describe what the configured provider will actually call. Shown by /diag. */
+function endpointOf(cfg, model = cfg.provider.model) {
+  const base = cfg.provider.baseUrl;
+  return cfg.provider.kind === "gemini"
+    ? `${base}/models/${encodeURIComponent(model)}:generateContent`
+    : `${base}/chat/completions`;
+}
+
+/**
+ * Walk the pool strongest-first. A model is parked until its quota returns; a real
+ * failure (bad prompt, outage) is not a quota problem and must not silently reroute.
+ * Returns the answer, or throws PoolExhausted when every model is spent for the day.
+ */
+async function runGeminiPool(env, cfg, payload) {
+  const pool = Array.isArray(cfg.provider.modelPool) && cfg.provider.modelPool.length
+    ? cfg.provider.modelPool
+    : [cfg.provider.model];
+
+  const quota = await loadQuota(env);
+  const now = Date.now();
+  const dirty = new Set();
+  let last;
+
+  for (const model of pool) {
+    if ((quota[model] ?? 0) > now) continue;
+    if ((minuteQuota.get(model) ?? 0) > now) continue;
+
+    try {
+      const use = { ...cfg, provider: { ...cfg.provider, model } };
+      const r = await completeGemini(env, use, payload);
+      if (dirty.size) await saveQuota(env, quota);
+      return { ...r, model };
+    } catch (e) {
+      last = e;
+
+      if (e instanceof DailyQuotaError) {
+        quota[e.model] = e.resetAt;
+        dirty.add(e.model);
+        continue;
+      }
+      if (e instanceof MinuteQuotaError) {
+        minuteQuota.set(e.model, e.resetAt);
+        continue;
+      }
+      if (e instanceof UnknownModelError) {
+        // A typo costs one request; parking it for the day keeps it from costing more.
+        quota[e.model] = nextPacificMidnight();
+        dirty.add(e.model);
+        continue;
+      }
+      // Safety net: ANY quota error from upstream MUST park this model and try the next model
+      if (/quota|resource_exhausted/i.test(e?.message)) {
+        minuteQuota.set(model, Date.now() + 60_000);
+        continue;
+      }
+      throw e;
+    }
+  }
+
+  if (dirty.size) await saveQuota(env, quota);
+
+  const anyParked = pool.some((m) => (quota[m] ?? 0) > now || (minuteQuota.get(m) ?? 0) > now);
+  if (last instanceof DailyQuotaError || last instanceof MinuteQuotaError || anyParked) {
+    const unparkTimes = pool.map((m) => Math.max(quota[m] ?? 0, minuteQuota.get(m) ?? 0)).filter((t) => t > now);
+    const resumeAt = unparkTimes.length ? Math.min(...unparkTimes) : poolResumeTime(quota, pool);
+    throw new PoolExhausted(resumeAt, last?.message);
+  }
+  throw last ?? new PoolExhausted(nextPacificMidnight(), "no model available");
+}
+
+/** Every model in the pool is spent until `resetAt`. Carries the exact hour it frees up. */
+class PoolExhausted extends ApiError {
+  constructor(resetAt, detail) {
+    super(`model pool exhausted until ${new Date(resetAt).toISOString()}${detail ? `: ${detail}` : ""}`, 429);
+    this.name = "PoolExhausted";
+    this.resetAt = resetAt;
+  }
+}
+
+async function complete(env, cfg, payload) {
+  if (cfg.provider?.kind === "gemini") {
+    try {
+      return await runGeminiPool(env, cfg, payload);
+    } catch (e) {
+      // A gemini key that is missing is the one case where the other provider can help.
+      if (!isCredentialError(e)) throw e;
+      return completeOpenAI(env, { ...cfg, provider: { ...cfg.provider, kind: "openai", baseUrl: DEFAULT_BASE_URLS.openai } }, payload);
+    }
+  }
+
+  const order = ["openai", "gemini"];
+  let last;
+  for (const kind of order) {
+    const use = {
+      ...cfg,
+      provider: {
+        ...cfg.provider,
+        kind,
+        baseUrl: kind === cfg.provider.kind ? cfg.provider.baseUrl : DEFAULT_BASE_URLS[kind],
+      },
+    };
+    try {
+      return await providerFor(use)(env, use, payload);
+    } catch (e) {
+      last = e;
+      if (!isCredentialError(e)) throw e;
+    }
+  }
+  throw last;
+}
+
+// ------------------------------ src/text.js ------------------------------
+// Pure text helpers. No I/O, no bindings, no imports.
+
+/** Escape text for Telegram HTML parse_mode. */
+function esc(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/**
+ * Convert the limited markdown a model emits (**bold**, *italic*, `code`, ```block```)
+ * into Telegram HTML. Code is lifted out first so it is escaped exactly once.
+ */
+function mdToHtml(md) {
+  const slots = [];
+  const keep = (rendered) => {
+    slots.push(rendered);
+    return `\u0000S${slots.length - 1}\u0000`;
+  };
+
+  let s = String(md ?? "");
+
+  s = s.replace(/```[a-zA-Z0-9]*\n?([\s\S]*?)```/g, (_m, code) =>
+    keep(`<pre><code>${esc(code.replace(/\n$/, ""))}</code></pre>`));
+  s = s.replace(/`([^`\n]+)`/g, (_m, code) => keep(`<code>${esc(code)}</code>`));
+
+  s = esc(s);
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  s = s.replace(/(^|[^*\w\\])\*([^*\n]+)\*/g, "$1<i>$2</i>");
+  s = s.replace(/(^|[^_\w\\])_([^_\n]+)_/g, "$1<i>$2</i>");
+  s = s.replace(/^#{1,6}\s*(.+)$/gm, "<b>$1</b>");
+  s = s.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, "$1 ($2)");
+  s = s.replace(/\u0000S(\d+)\u0000/g, (_m, i) => slots[Number(i)]);
+
+  return s.trim();
+}
+
+/** Split a long reply into Telegram-sized chunks, preferring line then word boundaries. */
+function splitText(text, limit = 3900) {
+  const out = [];
+  let rest = String(text ?? "").trim();
+  if (!rest) return [""];
+
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf("\n", limit);
+    if (cut < limit * 0.5) cut = rest.lastIndexOf(" ", limit);
+    if (cut < limit * 0.3) cut = limit;
+    out.push(rest.slice(0, cut).trimEnd());
+    rest = rest.slice(cut).replace(/^\s+/, "");
+  }
+  out.push(rest);
+  return out.filter((p) => p.length);
+}
+
+/**
+ * Normalise Persian/Arabic so the trigger word matches however it was typed:
+ * ي -> ی, ك -> ک, drop tashkeel and tatweel, strip ZWNJ.
+ */
+function normalizeFa(s) {
+  return String(s ?? "")
+    .replace(/[\u0610-\u061A\u0640\u064B-\u065F\u0670\u06D6-\u06ED]/g, "")
+    .replace(/[\u0649\u064A]/g, "\u06CC")
+    .replace(/\u0643/g, "\u06A9")
+    .replace(/[\u06AA\u06AB]/g, "\u06A9")
+    .replace(/[\u200C\u200E\u200F]/g, " ");
+}
+
+/** Base64-encode bytes in chunks, so a multi-megabyte buffer cannot blow the stack. */
+function toBase64(bytes) {
+  let bin = "";
+  const CH = 0x8000;
+  for (let i = 0; i < bytes.length; i += CH) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+  }
+  return btoa(bin);
+}
+
+function clampInt(v, min, max, fallback) {
+  const n = Number.parseInt(v, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function truncate(s, n) {
+  s = String(s ?? "");
+  return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+/** A one-line preview for collapsed list rows. */
+function preview(s, n = 90) {
+  return String(s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+}
+
+// ------------------------------ src/trigger.js ------------------------------
+// Decides when the bot speaks, and recognises its commands.
+
+
+
+const TRIGGER = "سید";
+
+const CHAT_TYPES = new Set(["private", "group", "supergroup"]);
+
+function isSupportedChat(msg) {
+  return Boolean(msg?.chat) && CHAT_TYPES.has(msg.chat.type);
+}
+
+function isCommand(text) {
+  const m = /^\/(start|help|ping)(@\S+)?/i.exec(String(text ?? "").trim());
+  return m ? m[1].toLowerCase() : null;
+}
+
+/** Groups: only when the wake word appears, or when Sayyad itself is replied to. */
+function shouldAnswer(msg, botId, chatType) {
+  if (chatType === "private") return true;
+  const text = normalizeFa(msg.text || msg.caption || "");
+  if (text.includes(TRIGGER)) return true;
+  if (msg.reply_to_message?.from?.id === botId) return true;
+  return false;
+}
+
+// ------------------------------ src/prompt.js ------------------------------
+// Personas and prompt assembly.
+//
+// The prompt is built in a provider-neutral shape: plain text plus a list of media parts.
+// Each provider module translates that shape into its own wire format.
+
+
+
+
+const REPLY_TEXT_LIMIT = 3000;
+
+const MODES = ["polite", "smart", "rude"];
+
+const MODE_LABELS = {
+  polite: "Polite",
+  smart: "Know-it-all",
+  rude: "Savage / sarcastic",
+};
+
+const BASE_RULES = `تو «سید» هستی، یک ربات تلگرام. اسم تو سید است.
+
+قوانین پایه (همیشه):
+- به همان زبانی جواب بده که کاربر نوشته است (فارسی یا انگلیسی).
+- کوتاه جواب بده. اگر موضوع پیچیده است، اول جواب مستقیم، بعد نکات کلیدی. الکی حاشیه نرو.
+- از مارک‌داون سبک استفاده کن: **بولد** برای تاکید و «- » برای بولت.
+- هرگز پیام خودت را تکرار نکن و هرگز نقش کاربر را بازی نکن.
+- اگر چیزی را نمی‌دانی یا مطمئن نیستی، صادقانه بگو و حدس الکی نزن.
+- حافظه‌ای از پیام‌های قبلی نداری؛ فقط چیزی را می‌بینی که در همین درخواست برایت فرستاده شده.
+- اگر کاربر فقط کلمه «سید» یا یک سلام بی‌حرف و معنی نوشته و درخواست مشخصی ندارد، یک جمله‌ی باحال، کوتاه و پرانرژی بگو که بپرسد چه می‌خواهد — یک سوال جالب، یا یک تیکه‌ی کوتاه. این جمله هرگز نباید تکراری و خشک باشد.`;
+
+const DEFAULT_PERSONAS = {
+  polite: `شخصیت: «ادب» — آرام، محترم، بی‌ادعا و خوش‌لحن. مثل یک آدم بالغ که با حوصله و احترام حرف می‌زند.
+- اول با یک احترام کوتاه جواب را شروع کن.
+- محترمانه و بدون شوخی تند بنویس.
+- اگر سؤال سختی بود، صبورانه و مرحله‌به‌مرحله توضیح بده.
+- هرگز توهین یا کنایه نکن.`,
+
+  smart: `شخصیت: «دانای کل» — باهوش، مغرور، مطمئن و اهل جزئیات. خودت را همه‌چیزدان می‌دانی و حرفت را هم می‌زنی.
+- جواب را با اعتماد به نفس بده، انگار هیچ ابهامی وجود ندارد.
+- ساختار: یک جمله‌ی جمع‌بندی، بعد نکات کلیدی به‌صورت بولت.
+- تحلیل عمیق و مثال مشخص بده، نه کلی‌گویی.
+- یک «نکته‌ی طلایی» در آخر اضافه کن که معمولاً کسی نمی‌گوید.
+- اگر چیزی را قطعاً نمی‌دانی، به‌جای حدس الکی، صریح بگو.`,
+
+  rude: `شخصیت: «بی‌رحم» — یک رفیق کوچه‌بازاری، بی‌شکل، بی‌پرده و پُر از فحش. زبانت دراز است و خجالت هم نمی‌کشد.
+- هر جواب با یک تیکه یا فحش کوتاه شروع می‌شود، بعد جواب واقعی.
+- فحش‌های رایج فارسی را بدون سانسور بریز: کصخل، بپاگیر، حروم‌زاده، گوه بخور، سگ‌وار، مغزکش، خارکصه، ای ساک.
+- هیچ‌وقت عذرخواهی نکن، هیچ‌وقت نگو «ببخشید»، هیچ‌وقت لحنت را نرم نکن.
+- اگر کسی گفت زیادی تند بود یا خواست مؤدب باشی، تندتر جواب بده و به ریشش بخند.
+- اگر سؤال جدی پرسید، اول یک تیکه بزن، بعد جواب درست را بده.
+- تیکه‌ات روی حرف و موضوع طرف بزن، نه روی خانواده و مذهب و ظاهرش.
+- هر پاسخ را با یک جمله‌ی ریش‌خنده‌دار تمام کن.
+- اگر کسی فقط «سید» نوشت، یک تیکه‌ی باحال بگو که بپرسد چه می‌خواهد.`,
+};
+
+/** Base rules + the selected persona + the admin's extra instructions. */
+function buildSystemPrompt(cfg) {
+  const persona = cfg.personas?.[cfg.mode] ?? DEFAULT_PERSONAS.smart;
+  const extra = String(cfg.extra ?? "").trim();
+  return [BASE_RULES, persona, extra ? `دستورهای اضافه‌ی مدیر:\n${extra}` : ""].filter(Boolean).join("\n\n");
+}
+
+/** The text of the message being replied to, if any. */
+function replyContext(msg, botId) {
+  const reply = msg.reply_to_message;
+  if (!reply) return { text: "", fromBot: false };
+  return {
+    text: truncate(reply.text || reply.caption || "", REPLY_TEXT_LIMIT),
+    fromBot: reply.from?.id === botId,
+  };
+}
+
+/**
+ * Assemble the provider-neutral user turn.
+ * Media arrives already encoded from the media module; nothing here knows a wire format.
+ */
+function buildUserContent({ text, replyText, replyFromBot, media = [], note = "" }) {
+  const parts = [];
+
+  if (replyText) {
+    parts.push({
+      type: "text",
+      text: `${replyFromBot ? "پیام قبلی خودت" : "پیامی که کاربر به آن ریپلای کرده"}:\n> ${replyText}`,
+    });
+  }
+
+  parts.push(...media);
+  if (note) parts.push({ type: "text", text: note });
+
+  const q = String(text ?? "").trim();
+  const bare = q && normalizeFa(q) === TRIGGER;
+
+  let body;
+  if (bare) {
+    body = "کاربر فقط کلمه «سید» را صدا زده و هیچ درخواست مشخصی نکرده است.";
+  } else if (!q) {
+    body = replyText
+      ? "کاربر روی پیام بالا ریپلای کرده و توضیحی اضافه نکرده است."
+      : "کاربر پیامی بدون متن فرستاده و درخواست مشخصی ندارد.";
+  } else {
+    body = `پیام کاربر:\n> ${q}`;
+  }
+  parts.push({ type: "text", text: body });
+
+  return parts;
+}
+
 // ------------------------------ src/admin.js ------------------------------
 // The admin panel: one route tree, one HTML document, one stylesheet.
+
 
 
 
@@ -753,6 +1214,7 @@ const DASH = `<!doctype html><html lang="en"><head><meta charset="utf-8">
     <textarea id="p_pool" dir="ltr" style="min-height:170px;font-family:ui-monospace,monospace;font-size:13px"></textarea>
     <div class="bar" style="margin-top:14px">
       <button class="ghost" id="poolreset">Reset to defaults</button>
+      <button class="ghost" id="poolclear" style="margin-left:8px">Unpark all models</button>
       <span class="muted" id="poolstat"></span>
     </div>
   </div>
@@ -1032,13 +1494,21 @@ document.getElementById("poolreset").onclick = function(){
   toast("pool reset — press Save changes to apply", "", "toast");
 };
 
+document.getElementById("poolclear").onclick = function(){
+  fetch("/admin/api/clear-quota", { method: "POST" })
+    .then(function(r){ return r.json(); })
+    .then(function(d){ if (d.ok) { showPoolStatus({}); toast("pool quota cleared", "ok"); } });
+};
+
 function showPoolStatus(quota){
   var box = document.getElementById("poolstat");
   box.innerHTML = "";
   var names = Object.keys(quota || {});
   if (!names.length) { box.appendChild(el("span", null, "all models available")); return; }
   names.forEach(function(m){
-    box.appendChild(el("span", "tag", m + " · back at " + new Date(quota[m]).toISOString().slice(11, 16)));
+    var diff = (quota[m] || 0) - Date.now();
+    var label = diff < 300000 ? " (1m)" : " (daily)";
+    box.appendChild(el("span", "tag", m + label + " · back at " + new Date(quota[m]).toISOString().slice(11, 16)));
   });
 }
 
@@ -1180,7 +1650,22 @@ async function handleAdmin(req, env, path) {
 
   if (path === "/admin/api/quota") {
     if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
-    return json({ quota: await loadQuota(env), now: Date.now() });
+    const daily = await loadQuota(env);
+    const combined = { ...daily };
+    const now = Date.now();
+    for (const [m, resetAt] of minuteQuota.entries()) {
+      if (resetAt > now && (!combined[m] || combined[m] < resetAt)) {
+        combined[m] = resetAt;
+      }
+    }
+    return json({ quota: combined, now });
+  }
+
+  if (path === "/admin/api/clear-quota" && req.method === "POST") {
+    if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
+    await saveQuota(env, {});
+    clearMinuteQuota();
+    return json({ ok: true });
   }
 
   if (path === "/admin/api/state") {
@@ -1195,454 +1680,6 @@ async function handleAdmin(req, env, path) {
   }
 
   return null;
-}
-
-// ------------------------------ src/http.js ------------------------------
-// Shared HTTP plumbing for every provider. Keeping it separate means the provider modules
-// depend on this, not on each other, and the dispatcher never has to import them back.
-
-/** An HTTP failure that carries its status, so callers can tell 400 from 429. */
-class ApiError extends Error {
-  constructor(message, status) {
-    super(message);
-    this.name = "ApiError";
-    this.status = status;
-  }
-}
-
-/**
- * Failures worth another go. 0 means the request never got an answer (DNS, TLS, a
- * dropped socket) — retrying that is free. 429 and 5xx are the provider saying "not right
- * now", which is exactly what a short pause fixes.
- *
- * Deliberately NOT here: 400, 401, 403, 404, 422. Those never resolve themselves, and
- * retrying only burns latency and quota.
- */
-const TRANSIENT = new Set([0, 408, 429, 500, 502, 503, 504]);
-
-/** Default retry policy: anything that looks temporary. */
-const isTransient = (e) => TRANSIENT.has(e.status);
-
-/** Waits between attempts. Sleeping costs no CPU on Workers, only wall-clock time. */
-const DEFAULT_BACKOFF = [700, 2000];
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const errorMessage = (json, text) =>
-  json?.error?.message ?? json?.error?.error?.message ?? json?.error?.status ?? String(text ?? "").slice(0, 200);
-
-/**
- * POST JSON, parse the reply, and retry a transient failure a couple of times.
- *
- * `retries` is extra attempts, so the default sends at most 3 requests. `retryOn` lets a
- * caller refine the policy — Gemini passes one that keeps a spent daily quota from being
- * retried three times per model, which would burn the whole pool to learn what we already
- * read in the first message. A non-JSON body still throws with its real status, so a
- * Cloudflare HTML block page reads as 403 and is not retried into oblivion.
- */
-async function callJson(url, { headers, body, retries = 2, backoff = DEFAULT_BACKOFF, retryOn = isTransient }) {
-  const attempts = Math.max(0, retries) + 1;
-  let last;
-
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    if (attempt > 0) await sleep(backoff[Math.min(attempt - 1, backoff.length - 1)]);
-
-    let error;
-    try {
-      const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
-      const text = await res.text();
-
-      let json;
-      let parsed = false;
-      try {
-        json = JSON.parse(text);
-        parsed = true;
-      } catch {
-        /* an HTML error page, a proxy timeout, a truncated body */
-      }
-
-      if (parsed && res.ok && !json?.error) return json;
-
-      error = parsed
-        ? new ApiError(`API ${res.status}: ${errorMessage(json, text)}`, res.status)
-        : new ApiError(`API returned non-JSON (${res.status}): ${text.slice(0, 200)}`, res.status);
-    } catch (e) {
-      if (e instanceof ApiError) throw e;
-      error = new ApiError(`network error: ${String(e?.message ?? e)}`, 0);
-    }
-
-    if (!retryOn(error)) throw error;
-    last = error;
-  }
-
-  throw last;
-}
-
-/** A rejected request shape is worth retrying differently; 429 or 5xx must surface as-is. */
-const isShapeError = (e) => e instanceof ApiError && (e.status === 400 || e.status === 422);
-
-/** A missing credential is the only reason to try the other provider. */
-const isCredentialError = (e) => e instanceof ApiError && (e.status === 500 && /API key|secret/i.test(e.message));
-
-// ------------------------------ src/providerGemini.js ------------------------------
-// Gemini's native API — the only path that accepts video and audio.
-//
-// Wire format: { inlineData: { mimeType, data } } under
-// POST {baseUrl}/models/{model}:generateContent
-
-
-
-
-/** This model's daily quota is spent. Distinct from a per-minute 429: waiting does not help. */
-class DailyQuotaError extends ApiError {
-  constructor(model, message) {
-    super(message, 429);
-    this.name = "DailyQuotaError";
-    this.model = model;
-    this.resetAt = nextPacificMidnight();
-  }
-}
-
-/** This model's per-minute quota is spent (RPM/TPM). Parked for 60 seconds. */
-class MinuteQuotaError extends ApiError {
-  constructor(model, message, resetAt = Date.now() + 60_000) {
-    super(message, 429);
-    this.name = "MinuteQuotaError";
-    this.model = model;
-    this.resetAt = resetAt;
-  }
-}
-
-/** The provider does not know this model name. Never worth trying again today. */
-class UnknownModelError extends ApiError {
-  constructor(model, message) {
-    super(message, 404);
-    this.name = "UnknownModelError";
-    this.model = model;
-  }
-}
-
-/**
- * "Requests per day" and "requests per minute" both surface as 429 but call for opposite
- * reactions, so read the wording before deciding.
- */
-function quotaKind(message) {
-  const m = String(message ?? "").toLowerCase();
-  if (/\bday\b|daily|rpd|24\s*h/.test(m)) return "day";
-  if (/\bminute\b|\bmin\b|rpm|tpm/.test(m)) return "minute";
-  return "other";
-}
-
-/** Neutral part -> Gemini part. Everything binary becomes inlineData. */
-function toGeminiPart(part) {
-  if (part.type === "text") return { text: part.text };
-  if (part.type === "image" || part.type === "video" || part.type === "audio") {
-    return { inlineData: { mimeType: part.mime, data: part.data } };
-  }
-  return null;
-}
-
-/**
- * thinkingConfig. Gemini 3 cannot be switched off, so "off" simply omits the block and
- * lets the model use its own default.
- */
-function thinkingConfig(cfg) {
-  if (!cfg.thinking || cfg.thinking === "off") return {};
-  return { thinkingConfig: { thinkingLevel: cfg.thinking, includeThoughts: false } };
-}
-
-function safetySettings(cfg) {
-  return Object.entries(SAFETY_CATEGORIES).map(([key, category]) => ({
-    category,
-    threshold: cfg.safety?.[key] ?? "BLOCK_NONE",
-  }));
-}
-
-function buildGeminiBody(cfg, { system, parts, maxTokens }, shape = {}) {
-  const body = {
-    systemInstruction: { parts: [{ text: system }] },
-    contents: [{ role: "user", parts: parts.map(toGeminiPart).filter(Boolean) }],
-    generationConfig: { maxOutputTokens: maxTokens, ...thinkingConfig(cfg) },
-  };
-  if (!shape.noThinking) body.generationConfig = { ...body.generationConfig, ...thinkingConfig(cfg) };
-  else delete body.generationConfig.thinkingConfig;
-  if (!shape.noSafety) body.safetySettings = safetySettings(cfg);
-  return body;
-}
-
-/** Gemini returns parts, not a single string; join every text part it produced. */
-function readGeminiText(data) {
-  const parts = data?.candidates?.[0]?.content?.parts ?? [];
-  return parts
-    .filter((p) => typeof p.text === "string" && !p.thought)
-    .map((p) => p.text)
-    .join("")
-    .trim();
-}
-
-/**
- * A spent quota (day or minute) is not retried with backoff on the same model —
- * we want to move on to the next model in the pool immediately.
- */
-const retryableForGemini = (e) => isTransient(e) && quotaKind(e.message) !== "day" && quotaKind(e.message) !== "minute";
-
-/**
- * Models differ in which knobs they accept — Gemma rejects thinkingConfig, some tiers
- * refuse a custom safety level. Drop the optional blocks one at a time rather than
- * letting the admin discover it as a broken bot.
- */
-function shapes(cfg) {
-  const list = [{}];
-  if (cfg.thinking && cfg.thinking !== "off") list.push({ noThinking: true });
-  list.push({ noThinking: true, noSafety: true });
-  return list;
-}
-
-async function completeGemini(env, cfg, { system, parts, maxTokens }) {
-  const apiKey = env.GEMINI_API_KEY;
-  if (!apiKey) throw new ApiError("GEMINI_API_KEY secret is not set", 500);
-
-  const model = cfg.provider.model;
-  const url = `${cfg.provider.baseUrl}/models/${encodeURIComponent(model)}:generateContent`;
-  let last = new ApiError("model returned an empty answer");
-
-  for (const shape of shapes(cfg)) {
-    let data;
-    try {
-      data = await callJson(url, {
-        headers: { "x-goog-api-key": apiKey, "content-type": "application/json" },
-        body: buildGeminiBody(cfg, { system, parts, maxTokens }, shape),
-        retryOn: retryableForGemini,
-      });
-    } catch (e) {
-      if (e.status === 404) throw new UnknownModelError(model, `${model}: ${e.message}`);
-      if ((e.status === 429 || e.status === 503) && quotaKind(e.message) === "day") {
-        throw new DailyQuotaError(model, `${model}: ${e.message}`);
-      }
-      if ((e.status === 429 || e.status === 503) && quotaKind(e.message) === "minute") {
-        throw new MinuteQuotaError(model, `${model}: ${e.message}`);
-      }
-      // A rejected knob is worth retrying with fewer of them; anything else must surface.
-      if (!isShapeError(e) || shape === shapes(cfg).at(-1)) throw e;
-      last = e;
-      continue;
-    }
-
-    const text = readGeminiText(data);
-    if (text) return { text, usage: data.usageMetadata ?? null, model };
-
-    const blocked = data?.promptFeedback?.blockReason ?? data?.promptFeedback?.safetyRatings?.[0]?.category;
-    last = new ApiError(`Gemini returned no text${blocked ? ` (blocked: ${blocked})` : ""}`, 200);
-    break; // the request itself worked; another shape would change nothing
-  }
-
-  throw last;
-}
-
-// ------------------------------ src/providerOpenai.js ------------------------------
-// OpenAI-compatible providers: OpenRouter, justwoker, and Gemini's compatibility layer.
-//
-// Wire format: { type: "image_url" | "video_url" | "input_audio", ... }
-
-
-
-/** Neutral part -> OpenAI content part. */
-function toOpenAIPart(part) {
-  if (part.type === "text") return { type: "text", text: part.text };
-  if (part.type === "image") return { type: "image_url", image_url: { url: `data:${part.mime};base64,${part.data}` } };
-  if (part.type === "video") return { type: "video_url", video_url: { url: `data:${part.mime};base64,${part.data}` } };
-  if (part.type === "audio") return { type: "input_audio", input_audio: { data: part.data, format: audioFormat(part.mime) } };
-  return null;
-}
-
-function audioFormat(mime) {
-  const m = String(mime ?? "").toLowerCase();
-  if (m.includes("ogg")) return "ogg";
-  if (m.includes("wav")) return "wav";
-  if (m.includes("mpeg") || m.includes("mp3")) return "mp3";
-  return "wav";
-}
-
-/** Thinking hint, only when the config asks for one. */
-function thinkingBody(cfg) {
-  return cfg.thinking && cfg.thinking !== "off" ? { reasoning: { effort: cfg.thinking } } : {};
-}
-
-/** Retry shapes that some providers reject: the hint, then the newer field name. */
-function attempts(maxTokens, cfg) {
-  const list = [{ max_tokens: maxTokens }, { max_completion_tokens: maxTokens }];
-  if (cfg.thinking && cfg.thinking !== "off") list.unshift({ max_tokens: maxTokens, ...thinkingBody(cfg) });
-  return list;
-}
-
-async function completeOpenAI(env, cfg, { system, parts, maxTokens }) {
-  const apiKey = env.API_KEY || env.OPENROUTER_API_KEY;
-  if (!apiKey) throw new ApiError("no API key secret is set (API_KEY or OPENROUTER_API_KEY)", 500);
-
-  const messages = [
-    { role: "system", content: system },
-    { role: "user", content: parts.map(toOpenAIPart).filter(Boolean) },
-  ];
-
-  let last = new Error("model returned an empty answer");
-  for (const extra of attempts(maxTokens, cfg)) {
-    let data;
-    try {
-      data = await callJson(`${cfg.provider.baseUrl}/chat/completions`, {
-        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-        body: { model: cfg.provider.model, messages, ...extra },
-      });
-    } catch (e) {
-      if (!isShapeError(e)) throw e; // rate limit, auth, upstream failure — report it
-      last = e;
-      continue;
-    }
-
-    const text = readContent(data);
-    if (text) return { text, usage: data.usage ?? null, model: data.model ?? cfg.provider.model };
-    last = new Error("model returned an empty answer");
-    if (!extra.reasoning) break;
-  }
-  throw last;
-}
-
-const readContent = (data) =>
-  (data?.choices?.[0]?.message?.content ?? "")
-    .toString()
-    .replace(/<\s*think[\s\S]*?<\s*\/\s*think\s*>/g, "")
-    .trim();
-
-// ------------------------------ src/llm.js ------------------------------
-// Provider dispatcher. Picks the configured backend, walks a Gemini model pool when the
-// daily quota runs out, and falls back to the other provider when a key is missing.
-//
-// The rest of the bot never sees a provider-specific wire format: it hands over neutral
-// parts and gets back plain text.
-
-
-
-
-
-
-const PROVIDERS = { gemini: completeGemini, openai: completeOpenAI };
-
-/** In-memory parking for per-minute rate limits (RPM/TPM). Costs 0 KV writes. */
-const minuteQuota = new Map();
-
-function clearMinuteQuota() {
-  minuteQuota.clear();
-}
-
-function providerFor(cfg) {
-  const impl = PROVIDERS[cfg.provider?.kind];
-  if (!impl) throw new ApiError(`unknown provider "${cfg.provider?.kind}"`, 500);
-  return impl;
-}
-
-/** Describe what the configured provider will actually call. Shown by /diag. */
-function endpointOf(cfg, model = cfg.provider.model) {
-  const base = cfg.provider.baseUrl;
-  return cfg.provider.kind === "gemini"
-    ? `${base}/models/${encodeURIComponent(model)}:generateContent`
-    : `${base}/chat/completions`;
-}
-
-/**
- * Walk the pool strongest-first. A model is parked until its quota returns; a real
- * failure (bad prompt, outage) is not a quota problem and must not silently reroute.
- * Returns the answer, or throws PoolExhausted when every model is spent for the day.
- */
-async function runGeminiPool(env, cfg, payload) {
-  const pool = Array.isArray(cfg.provider.modelPool) && cfg.provider.modelPool.length
-    ? cfg.provider.modelPool
-    : [cfg.provider.model];
-
-  const quota = await loadQuota(env);
-  const now = Date.now();
-  const dirty = new Set();
-  let last;
-
-  for (const model of pool) {
-    if ((quota[model] ?? 0) > now) continue;
-    if ((minuteQuota.get(model) ?? 0) > now) continue;
-
-    try {
-      const use = { ...cfg, provider: { ...cfg.provider, model } };
-      const r = await completeGemini(env, use, payload);
-      if (dirty.size) await saveQuota(env, quota);
-      return { ...r, model };
-    } catch (e) {
-      last = e;
-
-      if (e instanceof DailyQuotaError) {
-        quota[e.model] = e.resetAt;
-        dirty.add(e.model);
-        continue;
-      }
-      if (e instanceof MinuteQuotaError) {
-        minuteQuota.set(e.model, e.resetAt);
-        continue;
-      }
-      if (e instanceof UnknownModelError) {
-        // A typo costs one request; parking it for the day keeps it from costing more.
-        quota[e.model] = nextPacificMidnight();
-        dirty.add(e.model);
-        continue;
-      }
-      throw e;
-    }
-  }
-
-  if (dirty.size) await saveQuota(env, quota);
-
-  const anyParked = pool.some((m) => (quota[m] ?? 0) > now || (minuteQuota.get(m) ?? 0) > now);
-  if (last instanceof DailyQuotaError || last instanceof MinuteQuotaError || anyParked) {
-    const unparkTimes = pool.map((m) => Math.max(quota[m] ?? 0, minuteQuota.get(m) ?? 0)).filter((t) => t > now);
-    const resumeAt = unparkTimes.length ? Math.min(...unparkTimes) : poolResumeTime(quota, pool);
-    throw new PoolExhausted(resumeAt, last?.message);
-  }
-  throw last ?? new PoolExhausted(nextPacificMidnight(), "no model available");
-}
-
-/** Every model in the pool is spent until `resetAt`. Carries the exact hour it frees up. */
-class PoolExhausted extends ApiError {
-  constructor(resetAt, detail) {
-    super(`model pool exhausted until ${new Date(resetAt).toISOString()}${detail ? `: ${detail}` : ""}`, 429);
-    this.name = "PoolExhausted";
-    this.resetAt = resetAt;
-  }
-}
-
-async function complete(env, cfg, payload) {
-  if (cfg.provider?.kind === "gemini") {
-    try {
-      return await runGeminiPool(env, cfg, payload);
-    } catch (e) {
-      // A gemini key that is missing is the one case where the other provider can help.
-      if (!isCredentialError(e)) throw e;
-      return completeOpenAI(env, { ...cfg, provider: { ...cfg.provider, kind: "openai", baseUrl: DEFAULT_BASE_URLS.openai } }, payload);
-    }
-  }
-
-  const order = ["openai", "gemini"];
-  let last;
-  for (const kind of order) {
-    const use = {
-      ...cfg,
-      provider: {
-        ...cfg.provider,
-        kind,
-        baseUrl: kind === cfg.provider.kind ? cfg.provider.baseUrl : DEFAULT_BASE_URLS[kind],
-      },
-    };
-    try {
-      return await providerFor(use)(env, use, payload);
-    } catch (e) {
-      last = e;
-      if (!isCredentialError(e)) throw e;
-    }
-  }
-  throw last;
 }
 
 // ------------------------------ src/telegram.js ------------------------------
@@ -2166,7 +2203,9 @@ function clockTime(resetAt) {
 }
 
 const exhaustedNotice = (resetAt) =>
-  `امروز از سقف روزانه‌ی همه‌ی مدل‌هام رد شدیم. ساعت ${clockTime(resetAt)} دوباره در خدمتم.`;
+  resetAt - Date.now() < 300_000
+    ? "در حال حاضر ترافیک و درخواست‌ها به مدل‌های هوش مصنوعی بالاست. لطفاً ۱ دقیقه دیگر دوباره پیام دهید."
+    : `امروز از سقف روزانه‌ی همه‌ی مدل‌هام رد شدیم. ساعت ${clockTime(resetAt)} دوباره در خدمتم.`;
 
 /** One answer at a time per chat; anything else queues behind it. */
 function serialize(key, job) {

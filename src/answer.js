@@ -53,7 +53,9 @@ function clockTime(resetAt) {
 }
 
 const exhaustedNotice = (resetAt) =>
-  `امروز از سقف روزانه‌ی همه‌ی مدل‌هام رد شدیم. ساعت ${clockTime(resetAt)} دوباره در خدمتم.`;
+  resetAt - Date.now() < 300_000
+    ? "در حال حاضر ترافیک و درخواست‌ها به مدل‌های هوش مصنوعی بالاست. لطفاً ۱ دقیقه دیگر دوباره پیام دهید."
+    : `امروز از سقف روزانه‌ی همه‌ی مدل‌هام رد شدیم. ساعت ${clockTime(resetAt)} دوباره در خدمتم.`;
 
 /** One answer at a time per chat; anything else queues behind it. */
 function serialize(key, job) {

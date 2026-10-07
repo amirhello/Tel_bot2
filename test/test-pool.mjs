@@ -28,7 +28,9 @@ const ok = (text = "ok") => json({ candidates: [{ content: { parts: [{ text }] }
 await t("quotaKind tells a daily limit from a per-minute one", () => {
   assert.equal(quotaKind("Quota exceeded for quota metric: limit 20 per day"), "day");
   assert.equal(quotaKind("Requests per day exceeded"), "day");
+  assert.equal(quotaKind("Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_requests_per_day"), "day");
   assert.equal(quotaKind("RESOURCE_EXHAUSTED: limit 5 per minute"), "minute");
+  assert.equal(quotaKind("Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_requests_per_minute"), "minute");
   assert.equal(quotaKind("Resource has been exhausted (e.g. check quota)."), "other");
   assert.equal(quotaKind(undefined), "other");
 });
@@ -151,6 +153,29 @@ await t("a minute-spent model is parked in-memory for 60s and the next one answe
   assert.equal((await complete(e, cfg(), payload)).text, "from-second-again");
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, geminiURL("gemini-3.7-flash"));
+  clearMinuteQuota();
+});
+
+await t("Google API 429 with metric name falls back to next model in pool", async () => {
+  clearMinuteQuota();
+  const e = env({ GEMINI_API_KEY: "k" });
+  calls = [];
+  const googleErr = json(
+    {
+      error: {
+        code: 429,
+        message:
+          "You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. * Quota exceeded for metric: generativelanguage.go",
+        status: "RESOURCE_EXHAUSTED",
+      },
+    },
+    429,
+  );
+  responder = (url) => (url.includes("gemini-3.8-flash") ? googleErr : ok("from-second-model"));
+  const r = await complete(e, cfg(), payload);
+  assert.equal(r.text, "from-second-model");
+  assert.equal(calls.length, 2);
+  assert.ok(minuteQuota.has("gemini-3.8-flash"));
   clearMinuteQuota();
 });
 

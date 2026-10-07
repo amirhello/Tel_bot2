@@ -62,6 +62,7 @@ function setup(extra = {}, kvSeed = {}) {
   reply = "**سلام** دنیا";
   modelFail = null;
   lastModelBody = null;
+  M.clearMinuteQuota?.();
   E = env({ GEMINI_API_KEY: "AQ.test", OPENROUTER_API_KEY: "sk-or-x", ...extra, CONFIG: fakeKV(kvSeed) });
   return E;
 }

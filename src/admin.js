@@ -1,6 +1,7 @@
 // The admin panel: one route tree, one HTML document, one stylesheet.
 
 import { readArchive } from "./archive.js";
+import { clearMinuteQuota, minuteQuota } from "./llm.js";
 import { DEFAULT_PERSONAS, MODES, MODE_LABELS } from "./prompt.js";
 import {
   DEFAULT_MODEL_POOL,
@@ -11,6 +12,7 @@ import {
   loadConfig,
   loadQuota,
   saveConfig,
+  saveQuota,
 } from "./store.js";
 
 const COOKIE = "sayyad_admin";
@@ -168,6 +170,7 @@ const DASH = `<!doctype html><html lang="en"><head><meta charset="utf-8">
     <textarea id="p_pool" dir="ltr" style="min-height:170px;font-family:ui-monospace,monospace;font-size:13px"></textarea>
     <div class="bar" style="margin-top:14px">
       <button class="ghost" id="poolreset">Reset to defaults</button>
+      <button class="ghost" id="poolclear" style="margin-left:8px">Unpark all models</button>
       <span class="muted" id="poolstat"></span>
     </div>
   </div>
@@ -447,13 +450,21 @@ document.getElementById("poolreset").onclick = function(){
   toast("pool reset — press Save changes to apply", "", "toast");
 };
 
+document.getElementById("poolclear").onclick = function(){
+  fetch("/admin/api/clear-quota", { method: "POST" })
+    .then(function(r){ return r.json(); })
+    .then(function(d){ if (d.ok) { showPoolStatus({}); toast("pool quota cleared", "ok"); } });
+};
+
 function showPoolStatus(quota){
   var box = document.getElementById("poolstat");
   box.innerHTML = "";
   var names = Object.keys(quota || {});
   if (!names.length) { box.appendChild(el("span", null, "all models available")); return; }
   names.forEach(function(m){
-    box.appendChild(el("span", "tag", m + " · back at " + new Date(quota[m]).toISOString().slice(11, 16)));
+    var diff = (quota[m] || 0) - Date.now();
+    var label = diff < 300000 ? " (1m)" : " (daily)";
+    box.appendChild(el("span", "tag", m + label + " · back at " + new Date(quota[m]).toISOString().slice(11, 16)));
   });
 }
 
@@ -595,7 +606,22 @@ export async function handleAdmin(req, env, path) {
 
   if (path === "/admin/api/quota") {
     if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
-    return json({ quota: await loadQuota(env), now: Date.now() });
+    const daily = await loadQuota(env);
+    const combined = { ...daily };
+    const now = Date.now();
+    for (const [m, resetAt] of minuteQuota.entries()) {
+      if (resetAt > now && (!combined[m] || combined[m] < resetAt)) {
+        combined[m] = resetAt;
+      }
+    }
+    return json({ quota: combined, now });
+  }
+
+  if (path === "/admin/api/clear-quota" && req.method === "POST") {
+    if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
+    await saveQuota(env, {});
+    clearMinuteQuota();
+    return json({ ok: true });
   }
 
   if (path === "/admin/api/state") {

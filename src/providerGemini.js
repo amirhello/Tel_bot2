@@ -41,8 +41,8 @@ export class UnknownModelError extends ApiError {
  */
 export function quotaKind(message) {
   const m = String(message ?? "").toLowerCase();
-  if (/\bday\b|daily|rpd|24\s*h/.test(m)) return "day";
-  if (/\bminute\b|\bmin\b|rpm|tpm/.test(m)) return "minute";
+  if (/(?:^|[^a-z])(day|daily|rpd|24\s*h)(?:[^a-z]|$)/i.test(m)) return "day";
+  if (/(?:^|[^a-z])(minute|min|rpm|tpm)(?:[^a-z]|$)/i.test(m)) return "minute";
   return "other";
 }
 
@@ -97,7 +97,11 @@ export function readGeminiText(data) {
  * A spent quota (day or minute) is not retried with backoff on the same model —
  * we want to move on to the next model in the pool immediately.
  */
-const retryableForGemini = (e) => isTransient(e) && quotaKind(e.message) !== "day" && quotaKind(e.message) !== "minute";
+const retryableForGemini = (e) =>
+  isTransient(e) &&
+  quotaKind(e.message) !== "day" &&
+  quotaKind(e.message) !== "minute" &&
+  !/quota|resource_exhausted/i.test(e.message);
 
 /**
  * Models differ in which knobs they accept — Gemma rejects thinkingConfig, some tiers
@@ -129,10 +133,13 @@ export async function completeGemini(env, cfg, { system, parts, maxTokens }) {
       });
     } catch (e) {
       if (e.status === 404) throw new UnknownModelError(model, `${model}: ${e.message}`);
-      if ((e.status === 429 || e.status === 503) && quotaKind(e.message) === "day") {
-        throw new DailyQuotaError(model, `${model}: ${e.message}`);
-      }
-      if ((e.status === 429 || e.status === 503) && quotaKind(e.message) === "minute") {
+      const isQuota =
+        (e.status === 429 || e.status === 503) &&
+        (quotaKind(e.message) !== "other" || /quota|resource_exhausted/i.test(e.message));
+      if (isQuota) {
+        if (quotaKind(e.message) === "day") {
+          throw new DailyQuotaError(model, `${model}: ${e.message}`);
+        }
         throw new MinuteQuotaError(model, `${model}: ${e.message}`);
       }
       // A rejected knob is worth retrying with fewer of them; anything else must surface.
