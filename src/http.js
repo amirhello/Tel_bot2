@@ -18,7 +18,7 @@ export class ApiError extends Error {
  * Deliberately NOT here: 400, 401, 403, 404, 422. Those never resolve themselves, and
  * retrying only burns latency and quota.
  */
-const TRANSIENT = new Set([0, 408, 429, 500, 502, 503, 504]);
+const TRANSIENT = new Set([0, 408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526]);
 
 /** Default retry policy: anything that looks temporary. */
 export const isTransient = (e) => TRANSIENT.has(e.status);

@@ -90,7 +90,7 @@ class ApiError extends Error {
  * Deliberately NOT here: 400, 401, 403, 404, 422. Those never resolve themselves, and
  * retrying only burns latency and quota.
  */
-const TRANSIENT = new Set([0, 408, 429, 500, 502, 503, 504]);
+const TRANSIENT = new Set([0, 408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526]);
 
 /** Default retry policy: anything that looks temporary. */
 const isTransient = (e) => TRANSIENT.has(e.status);
@@ -2462,11 +2462,17 @@ async function diagnostics(env) {
 
   if (env.DIAG_IMAGE) {
     try {
+      // Brief pause so consecutive subrequests do not trip the tight RPM limit or socket reset
+      await new Promise((r) => setTimeout(r, 600));
+      const testImg =
+        typeof env.DIAG_IMAGE === "string" && env.DIAG_IMAGE.length > 80
+          ? env.DIAG_IMAGE
+          : "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAFklEQVR4nGNwa9pCEmIY1TCqYfhqAACXG3wQdHVYSAAAAABJRU5ErkJggg==";
       const diagCfg = { ...cfg, thinking: "off" };
       const rImg = await complete(env, diagCfg, {
         system: "You are Sayyad. Answer with one short Persian word.",
         parts: [
-          { type: "image", mime: "image/png", data: env.DIAG_IMAGE },
+          { type: "image", mime: "image/png", data: testImg },
           { type: "text", text: "تست تصویر" },
         ],
         maxTokens: 120,

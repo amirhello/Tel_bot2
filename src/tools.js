@@ -52,11 +52,17 @@ export async function diagnostics(env) {
 
   if (env.DIAG_IMAGE) {
     try {
+      // Brief pause so consecutive subrequests do not trip the tight RPM limit or socket reset
+      await new Promise((r) => setTimeout(r, 600));
+      const testImg =
+        typeof env.DIAG_IMAGE === "string" && env.DIAG_IMAGE.length > 80
+          ? env.DIAG_IMAGE
+          : "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAFklEQVR4nGNwa9pCEmIY1TCqYfhqAACXG3wQdHVYSAAAAABJRU5ErkJggg==";
       const diagCfg = { ...cfg, thinking: "off" };
       const rImg = await complete(env, diagCfg, {
         system: "You are Sayyad. Answer with one short Persian word.",
         parts: [
-          { type: "image", mime: "image/png", data: env.DIAG_IMAGE },
+          { type: "image", mime: "image/png", data: testImg },
           { type: "text", text: "تست تصویر" },
         ],
         maxTokens: 120,
