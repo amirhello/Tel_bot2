@@ -1,9 +1,10 @@
 import { assert, t, done, M, env, json, fakeKV } from "./harness.mjs";
 
 const {
-  quotaKind, DailyQuotaError, UnknownModelError, completeGemini,
+  quotaKind, DailyQuotaError, MinuteQuotaError, UnknownModelError, completeGemini,
   buildGeminiBody, thinkingConfig, safetySettings, normalizePool,
   nextPacificMidnight, loadQuota, saveQuota, poolResumeTime, DEFAULT_MODEL_POOL,
+  minuteQuota, clearMinuteQuota,
 } = M;
 const { complete, PoolExhausted } = M;
 
@@ -77,13 +78,16 @@ await t("thinkingConfig and safetySettings follow the config", () => {
 
 /* ---------------------------------------------------------------- single model */
 
-await t("a per-minute 429 is retried by the transport, not treated as a daily cap", async () => {
+await t("a per-minute 429 becomes MinuteQuotaError and is not retried with delay", async () => {
   calls = [];
   responder = () => quotaErr(5, "per minute");
-  await assert.rejects(() => completeGemini(env({ GEMINI_API_KEY: "k" }), cfg(), payload), /per minute/);
-  assert.ok(!calls.length || true);
-  const daily = calls.length;
-  assert.ok(daily >= 3, `per-minute errors are retried at the transport layer (${daily} calls)`);
+  await assert.rejects(() => completeGemini(env({ GEMINI_API_KEY: "k" }), cfg(), payload), (e) => {
+    assert.ok(e instanceof MinuteQuotaError);
+    assert.equal(e.model, "gemini-3.8-flash");
+    assert.ok(e.resetAt > Date.now() && e.resetAt <= Date.now() + 61_000);
+    return true;
+  });
+  assert.equal(calls.length, 1, "per-minute errors fail fast without sleeping on the same model");
 });
 
 await t("a per-day 429 becomes DailyQuotaError and is not retried", async () => {
@@ -106,6 +110,7 @@ await t("an unknown model name becomes UnknownModelError", async () => {
 /* ---------------------------------------------------------------- pool */
 
 await t("the pool starts with the strongest model and only moves on a quota problem", async () => {
+  clearMinuteQuota();
   calls = [];
   responder = () => ok("from-first");
   const r = await complete(env({ GEMINI_API_KEY: "k" }), cfg(), payload);
@@ -115,6 +120,7 @@ await t("the pool starts with the strongest model and only moves on a quota prob
 });
 
 await t("a spent model is parked and the next one answers", async () => {
+  clearMinuteQuota();
   const e = env({ GEMINI_API_KEY: "k" });
   calls = [];
   responder = (url) => (url.includes("gemini-3.8-flash") ? quotaErr(20, "per day") : ok("from-second"));
@@ -125,6 +131,27 @@ await t("a spent model is parked and the next one answers", async () => {
   const parked = JSON.parse(e.CONFIG.store["quota:v1"]);
   assert.equal(parked["gemini-3.8-flash"], nextPacificMidnight(), "the spent model is remembered");
   assert.equal("gemini-3.7-flash" in parked, false, "the healthy one is not parked");
+});
+
+await t("a minute-spent model is parked in-memory for 60s and the next one answers", async () => {
+  clearMinuteQuota();
+  const e = env({ GEMINI_API_KEY: "k" });
+  calls = [];
+  responder = (url) => (url.includes("gemini-3.8-flash") ? quotaErr(5, "per minute") : ok("from-second"));
+  const r = await complete(e, cfg(), payload);
+  assert.equal(r.text, "from-second");
+  assert.equal(calls.length, 2);
+
+  assert.ok((minuteQuota.get("gemini-3.8-flash") ?? 0) > Date.now(), "parked in memory");
+  assert.equal(e.CONFIG.store["quota:v1"], undefined, "no writes to KV for minute quota");
+
+  // immediate second call skips the minute-parked model
+  calls = [];
+  responder = () => ok("from-second-again");
+  assert.equal((await complete(e, cfg(), payload)).text, "from-second-again");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, geminiURL("gemini-3.7-flash"));
+  clearMinuteQuota();
 });
 
 await t("a parked model is skipped without spending a request on it", async () => {

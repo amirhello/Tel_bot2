@@ -1,8 +1,8 @@
 // Entrypoint. Routing only — every decision lives in another module.
 
-import { handleAdmin, json } from "admin";
-import { processMessage } from "answer";
-import { diagnostics, reportPage, resetWebhook, setup, signWebhookSecret } from "tools";
+import { handleAdmin, json } from "./admin.js";
+import { processMessage } from "./answer.js";
+import { diagnostics, reportPage, resetWebhook, setup, signWebhookSecret } from "./tools.js";
 
 const seen = new Set();
 

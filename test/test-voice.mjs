@@ -258,7 +258,7 @@ await t("a voice note is answered with audio, not with text", async () => {
   assert.equal(stats(E).requests, 1, "a voice counts against the daily cap");
 });
 
-await t("a broken live session gets a friendly error and is counted", async () => {
+await t("a broken live session falls back to text and is counted as an error", async () => {
   setup((sock, msg) => {
     if (msg.setup) sock.emit("message", JSON.stringify({ error: { message: "backend exploded" } }));
   });
@@ -267,8 +267,8 @@ await t("a broken live session gets a friendly error and is counted", async () =
 
   assert.equal(tg.filter((c) => c.method === "sendAudio").length, 0, "no half-broken audio goes out");
   const msgs = sentMessages();
-  assert.equal(msgs.length, 1, "exactly one error message");
-  assert.match(msgs[0].body.text, /دوباره/, "friendly, never technical");
+  assert.equal(msgs.length, 1, "exactly one text fallback message");
+  assert.ok(msgs[0].body.text.includes("جواب"), "falls back to text reply so answer is not lost");
   assert.ok(stats(E).errors >= 1, "the failure is counted");
 });
 

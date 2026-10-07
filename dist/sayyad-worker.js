@@ -368,6 +368,10 @@ function defaultConfig(personas) {
       video: { enabled: true, maxMB: 4, maxPer: 1 },
       audio: { enabled: true, maxMB: 8, maxPer: 1 },
     },
+    voice: {
+      enabled: true,
+      model: "gemini-3.8-live",
+    },
     personas: { ...personas },
   };
 }
@@ -398,6 +402,11 @@ function normalizeConfig(saved, personas) {
       maxPer: clampNum(m.maxPer, 1, 4, base.media[k].maxPer),
     };
   }
+
+  c.voice = {
+    enabled: saved?.voice?.enabled !== false,
+    model: String(saved?.voice?.model || base.voice.model).trim(),
+  };
 
   c.thinking = THINKING_LEVELS.includes(c.thinking) ? c.thinking : "medium";
   c.maxTokens = clampNum(c.maxTokens, 200, 8000, 2000);
@@ -505,7 +514,7 @@ async function saveConfig(env, config) {
 
 /* ------------------------------------------------------------------ stats */
 
-const EMPTY_STATS = { requests: 0, errors: 0, replies: 0, day: null, today: 0, lastUsed: null, lastError: null };
+const EMPTY_STATS = { requests: 0, errors: 0, replies: 0, day: null, today: 0, lastUsed: null, lastError: null, recentErrors: [] };
 
 function normalizeStats(s) {
   return {
@@ -515,6 +524,7 @@ function normalizeStats(s) {
     errors: Number(s?.errors ?? 0),
     replies: Number(s?.replies ?? 0),
     today: Number(s?.today ?? 0),
+    recentErrors: Array.isArray(s?.recentErrors) ? s.recentErrors.slice(0, 20) : [],
   };
 }
 
@@ -558,14 +568,20 @@ function poolResumeTime(quota, pool) {
 
 async function bumpStats(env, patch) {
   const s = await loadStats(env);
+  const errList = Array.isArray(s.recentErrors) ? [...s.recentErrors] : [];
+  if (patch.lastError) {
+    errList.unshift({ t: Date.now(), msg: String(patch.lastError).slice(0, 300) });
+    if (errList.length > 20) errList.length = 20;
+  }
   const next = {
     day: todayKey(),
     today: usedToday(s) + (patch.requests ?? 0),
     requests: s.requests + (patch.requests ?? 0),
-    errors: s.errors + (patch.errors ?? 0),
+    errors: patch.resetErrors ? 0 : s.errors + (patch.errors ?? 0),
     replies: s.replies + (patch.replies ?? 0),
     lastUsed: patch.lastUsed ?? s.lastUsed,
     lastError: patch.lastError !== undefined ? patch.lastError : s.lastError,
+    recentErrors: patch.clearErrors ? [] : errList,
   };
   try {
     await writeKey(env, STATS_KEY, next);
@@ -752,6 +768,17 @@ const DASH = `<!doctype html><html lang="en"><head><meta charset="utf-8">
   </div>
 
   <div class="card">
+    <h2>Voice replies (Gemini Live API)</h2>
+    <div class="switch">
+      <input type="checkbox" id="v_enabled">
+      <label for="v_enabled" style="margin:0">Voice reply to voice notes</label>
+    </div>
+    <div style="margin-top:12px"><label>Voice Model</label>
+      <input type="text" id="v_model" dir="ltr" placeholder="gemini-3.8-live">
+    </div>
+  </div>
+
+  <div class="card">
     <h2>Limits &amp; diagnostics</h2>
     <div class="row">
       <div><label>Max tokens per reply (200–8000)</label><input type="number" id="p_maxTokens" min="200" max="8000"></div>
@@ -762,7 +789,10 @@ const DASH = `<!doctype html><html lang="en"><head><meta charset="utf-8">
   </div>
 
   <div class="card">
-    <h2>Statistics</h2>
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <h2>Statistics &amp; Health</h2>
+      <button class="ghost" id="clearerrors" style="padding:4px 10px;font-size:12px">Clear errors</button>
+    </div>
     <div class="stats">
       <div class="stat"><b id="s_req">0</b><span>Requests</span></div>
       <div class="stat"><b id="s_today">0</b><span>Today</span></div>
@@ -770,6 +800,7 @@ const DASH = `<!doctype html><html lang="en"><head><meta charset="utf-8">
       <div class="stat"><b id="s_err">0</b><span>Errors</span></div>
     </div>
     <p class="muted" style="margin:14px 0 0" id="s_last"></p>
+    <div id="errlist" style="margin-top:12px"></div>
   </div>
 </div>
 
@@ -870,7 +901,10 @@ function renderModes(){
 
 function paint(c, st){
   selected = c.mode; renderModes();
+  window._cfg = c;
   setb("enabled", c.enabled);
+  setb("v_enabled", c.voice?.enabled !== false);
+  setv("v_model", c.voice?.model || "gemini-3.8-live");
   setv("p_kind", c.provider.kind); setv("p_model", c.provider.model);
   setv("p_baseUrl", c.provider.baseUrl); setv("p_thinking", c.thinking);
   setv("p_maxTokens", c.maxTokens); setv("p_dailyCap", c.dailyCap);
@@ -886,13 +920,33 @@ function paint(c, st){
   document.getElementById("s_req").textContent = st.requests || 0;
   document.getElementById("s_today").textContent = st.today || 0;
   document.getElementById("s_rep").textContent = st.replies || 0;
-  document.getElementById("s_err").textContent = st.errors || 0;
+  var errEl = document.getElementById("s_err");
+  errEl.textContent = st.errors || 0;
+  errEl.style.color = (st.errors > 0) ? "var(--bad)" : "inherit";
   document.getElementById("s_last").textContent = "Last request: " + (st.lastUsed || "never") + "  ·  Last error: " + (st.lastError || "none");
+  var elist = document.getElementById("errlist");
+  if (elist) {
+    elist.innerHTML = "";
+    var rErr = st.recentErrors || [];
+    if (rErr.length) {
+      rErr.forEach(function(it){
+        var d = el("div", "tag", stamp(it.t) + " · " + it.msg);
+        d.style.display = "block";
+        d.style.margin = "4px 0";
+        d.style.color = "var(--bad)";
+        d.style.borderColor = "#491d22";
+        d.style.background = "#180f12";
+        d.style.padding = "6px 10px";
+        elist.appendChild(d);
+      });
+    }
+  }
 }
 
 function collect(){
   var body = {
     enabled: document.getElementById("enabled").checked,
+    voice: { enabled: document.getElementById("v_enabled").checked, model: val("v_model") },
     mode: selected,
     extra: val("p_extra"),
     maxTokens: val("p_maxTokens"),
@@ -962,6 +1016,15 @@ document.querySelectorAll(".tab").forEach(function(t){
 document.getElementById("save").onclick = function(e){ save(e); };
 document.getElementById("save2").onclick = function(e){ save(e); };
 document.getElementById("logrefresh").onclick = loadLog;
+var clrBtn = document.getElementById("clearerrors");
+if (clrBtn) {
+  clrBtn.onclick = function(){
+    if (!confirm("Clear error history?")) return;
+    fetch("/admin/api/clear-errors", { method: "POST" })
+      .then(function(r){ return r.json(); })
+      .then(function(d){ if (d.ok) paint(window._cfg || {}, d.stats); toast("errors cleared", "ok"); });
+  };
+}
 
 document.getElementById("poolreset").onclick = function(){
   if (!confirm("Replace the pool with the built-in defaults?")) return;
@@ -1029,13 +1092,22 @@ function readPatch(body) {
   if ("maxTokens" in body) patch.maxTokens = body.maxTokens;
   if ("dailyCap" in body) patch.dailyCap = body.dailyCap;
 
+  if (body.voice && typeof body.voice === "object") {
+    patch.voice = {
+      enabled: body.voice.enabled !== false,
+      model: typeof body.voice.model === "string" ? body.voice.model.trim() : undefined,
+    };
+  }
+
   if (body.provider && typeof body.provider === "object") {
     patch.provider = {
       kind: ["gemini", "openai"].includes(body.provider.kind) ? body.provider.kind : undefined,
       model: body.provider.model,
       baseUrl: body.provider.baseUrl,
-      modelPool: body.modelPool,
+      modelPool: body.provider.modelPool ?? body.modelPool,
     };
+  } else if (body.modelPool) {
+    patch.provider = { modelPool: body.modelPool };
   }
   if (body.media && typeof body.media === "object") {
     patch.media = {};
@@ -1062,6 +1134,7 @@ function deepMerge(base, patch) {
     out.media = { ...base.media };
     for (const k of Object.keys(patch.media)) out.media[k] = { ...base.media[k], ...patch.media[k] };
   }
+  if (patch.voice) out.voice = { ...base.voice, ...patch.voice };
   if (patch.provider) out.provider = { ...base.provider, ...patch.provider };
   if (patch.safety) out.safety = { ...base.safety, ...patch.safety };
   if (patch.personas) out.personas = { ...base.personas, ...patch.personas };
@@ -1091,6 +1164,12 @@ async function handleAdmin(req, env, path) {
 
   if (path === "/admin/api/logout") {
     return new Response(null, { status: 303, headers: { location: "/admin", "set-cookie": `${COOKIE}=; Path=/; HttpOnly; Max-Age=0` } });
+  }
+
+  if (path === "/admin/api/clear-errors" && req.method === "POST") {
+    if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
+    const stats = await bumpStats(env, { resetErrors: true, clearErrors: true, lastError: null });
+    return json({ ok: true, stats });
   }
 
   if (path === "/admin/api/log") {
@@ -1224,6 +1303,16 @@ class DailyQuotaError extends ApiError {
   }
 }
 
+/** This model's per-minute quota is spent (RPM/TPM). Parked for 60 seconds. */
+class MinuteQuotaError extends ApiError {
+  constructor(model, message, resetAt = Date.now() + 60_000) {
+    super(message, 429);
+    this.name = "MinuteQuotaError";
+    this.model = model;
+    this.resetAt = resetAt;
+  }
+}
+
 /** The provider does not know this model name. Never worth trying again today. */
 class UnknownModelError extends ApiError {
   constructor(model, message) {
@@ -1292,10 +1381,10 @@ function readGeminiText(data) {
 }
 
 /**
- * A spent daily quota is permanent for the day, so it must not be retried three times
- * per model — that would burn the whole pool to re-read a message we already understand.
+ * A spent quota (day or minute) is not retried with backoff on the same model —
+ * we want to move on to the next model in the pool immediately.
  */
-const retryableForGemini = (e) => isTransient(e) && quotaKind(e.message) !== "day";
+const retryableForGemini = (e) => isTransient(e) && quotaKind(e.message) !== "day" && quotaKind(e.message) !== "minute";
 
 /**
  * Models differ in which knobs they accept — Gemma rejects thinkingConfig, some tiers
@@ -1329,6 +1418,9 @@ async function completeGemini(env, cfg, { system, parts, maxTokens }) {
       if (e.status === 404) throw new UnknownModelError(model, `${model}: ${e.message}`);
       if ((e.status === 429 || e.status === 503) && quotaKind(e.message) === "day") {
         throw new DailyQuotaError(model, `${model}: ${e.message}`);
+      }
+      if ((e.status === 429 || e.status === 503) && quotaKind(e.message) === "minute") {
+        throw new MinuteQuotaError(model, `${model}: ${e.message}`);
       }
       // A rejected knob is worth retrying with fewer of them; anything else must surface.
       if (!isShapeError(e) || shape === shapes(cfg).at(-1)) throw e;
@@ -1434,6 +1526,13 @@ const readContent = (data) =>
 
 const PROVIDERS = { gemini: completeGemini, openai: completeOpenAI };
 
+/** In-memory parking for per-minute rate limits (RPM/TPM). Costs 0 KV writes. */
+const minuteQuota = new Map();
+
+function clearMinuteQuota() {
+  minuteQuota.clear();
+}
+
 function providerFor(cfg) {
   const impl = PROVIDERS[cfg.provider?.kind];
   if (!impl) throw new ApiError(`unknown provider "${cfg.provider?.kind}"`, 500);
@@ -1465,6 +1564,7 @@ async function runGeminiPool(env, cfg, payload) {
 
   for (const model of pool) {
     if ((quota[model] ?? 0) > now) continue;
+    if ((minuteQuota.get(model) ?? 0) > now) continue;
 
     try {
       const use = { ...cfg, provider: { ...cfg.provider, model } };
@@ -1479,6 +1579,10 @@ async function runGeminiPool(env, cfg, payload) {
         dirty.add(e.model);
         continue;
       }
+      if (e instanceof MinuteQuotaError) {
+        minuteQuota.set(e.model, e.resetAt);
+        continue;
+      }
       if (e instanceof UnknownModelError) {
         // A typo costs one request; parking it for the day keeps it from costing more.
         quota[e.model] = nextPacificMidnight();
@@ -1491,8 +1595,11 @@ async function runGeminiPool(env, cfg, payload) {
 
   if (dirty.size) await saveQuota(env, quota);
 
-  if (last instanceof DailyQuotaError || pool.some((m) => (quota[m] ?? 0) > now)) {
-    throw new PoolExhausted(poolResumeTime(quota, pool), last?.message);
+  const anyParked = pool.some((m) => (quota[m] ?? 0) > now || (minuteQuota.get(m) ?? 0) > now);
+  if (last instanceof DailyQuotaError || last instanceof MinuteQuotaError || anyParked) {
+    const unparkTimes = pool.map((m) => Math.max(quota[m] ?? 0, minuteQuota.get(m) ?? 0)).filter((t) => t > now);
+    const resumeAt = unparkTimes.length ? Math.min(...unparkTimes) : poolResumeTime(quota, pool);
+    throw new PoolExhausted(resumeAt, last?.message);
   }
   throw last ?? new PoolExhausted(nextPacificMidnight(), "no model available");
 }
@@ -1767,6 +1874,11 @@ const LIVE_ENDPOINT =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
 const DEFAULT_MODEL = "gemini-3.8-live";
+const FALLBACK_VOICE_MODELS = [
+  "gemini-3.8-live",
+  "gemini-2.5-flash-native-audio-dialog",
+  "gemini-2.0-flash-exp",
+];
 const WAV_RATE = 24000; // Live API audio output: PCM 16-bit little-endian, 24 kHz mono
 const SPOKEN_MAX = 1500; // ~1.5 min of speech; longer answers would blow the 30 s window
 const STALL_MS = 2500; // no new audio for this long ⇒ the turn is over (turnComplete can be very late)
@@ -1858,16 +1970,7 @@ function base64Bytes(b64) {
  * A turn that produced *some* audio but died before `turnComplete` still counts as a
  * success — a slightly short answer beats an error message.
  */
-async function speak(env, cfg, text, opts = {}) {
-  const key = env.GEMINI_API_KEY;
-  if (!key) throw new Error("live voice: GEMINI_API_KEY is not set");
-
-  const words = spokenText(text);
-  if (!words) throw new Error("live voice: nothing to say");
-
-  const timeoutMs = opts.timeoutMs ?? liveTimeoutMs;
-
-  const model = cfg?.voice?.model || DEFAULT_MODEL;
+async function speakOnce(key, model, words, timeoutMs) {
   const res = await fetch(`${LIVE_ENDPOINT}?key=${encodeURIComponent(key)}`, {
     headers: { Upgrade: "websocket" },
   });
@@ -1909,11 +2012,6 @@ async function speak(env, cfg, text, opts = {}) {
 
     const send = (msg) => ws.send(JSON.stringify(msg));
 
-    /**
-     * Frames are handled strictly in order, and close/error wait for the queue to drain —
-     * otherwise a frame still being decoded would be lost to a fast close, and audio that
-     * DID arrive would look like audio that never did.
-     */
     let queue = Promise.resolve();
     const enqueue = (ev) => {
       queue = queue.then(() => handle(ev)).catch(() => {});
@@ -1973,6 +2071,43 @@ async function speak(env, cfg, text, opts = {}) {
       },
     });
   });
+}
+
+/**
+ * Say `text` out loud. Resolves with a WAV (Uint8Array), throws on anything unexpected.
+ * A turn that produced *some* audio but died before `turnComplete` still counts as a
+ * success — a slightly short answer beats an error message.
+ */
+async function speak(env, cfg, text, opts = {}) {
+  const key = env.GEMINI_API_KEY;
+  if (!key) throw new Error("live voice: GEMINI_API_KEY is not set");
+
+  const words = spokenText(text);
+  if (!words) throw new Error("live voice: nothing to say");
+
+  const timeoutMs = opts.timeoutMs ?? liveTimeoutMs;
+  const startAt = Date.now();
+  const primary = cfg?.voice?.model || DEFAULT_MODEL;
+  const pool = [primary, ...FALLBACK_VOICE_MODELS.filter((m) => m !== primary)];
+
+  let lastErr;
+  for (let i = 0; i < pool.length; i++) {
+    const model = pool[i];
+    const elapsed = Date.now() - startAt;
+    const remaining = timeoutMs - elapsed;
+    if (i > 0 && remaining < 2000) break;
+
+    try {
+      return await speakOnce(key, model, words, Math.max(1, remaining));
+    } catch (e) {
+      lastErr = e;
+      if (!/model|not found|unknown|404|unsupported|unavailable/i.test(e.message)) {
+        throw e;
+      }
+    }
+  }
+
+  throw lastErr ?? new Error("live voice: all voice models failed");
 }
 
 // ------------------------------ src/answer.js ------------------------------
@@ -2133,20 +2268,25 @@ async function reply(env, msg, cfg) {
   if (voiceReply(msg, cfg)) {
     const startAt = Date.now();
     const elapsed = () => Date.now() - startAt;
-    // Telegram's indicator dies after ~5 s, so heartbeat one until the audio ships —
-    // the upload itself can take a few seconds on a big file.
     const keep = setInterval(() => sendChatAction(token, chatId, "upload_voice").catch(() => {}), 4000);
+    let audioSent = false;
     try {
-      // Speaking costs wall-clock too: bail out well before waitUntil ends (30 s), or the
-      // worker is killed mid-sentence and the user gets nothing at all.
       if (elapsed() > VOICE_BUDGET_MS) throw new Error("live voice: over the time budget");
       const wav = await speak(env, cfg, answer, { timeoutMs: Math.max(3000, VOICE_BUDGET_MS - elapsed()) });
       await sendAudioFile(token, chatId, wav, "sayyad.wav", "audio/wav", msg.message_id);
+      audioSent = true;
+      await bumpStats(env, { replies: 1 });
+      return;
+    } catch (voiceErr) {
+      await bumpStats(env, { errors: 1, lastError: `voice failed: ${voiceErr?.message ?? voiceErr}`.slice(0, 300) });
     } finally {
       clearInterval(keep);
     }
-    await bumpStats(env, { replies: 1 });
-    return;
+    if (!audioSent) {
+      await sendLong(token, chatId, answer, msg.message_id);
+      await bumpStats(env, { replies: 1 });
+      return;
+    }
   }
 
   await sendLong(token, chatId, answer, msg.message_id);
@@ -2218,9 +2358,27 @@ async function diagnostics(env) {
       parts: [{ type: "text", text: "say: تست" }],
       maxTokens: 64,
     });
-    out.checks.model = { ok: true, sample: r.text.slice(0, 120), usage: r.usage };
+    out.checks.text = { ok: true, sample: r.text.slice(0, 120), usage: r.usage };
+    out.checks.model = out.checks.text;
   } catch (e) {
-    out.checks.model = { ok: false, error: String(e?.message ?? e).slice(0, 300) };
+    out.checks.text = { ok: false, error: String(e?.message ?? e).slice(0, 300) };
+    out.checks.model = out.checks.text;
+  }
+
+  if (env.DIAG_IMAGE) {
+    try {
+      const rImg = await complete(env, cfg, {
+        system: "You are Sayyad. Answer with one short Persian word.",
+        parts: [
+          { type: "image", mime: "image/png", data: env.DIAG_IMAGE },
+          { type: "text", text: "تست تصویر" },
+        ],
+        maxTokens: 64,
+      });
+      out.checks.image = { ok: true, sample: rImg.text.slice(0, 120), usage: rImg.usage };
+    } catch (e) {
+      out.checks.image = { ok: false, error: String(e?.message ?? e).slice(0, 300) };
+    }
   }
 
   out.note = "Video and audio are only sent through the Gemini native provider.";
@@ -2324,4 +2482,4 @@ async function webhook(req, env, ctx) {
   return new Response("ok");
 }
 
-export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, STATS_KEY, THINKING_LEVELS, TRIGGER, UnknownModelError, appendArchive, archiveRecord, botId, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, collectMedia, complete, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, detectMedia, diagnostics, downloadFile, endpointOf, esc, getMe, getWebhookInfo, handleAdmin, isAuthed, isCommand, isCredentialError, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mdToHtml, mediaKind, migrateLegacy, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiText, readPatch, renderDashboard, renderLogin, replyContext, reportPage, resetWebhook, safetySettings, saveConfig, saveQuota, sendAudioFile, sendChatAction, sendLong, sendText, setLiveTimeout, setWebhook, setup, shouldAnswer, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday };
+export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MinuteQuotaError, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, STATS_KEY, THINKING_LEVELS, TRIGGER, UnknownModelError, appendArchive, archiveRecord, botId, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearMinuteQuota, collectMedia, complete, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, detectMedia, diagnostics, downloadFile, endpointOf, esc, getMe, getWebhookInfo, handleAdmin, isAuthed, isCommand, isCredentialError, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mdToHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiText, readPatch, renderDashboard, renderLogin, replyContext, reportPage, resetWebhook, safetySettings, saveConfig, saveQuota, sendAudioFile, sendChatAction, sendLong, sendText, setLiveTimeout, setWebhook, setup, shouldAnswer, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday };

@@ -3,8 +3,8 @@
 // Everything here is base64 already, so neither provider module has to know about
 // Telegram. Each media type has its own on/off switch, size cap and per-message limit.
 
-import { downloadFile } from "telegram";
-import { toBase64 } from "text";
+import { downloadFile } from "./telegram.js";
+import { toBase64 } from "./text.js";
 
 /** Map a Telegram message (or a message it replied to) onto one media slot. */
 export function detectMedia(msg) {

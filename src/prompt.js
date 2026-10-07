@@ -3,8 +3,8 @@
 // The prompt is built in a provider-neutral shape: plain text plus a list of media parts.
 // Each provider module translates that shape into its own wire format.
 
-import { TRIGGER } from "trigger";
-import { normalizeFa, truncate } from "text";
+import { TRIGGER } from "./trigger.js";
+import { normalizeFa, truncate } from "./text.js";
 
 export const REPLY_TEXT_LIMIT = 3000;
 

@@ -4,12 +4,19 @@
 // The rest of the bot never sees a provider-specific wire format: it hands over neutral
 // parts and gets back plain text.
 
-import { ApiError, isCredentialError } from "http";
-import { DailyQuotaError, UnknownModelError, completeGemini } from "providerGemini";
-import { completeOpenAI } from "providerOpenai";
-import { DEFAULT_BASE_URLS, loadQuota, nextPacificMidnight, poolResumeTime, saveQuota } from "store";
+import { ApiError, isCredentialError } from "./http.js";
+import { DailyQuotaError, MinuteQuotaError, UnknownModelError, completeGemini } from "./providerGemini.js";
+import { completeOpenAI } from "./providerOpenai.js";
+import { DEFAULT_BASE_URLS, loadQuota, nextPacificMidnight, poolResumeTime, saveQuota } from "./store.js";
 
 const PROVIDERS = { gemini: completeGemini, openai: completeOpenAI };
+
+/** In-memory parking for per-minute rate limits (RPM/TPM). Costs 0 KV writes. */
+export const minuteQuota = new Map();
+
+export function clearMinuteQuota() {
+  minuteQuota.clear();
+}
 
 export function providerFor(cfg) {
   const impl = PROVIDERS[cfg.provider?.kind];
@@ -42,6 +49,7 @@ async function runGeminiPool(env, cfg, payload) {
 
   for (const model of pool) {
     if ((quota[model] ?? 0) > now) continue;
+    if ((minuteQuota.get(model) ?? 0) > now) continue;
 
     try {
       const use = { ...cfg, provider: { ...cfg.provider, model } };
@@ -56,6 +64,10 @@ async function runGeminiPool(env, cfg, payload) {
         dirty.add(e.model);
         continue;
       }
+      if (e instanceof MinuteQuotaError) {
+        minuteQuota.set(e.model, e.resetAt);
+        continue;
+      }
       if (e instanceof UnknownModelError) {
         // A typo costs one request; parking it for the day keeps it from costing more.
         quota[e.model] = nextPacificMidnight();
@@ -68,8 +80,11 @@ async function runGeminiPool(env, cfg, payload) {
 
   if (dirty.size) await saveQuota(env, quota);
 
-  if (last instanceof DailyQuotaError || pool.some((m) => (quota[m] ?? 0) > now)) {
-    throw new PoolExhausted(poolResumeTime(quota, pool), last?.message);
+  const anyParked = pool.some((m) => (quota[m] ?? 0) > now || (minuteQuota.get(m) ?? 0) > now);
+  if (last instanceof DailyQuotaError || last instanceof MinuteQuotaError || anyParked) {
+    const unparkTimes = pool.map((m) => Math.max(quota[m] ?? 0, minuteQuota.get(m) ?? 0)).filter((t) => t > now);
+    const resumeAt = unparkTimes.length ? Math.min(...unparkTimes) : poolResumeTime(quota, pool);
+    throw new PoolExhausted(resumeAt, last?.message);
   }
   throw last ?? new PoolExhausted(nextPacificMidnight(), "no model available");
 }

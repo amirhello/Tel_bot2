@@ -26,28 +26,31 @@ Worker فعلی روی OpenRouter کار می‌کند (پاسخ `403` می‌گ
 
 برای هر ماژول:
 
-- **Name** را دقیقاً مثل جدول زیر بنویس (حروف بزرگ/کوچک مهم است)
+- **Name** را دقیقاً **`name.js`** بنویس (مثلاً `admin.js` — با پسوند `.js`، چون importها نسبی‌اند: `from "./admin.js"`)
+
 - محتوای فایل `src/<name>.js` را کامل کپی و داخلش بچسبان
 
-> ترتیب ساختن مهم نیست — ولی **اول این ۱۵ تا را بساز**، بعد `index` را آخر.
+> نام ماژول در داشبورد **باید دقیقاً با پسوند `.js`** باشد، وگرنه `from "./name.js"` حل نمی‌شود.
+
+- ترتیب ساختن مهم نیست — ولی **اول این ۱۵ تا را بساز**، بعد `index` را آخر.
 
 | # | Name در داشبورد | فایلی که کپی می‌کنی |
 |---|---|---|
-| 1 | `text` | `src/text.js` |
-| 2 | `store` | `src/store.js` |
-| 3 | `http` | `src/http.js` |
-| 4 | `trigger` | `src/trigger.js` |
-| 5 | `prompt` | `src/prompt.js` |
-| 6 | `telegram` | `src/telegram.js` |
-| 7 | `archive` | `src/archive.js` |
-| 8 | `media` | `src/media.js` |
-| 9 | `providerOpenai` | `src/providerOpenai.js` |
-| 10 | `providerGemini` | `src/providerGemini.js` |
-| 11 | `llm` | `src/llm.js` |
-| 12 | `answer` | `src/answer.js` |
-| 13 | `voice` | `src/voice.js` |
-| 14 | `admin` | `src/admin.js` |
-| 15 | `tools` | `src/tools.js` |
+| 1 | `text.js` | `src/text.js` |
+| 2 | `store.js` | `src/store.js` |
+| 3 | `http.js` | `src/http.js` |
+| 4 | `trigger.js` | `src/trigger.js` |
+| 5 | `prompt.js` | `src/prompt.js` |
+| 6 | `telegram.js` | `src/telegram.js` |
+| 7 | `archive.js` | `src/archive.js` |
+| 8 | `media.js` | `src/media.js` |
+| 9 | `providerOpenai.js` | `src/providerOpenai.js` |
+| 10 | `providerGemini.js` | `src/providerGemini.js` |
+| 11 | `llm.js` | `src/llm.js` |
+| 12 | `answer.js` | `src/answer.js` |
+| 13 | `voice.js` | `src/voice.js` |
+| 14 | `admin.js` | `src/admin.js` |
+| 15 | `tools.js` | `src/tools.js` |
 
 ### اگر قبلاً نسخه‌ی قبلی را نصب کرده‌ای
 
@@ -59,7 +62,7 @@ answer.js   telegram.js   +   voice.js (جدید)
 
 و بعد **Deploy** و یک بار `/setup` را باز کن.
 
-**نکته:** خطوط `import { ... } from "name"` را **دست نزن** — اینها اسم ماژول‌هایی هستند که همین الان ساخته‌ای.
+**نکته:** خطوط `import { ... } from "./name.js"` را **دست نزن** — اینها اسم ماژول‌هایی هستند که همین الان ساخته‌ای.
 
 ---
 
@@ -68,9 +71,9 @@ answer.js   telegram.js   +   voice.js (جدید)
 در تب اصلی ویرایشگر (جایی که کد اصلی بود)، **کل محتوای قبلی را پاک کن** و این را بچسبان:
 
 ```js
-import { handleAdmin, json } from "admin";
-import { processMessage } from "answer";
-import { diagnostics, reportPage, resetWebhook, setup, signWebhookSecret } from "tools";
+import { handleAdmin, json } from "./admin.js";
+import { processMessage } from "./answer.js";
+import { diagnostics, reportPage, resetWebhook, setup, signWebhookSecret } from "./tools.js";
 
 const seen = new Set();
 

@@ -1,16 +1,17 @@
 // The admin panel: one route tree, one HTML document, one stylesheet.
 
-import { readArchive } from "archive";
-import { DEFAULT_PERSONAS, MODES, MODE_LABELS } from "prompt";
+import { readArchive } from "./archive.js";
+import { DEFAULT_PERSONAS, MODES, MODE_LABELS } from "./prompt.js";
 import {
   DEFAULT_MODEL_POOL,
   SAFETY_CATEGORY_KEYS,
   SAFETY_LEVELS,
   THINKING_LEVELS,
+  bumpStats,
   loadConfig,
   loadQuota,
   saveConfig,
-} from "store";
+} from "./store.js";
 
 const COOKIE = "sayyad_admin";
 const MEDIA_KINDS = ["image", "video", "audio"];
@@ -182,6 +183,17 @@ const DASH = `<!doctype html><html lang="en"><head><meta charset="utf-8">
   </div>
 
   <div class="card">
+    <h2>Voice replies (Gemini Live API)</h2>
+    <div class="switch">
+      <input type="checkbox" id="v_enabled">
+      <label for="v_enabled" style="margin:0">Voice reply to voice notes</label>
+    </div>
+    <div style="margin-top:12px"><label>Voice Model</label>
+      <input type="text" id="v_model" dir="ltr" placeholder="gemini-3.8-live">
+    </div>
+  </div>
+
+  <div class="card">
     <h2>Limits &amp; diagnostics</h2>
     <div class="row">
       <div><label>Max tokens per reply (200–8000)</label><input type="number" id="p_maxTokens" min="200" max="8000"></div>
@@ -192,7 +204,10 @@ const DASH = `<!doctype html><html lang="en"><head><meta charset="utf-8">
   </div>
 
   <div class="card">
-    <h2>Statistics</h2>
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <h2>Statistics &amp; Health</h2>
+      <button class="ghost" id="clearerrors" style="padding:4px 10px;font-size:12px">Clear errors</button>
+    </div>
     <div class="stats">
       <div class="stat"><b id="s_req">0</b><span>Requests</span></div>
       <div class="stat"><b id="s_today">0</b><span>Today</span></div>
@@ -200,6 +215,7 @@ const DASH = `<!doctype html><html lang="en"><head><meta charset="utf-8">
       <div class="stat"><b id="s_err">0</b><span>Errors</span></div>
     </div>
     <p class="muted" style="margin:14px 0 0" id="s_last"></p>
+    <div id="errlist" style="margin-top:12px"></div>
   </div>
 </div>
 
@@ -300,7 +316,10 @@ function renderModes(){
 
 function paint(c, st){
   selected = c.mode; renderModes();
+  window._cfg = c;
   setb("enabled", c.enabled);
+  setb("v_enabled", c.voice?.enabled !== false);
+  setv("v_model", c.voice?.model || "gemini-3.8-live");
   setv("p_kind", c.provider.kind); setv("p_model", c.provider.model);
   setv("p_baseUrl", c.provider.baseUrl); setv("p_thinking", c.thinking);
   setv("p_maxTokens", c.maxTokens); setv("p_dailyCap", c.dailyCap);
@@ -316,13 +335,33 @@ function paint(c, st){
   document.getElementById("s_req").textContent = st.requests || 0;
   document.getElementById("s_today").textContent = st.today || 0;
   document.getElementById("s_rep").textContent = st.replies || 0;
-  document.getElementById("s_err").textContent = st.errors || 0;
+  var errEl = document.getElementById("s_err");
+  errEl.textContent = st.errors || 0;
+  errEl.style.color = (st.errors > 0) ? "var(--bad)" : "inherit";
   document.getElementById("s_last").textContent = "Last request: " + (st.lastUsed || "never") + "  ·  Last error: " + (st.lastError || "none");
+  var elist = document.getElementById("errlist");
+  if (elist) {
+    elist.innerHTML = "";
+    var rErr = st.recentErrors || [];
+    if (rErr.length) {
+      rErr.forEach(function(it){
+        var d = el("div", "tag", stamp(it.t) + " · " + it.msg);
+        d.style.display = "block";
+        d.style.margin = "4px 0";
+        d.style.color = "var(--bad)";
+        d.style.borderColor = "#491d22";
+        d.style.background = "#180f12";
+        d.style.padding = "6px 10px";
+        elist.appendChild(d);
+      });
+    }
+  }
 }
 
 function collect(){
   var body = {
     enabled: document.getElementById("enabled").checked,
+    voice: { enabled: document.getElementById("v_enabled").checked, model: val("v_model") },
     mode: selected,
     extra: val("p_extra"),
     maxTokens: val("p_maxTokens"),
@@ -392,6 +431,15 @@ document.querySelectorAll(".tab").forEach(function(t){
 document.getElementById("save").onclick = function(e){ save(e); };
 document.getElementById("save2").onclick = function(e){ save(e); };
 document.getElementById("logrefresh").onclick = loadLog;
+var clrBtn = document.getElementById("clearerrors");
+if (clrBtn) {
+  clrBtn.onclick = function(){
+    if (!confirm("Clear error history?")) return;
+    fetch("/admin/api/clear-errors", { method: "POST" })
+      .then(function(r){ return r.json(); })
+      .then(function(d){ if (d.ok) paint(window._cfg || {}, d.stats); toast("errors cleared", "ok"); });
+  };
+}
 
 document.getElementById("poolreset").onclick = function(){
   if (!confirm("Replace the pool with the built-in defaults?")) return;
@@ -459,13 +507,22 @@ export function readPatch(body) {
   if ("maxTokens" in body) patch.maxTokens = body.maxTokens;
   if ("dailyCap" in body) patch.dailyCap = body.dailyCap;
 
+  if (body.voice && typeof body.voice === "object") {
+    patch.voice = {
+      enabled: body.voice.enabled !== false,
+      model: typeof body.voice.model === "string" ? body.voice.model.trim() : undefined,
+    };
+  }
+
   if (body.provider && typeof body.provider === "object") {
     patch.provider = {
       kind: ["gemini", "openai"].includes(body.provider.kind) ? body.provider.kind : undefined,
       model: body.provider.model,
       baseUrl: body.provider.baseUrl,
-      modelPool: body.modelPool,
+      modelPool: body.provider.modelPool ?? body.modelPool,
     };
+  } else if (body.modelPool) {
+    patch.provider = { modelPool: body.modelPool };
   }
   if (body.media && typeof body.media === "object") {
     patch.media = {};
@@ -492,6 +549,7 @@ function deepMerge(base, patch) {
     out.media = { ...base.media };
     for (const k of Object.keys(patch.media)) out.media[k] = { ...base.media[k], ...patch.media[k] };
   }
+  if (patch.voice) out.voice = { ...base.voice, ...patch.voice };
   if (patch.provider) out.provider = { ...base.provider, ...patch.provider };
   if (patch.safety) out.safety = { ...base.safety, ...patch.safety };
   if (patch.personas) out.personas = { ...base.personas, ...patch.personas };
@@ -521,6 +579,12 @@ export async function handleAdmin(req, env, path) {
 
   if (path === "/admin/api/logout") {
     return new Response(null, { status: 303, headers: { location: "/admin", "set-cookie": `${COOKIE}=; Path=/; HttpOnly; Max-Age=0` } });
+  }
+
+  if (path === "/admin/api/clear-errors" && req.method === "POST") {
+    if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
+    const stats = await bumpStats(env, { resetErrors: true, clearErrors: true, lastError: null });
+    return json({ ok: true, stats });
   }
 
   if (path === "/admin/api/log") {

@@ -1,6 +1,6 @@
 // Telegram Bot API client and the outbound half of a reply.
 
-import { mdToHtml, splitText } from "text";
+import { mdToHtml, splitText } from "./text.js";
 
 const api = (token, method) => `https://api.telegram.org/bot${token}/${method}`;
 

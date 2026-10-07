@@ -3,8 +3,8 @@
 // Wire format: { inlineData: { mimeType, data } } under
 // POST {baseUrl}/models/{model}:generateContent
 
-import { ApiError, callJson, isShapeError, isTransient } from "http";
-import { SAFETY_CATEGORIES, nextPacificMidnight } from "store";
+import { ApiError, callJson, isShapeError, isTransient } from "./http.js";
+import { SAFETY_CATEGORIES, nextPacificMidnight } from "./store.js";
 
 /** This model's daily quota is spent. Distinct from a per-minute 429: waiting does not help. */
 export class DailyQuotaError extends ApiError {
@@ -13,6 +13,16 @@ export class DailyQuotaError extends ApiError {
     this.name = "DailyQuotaError";
     this.model = model;
     this.resetAt = nextPacificMidnight();
+  }
+}
+
+/** This model's per-minute quota is spent (RPM/TPM). Parked for 60 seconds. */
+export class MinuteQuotaError extends ApiError {
+  constructor(model, message, resetAt = Date.now() + 60_000) {
+    super(message, 429);
+    this.name = "MinuteQuotaError";
+    this.model = model;
+    this.resetAt = resetAt;
   }
 }
 
@@ -84,10 +94,10 @@ export function readGeminiText(data) {
 }
 
 /**
- * A spent daily quota is permanent for the day, so it must not be retried three times
- * per model — that would burn the whole pool to re-read a message we already understand.
+ * A spent quota (day or minute) is not retried with backoff on the same model —
+ * we want to move on to the next model in the pool immediately.
  */
-const retryableForGemini = (e) => isTransient(e) && quotaKind(e.message) !== "day";
+const retryableForGemini = (e) => isTransient(e) && quotaKind(e.message) !== "day" && quotaKind(e.message) !== "minute";
 
 /**
  * Models differ in which knobs they accept — Gemma rejects thinkingConfig, some tiers
@@ -121,6 +131,9 @@ export async function completeGemini(env, cfg, { system, parts, maxTokens }) {
       if (e.status === 404) throw new UnknownModelError(model, `${model}: ${e.message}`);
       if ((e.status === 429 || e.status === 503) && quotaKind(e.message) === "day") {
         throw new DailyQuotaError(model, `${model}: ${e.message}`);
+      }
+      if ((e.status === 429 || e.status === 503) && quotaKind(e.message) === "minute") {
+        throw new MinuteQuotaError(model, `${model}: ${e.message}`);
       }
       // A rejected knob is worth retrying with fewer of them; anything else must surface.
       if (!isShapeError(e) || shape === shapes(cfg).at(-1)) throw e;

@@ -1,13 +1,13 @@
 // The answering pipeline: webhook update in, Telegram reply out.
 
-import { appendArchive, archiveRecord } from "archive";
-import { PoolExhausted, complete } from "llm";
-import { collectMedia } from "media";
-import { DEFAULT_PERSONAS, buildSystemPrompt, buildUserContent, replyContext } from "prompt";
-import { botId, sendAudioFile, sendChatAction, sendLong, sendText } from "telegram";
-import { isCommand, isSupportedChat, shouldAnswer } from "trigger";
-import { bumpStats, loadConfig, loadStats, usedToday } from "store";
-import { speak } from "voice";
+import { appendArchive, archiveRecord } from "./archive.js";
+import { PoolExhausted, complete } from "./llm.js";
+import { collectMedia } from "./media.js";
+import { DEFAULT_PERSONAS, buildSystemPrompt, buildUserContent, replyContext } from "./prompt.js";
+import { botId, sendAudioFile, sendChatAction, sendLong, sendText } from "./telegram.js";
+import { isCommand, isSupportedChat, shouldAnswer } from "./trigger.js";
+import { bumpStats, loadConfig, loadStats, usedToday } from "./store.js";
+import { speak } from "./voice.js";
 const ERRORS = [
   "الان یه کم درگیرم. یه بار دیگه بفرست، شاید سر جا شد.",
   "یه چیزی قاطی شد. دوباره بزن، درستش می‌کنم.",
@@ -155,20 +155,25 @@ async function reply(env, msg, cfg) {
   if (voiceReply(msg, cfg)) {
     const startAt = Date.now();
     const elapsed = () => Date.now() - startAt;
-    // Telegram's indicator dies after ~5 s, so heartbeat one until the audio ships —
-    // the upload itself can take a few seconds on a big file.
     const keep = setInterval(() => sendChatAction(token, chatId, "upload_voice").catch(() => {}), 4000);
+    let audioSent = false;
     try {
-      // Speaking costs wall-clock too: bail out well before waitUntil ends (30 s), or the
-      // worker is killed mid-sentence and the user gets nothing at all.
       if (elapsed() > VOICE_BUDGET_MS) throw new Error("live voice: over the time budget");
       const wav = await speak(env, cfg, answer, { timeoutMs: Math.max(3000, VOICE_BUDGET_MS - elapsed()) });
       await sendAudioFile(token, chatId, wav, "sayyad.wav", "audio/wav", msg.message_id);
+      audioSent = true;
+      await bumpStats(env, { replies: 1 });
+      return;
+    } catch (voiceErr) {
+      await bumpStats(env, { errors: 1, lastError: `voice failed: ${voiceErr?.message ?? voiceErr}`.slice(0, 300) });
     } finally {
       clearInterval(keep);
     }
-    await bumpStats(env, { replies: 1 });
-    return;
+    if (!audioSent) {
+      await sendLong(token, chatId, answer, msg.message_id);
+      await bumpStats(env, { replies: 1 });
+      return;
+    }
   }
 
   await sendLong(token, chatId, answer, msg.message_id);

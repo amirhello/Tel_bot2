@@ -2,7 +2,7 @@
 //
 // Wire format: { type: "image_url" | "video_url" | "input_audio", ... }
 
-import { ApiError, callJson, isShapeError } from "http";
+import { ApiError, callJson, isShapeError } from "./http.js";
 
 /** Neutral part -> OpenAI content part. */
 export function toOpenAIPart(part) {

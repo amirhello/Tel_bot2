@@ -1,9 +1,10 @@
 // Dev-only: flattens src/*.js into dist/sayyad-worker.js.
 //
-// The source files use bare module names (import { x } from "store") because that is what
-// Cloudflare's Modules tab expects. This script resolves those names by reading the import
-// graph, orders the modules topologically, strips the module syntax, and re-exports every
-// public name so the offline test suite can import the exact bundle that gets deployed.
+// The source files use relative imports (import { x } from "./store.js") because that
+// is what Cloudflare's Modules tab expects. This script resolves those names by reading
+// the import graph, orders the modules topologically, strips the module syntax, and
+// re-exports every public name so the offline test suite can import the exact bundle
+// that gets deployed.
 //
 //   node build.mjs
 import { readFileSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
@@ -16,6 +17,13 @@ const SRC = join(root, "src");
 const IMPORT_RE = /^import\s+([\s\S]*?)\s+from\s+["']([^"']+)["']\s*;/gm;
 const REEXPORT_RE = /^export\s*\{[^}]*\}\s*(?:from\s*["'][^"']+["'])?\s*;\s*$/gm;
 
+/** "./store.js" or the legacy bare "store" both mean the sibling file store.js. */
+function resolveModule(file, spec) {
+  const bare = spec.startsWith("./") ? spec.slice(2) : spec;
+  if (!/^[\w-]+\.js$/.test(bare)) throw new Error(`${file}: unsupported import specifier "${spec}"`);
+  return bare;
+}
+
 const files = readdirSync(SRC).filter((f) => f.endsWith(".js")).sort();
 const sources = new Map();
 const edges = new Map();
@@ -26,9 +34,7 @@ for (const file of files) {
 
   const deps = new Set();
   for (const m of raw.matchAll(IMPORT_RE)) {
-    const spec = m[2];
-    if (!/^[\w]+$/.test(spec)) throw new Error(`${file}: unsupported import specifier "${spec}"`);
-    deps.add(`${spec}.js`);
+    deps.add(resolveModule(file, m[2]));
   }
   edges.set(file, deps);
 }

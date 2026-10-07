@@ -76,6 +76,10 @@ export function defaultConfig(personas) {
       video: { enabled: true, maxMB: 4, maxPer: 1 },
       audio: { enabled: true, maxMB: 8, maxPer: 1 },
     },
+    voice: {
+      enabled: true,
+      model: "gemini-3.8-live",
+    },
     personas: { ...personas },
   };
 }
@@ -106,6 +110,11 @@ export function normalizeConfig(saved, personas) {
       maxPer: clampNum(m.maxPer, 1, 4, base.media[k].maxPer),
     };
   }
+
+  c.voice = {
+    enabled: saved?.voice?.enabled !== false,
+    model: String(saved?.voice?.model || base.voice.model).trim(),
+  };
 
   c.thinking = THINKING_LEVELS.includes(c.thinking) ? c.thinking : "medium";
   c.maxTokens = clampNum(c.maxTokens, 200, 8000, 2000);
@@ -213,7 +222,7 @@ export async function saveConfig(env, config) {
 
 /* ------------------------------------------------------------------ stats */
 
-const EMPTY_STATS = { requests: 0, errors: 0, replies: 0, day: null, today: 0, lastUsed: null, lastError: null };
+const EMPTY_STATS = { requests: 0, errors: 0, replies: 0, day: null, today: 0, lastUsed: null, lastError: null, recentErrors: [] };
 
 function normalizeStats(s) {
   return {
@@ -223,6 +232,7 @@ function normalizeStats(s) {
     errors: Number(s?.errors ?? 0),
     replies: Number(s?.replies ?? 0),
     today: Number(s?.today ?? 0),
+    recentErrors: Array.isArray(s?.recentErrors) ? s.recentErrors.slice(0, 20) : [],
   };
 }
 
@@ -266,14 +276,20 @@ export function poolResumeTime(quota, pool) {
 
 export async function bumpStats(env, patch) {
   const s = await loadStats(env);
+  const errList = Array.isArray(s.recentErrors) ? [...s.recentErrors] : [];
+  if (patch.lastError) {
+    errList.unshift({ t: Date.now(), msg: String(patch.lastError).slice(0, 300) });
+    if (errList.length > 20) errList.length = 20;
+  }
   const next = {
     day: todayKey(),
     today: usedToday(s) + (patch.requests ?? 0),
     requests: s.requests + (patch.requests ?? 0),
-    errors: s.errors + (patch.errors ?? 0),
+    errors: patch.resetErrors ? 0 : s.errors + (patch.errors ?? 0),
     replies: s.replies + (patch.replies ?? 0),
     lastUsed: patch.lastUsed ?? s.lastUsed,
     lastError: patch.lastError !== undefined ? patch.lastError : s.lastError,
+    recentErrors: patch.clearErrors ? [] : errList,
   };
   try {
     await writeKey(env, STATS_KEY, next);

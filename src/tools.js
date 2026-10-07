@@ -1,10 +1,10 @@
 // Operator routes: /diag (is anything broken?) and /setup (point Telegram here).
 
-import { complete } from "llm";
-import { DEFAULT_PERSONAS } from "prompt";
-import { loadConfig } from "store";
-import { deleteWebhook, getMe, getWebhookInfo, setWebhook } from "telegram";
-import { esc } from "text";
+import { complete } from "./llm.js";
+import { DEFAULT_PERSONAS } from "./prompt.js";
+import { loadConfig } from "./store.js";
+import { deleteWebhook, getMe, getWebhookInfo, setWebhook } from "./telegram.js";
+import { esc } from "./text.js";
 
 /** A live probe of both the Telegram side and the configured model. */
 export async function diagnostics(env) {
@@ -42,9 +42,27 @@ export async function diagnostics(env) {
       parts: [{ type: "text", text: "say: تست" }],
       maxTokens: 64,
     });
-    out.checks.model = { ok: true, sample: r.text.slice(0, 120), usage: r.usage };
+    out.checks.text = { ok: true, sample: r.text.slice(0, 120), usage: r.usage };
+    out.checks.model = out.checks.text;
   } catch (e) {
-    out.checks.model = { ok: false, error: String(e?.message ?? e).slice(0, 300) };
+    out.checks.text = { ok: false, error: String(e?.message ?? e).slice(0, 300) };
+    out.checks.model = out.checks.text;
+  }
+
+  if (env.DIAG_IMAGE) {
+    try {
+      const rImg = await complete(env, cfg, {
+        system: "You are Sayyad. Answer with one short Persian word.",
+        parts: [
+          { type: "image", mime: "image/png", data: env.DIAG_IMAGE },
+          { type: "text", text: "تست تصویر" },
+        ],
+        maxTokens: 64,
+      });
+      out.checks.image = { ok: true, sample: rImg.text.slice(0, 120), usage: rImg.usage };
+    } catch (e) {
+      out.checks.image = { ok: false, error: String(e?.message ?? e).slice(0, 300) };
+    }
   }
 
   out.note = "Video and audio are only sent through the Gemini native provider.";

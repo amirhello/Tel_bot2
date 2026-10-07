@@ -11,7 +11,12 @@
 const LIVE_ENDPOINT =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
-const DEFAULT_MODEL = "gemini-3.8-live";
+export const DEFAULT_MODEL = "gemini-3.8-live";
+export const FALLBACK_VOICE_MODELS = [
+  "gemini-3.8-live",
+  "gemini-2.5-flash-native-audio-dialog",
+  "gemini-2.0-flash-exp",
+];
 const WAV_RATE = 24000; // Live API audio output: PCM 16-bit little-endian, 24 kHz mono
 const SPOKEN_MAX = 1500; // ~1.5 min of speech; longer answers would blow the 30 s window
 const STALL_MS = 2500; // no new audio for this long ⇒ the turn is over (turnComplete can be very late)
@@ -103,16 +108,7 @@ function base64Bytes(b64) {
  * A turn that produced *some* audio but died before `turnComplete` still counts as a
  * success — a slightly short answer beats an error message.
  */
-export async function speak(env, cfg, text, opts = {}) {
-  const key = env.GEMINI_API_KEY;
-  if (!key) throw new Error("live voice: GEMINI_API_KEY is not set");
-
-  const words = spokenText(text);
-  if (!words) throw new Error("live voice: nothing to say");
-
-  const timeoutMs = opts.timeoutMs ?? liveTimeoutMs;
-
-  const model = cfg?.voice?.model || DEFAULT_MODEL;
+async function speakOnce(key, model, words, timeoutMs) {
   const res = await fetch(`${LIVE_ENDPOINT}?key=${encodeURIComponent(key)}`, {
     headers: { Upgrade: "websocket" },
   });
@@ -154,11 +150,6 @@ export async function speak(env, cfg, text, opts = {}) {
 
     const send = (msg) => ws.send(JSON.stringify(msg));
 
-    /**
-     * Frames are handled strictly in order, and close/error wait for the queue to drain —
-     * otherwise a frame still being decoded would be lost to a fast close, and audio that
-     * DID arrive would look like audio that never did.
-     */
     let queue = Promise.resolve();
     const enqueue = (ev) => {
       queue = queue.then(() => handle(ev)).catch(() => {});
@@ -218,4 +209,41 @@ export async function speak(env, cfg, text, opts = {}) {
       },
     });
   });
+}
+
+/**
+ * Say `text` out loud. Resolves with a WAV (Uint8Array), throws on anything unexpected.
+ * A turn that produced *some* audio but died before `turnComplete` still counts as a
+ * success — a slightly short answer beats an error message.
+ */
+export async function speak(env, cfg, text, opts = {}) {
+  const key = env.GEMINI_API_KEY;
+  if (!key) throw new Error("live voice: GEMINI_API_KEY is not set");
+
+  const words = spokenText(text);
+  if (!words) throw new Error("live voice: nothing to say");
+
+  const timeoutMs = opts.timeoutMs ?? liveTimeoutMs;
+  const startAt = Date.now();
+  const primary = cfg?.voice?.model || DEFAULT_MODEL;
+  const pool = [primary, ...FALLBACK_VOICE_MODELS.filter((m) => m !== primary)];
+
+  let lastErr;
+  for (let i = 0; i < pool.length; i++) {
+    const model = pool[i];
+    const elapsed = Date.now() - startAt;
+    const remaining = timeoutMs - elapsed;
+    if (i > 0 && remaining < 2000) break;
+
+    try {
+      return await speakOnce(key, model, words, Math.max(1, remaining));
+    } catch (e) {
+      lastErr = e;
+      if (!/model|not found|unknown|404|unsupported|unavailable/i.test(e.message)) {
+        throw e;
+      }
+    }
+  }
+
+  throw lastErr ?? new Error("live voice: all voice models failed");
 }

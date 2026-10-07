@@ -204,7 +204,7 @@ npx wrangler dev  # اجرای محلی (اول .dev.vars را از .dev.vars.ex
 
 ```
 build.mjs          باندلر: گراف import را می‌خواند، ترتیب توپولوژیک می‌دهد
-src/*.js           ۱۶ ماژول، با نام‌های بدون پسوند
+src/*.js           ۱۶ ماژول، با import نسبی (`from "./store.js"` — همان فرمی که تب Modules کلودفلر می‌خواهد)
 test/harness.mjs   مشترک: باندل، KV ساختگی، env
 test/test-*.mjs    یک فایل برای هر لایه
 dist/              خروجی تک‌فایلی (اختیاری، برای استقرار بدون تب Modules)

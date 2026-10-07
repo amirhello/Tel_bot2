@@ -1,6 +1,6 @@
 // Decides when the bot speaks, and recognises its commands.
 
-import { normalizeFa } from "text";
+import { normalizeFa } from "./text.js";
 
 export const TRIGGER = "سید";
 
