@@ -112,9 +112,12 @@ label.check input{width:auto}
 .prev{color:var(--dim);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:120px;text-align:left}
 .tag{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--dim);white-space:nowrap}
 .tag.on{color:var(--ok);border-color:#1d4423}
+.tag.err{color:var(--bad);border-color:#5a1e22;background:rgba(248,81,73,.1)}
 .body{border-top:1px solid var(--line);padding:12px}
 .body .meta{font-size:12px;color:var(--dim)}
 .msg{white-space:pre-wrap;word-break:break-word;background:#111722;border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:8px;direction:rtl;text-align:right}
+.replybox{white-space:pre-wrap;word-break:break-word;background:#0d1e16;border:1px solid #1a4427;border-radius:8px;padding:10px;margin-top:8px;direction:rtl;text-align:right}
+.errbox{white-space:pre-wrap;word-break:break-word;background:#241113;border:1px solid #5a1e22;border-radius:8px;padding:10px;margin-top:8px;color:#fca5a5;direction:ltr;text-align:left;font-family:ui-monospace,monospace;font-size:13px}
 `;
 
 const LOGIN = `<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -399,17 +402,38 @@ function save(ev){
 }
 
 function logCard(it){
-  var det = el("details", "item");
+  var isErr = !!(it.err || it.ok === false);
+  var det = el("details", "item" + (isErr ? " err" : ""));
   var sum = document.createElement("summary");
   sum.appendChild(el("span", "when", stamp(it.t)));
-  sum.appendChild(el("span", "who", it.u.name));
-  sum.appendChild(el("span", "tag" + (it.a ? " on" : ""), it.a ? "answered" : "ignored"));
-  sum.appendChild(el("span", "where", it.c.t));
-  sum.appendChild(el("span", "prev", (it.k || "") + " · " + (it.x || "").replace(/\\s+/g, " ").slice(0, 90)));
+  sum.appendChild(el("span", "who", (it.u && it.u.name) || "user"));
+  var tagText = !it.a ? "ignored" : isErr ? "error" : "answered";
+  var tagCls = "tag" + (!it.a ? "" : isErr ? " err" : " on");
+  sum.appendChild(el("span", tagCls, tagText));
+  if (it.model) sum.appendChild(el("span", "tag", it.model));
+  sum.appendChild(el("span", "where", (it.c && it.c.t) || ""));
+  sum.appendChild(el("span", "prev", (it.k || "") + " · " + (it.x || "").replace(/\\s+/g, " ").slice(0, 70)));
   det.appendChild(sum);
   var body = el("div", "body");
-  body.appendChild(el("div", "meta", "user " + it.u.id + "  ·  chat " + it.c.id + "  ·  message " + it.m + "  ·  " + stamp(it.t)));
-  body.appendChild(el("div", "msg", it.x || "(no text)"));
+  var uid = it.u ? it.u.id : "";
+  var cid = it.c ? it.c.id : "";
+  body.appendChild(el("div", "meta", "user " + uid + "  ·  chat " + cid + "  ·  message " + it.m + "  ·  " + stamp(it.t) + (it.model ? "  ·  " + it.model : "")));
+  var inMsg = el("div", "msg");
+  inMsg.appendChild(el("b", null, "User: "));
+  inMsg.appendChild(document.createTextNode(it.x || "(no text)"));
+  body.appendChild(inMsg);
+  if (it.reply) {
+    var rep = el("div", "replybox");
+    rep.appendChild(el("b", null, "AI: "));
+    rep.appendChild(document.createTextNode(it.reply));
+    body.appendChild(rep);
+  }
+  if (it.err) {
+    var er = el("div", "errbox");
+    er.appendChild(el("b", null, "Error: "));
+    er.appendChild(document.createTextNode(it.err));
+    body.appendChild(er);
+  }
   det.appendChild(body);
   return det;
 }

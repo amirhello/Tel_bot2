@@ -4,19 +4,28 @@ export const ARCHIVE_KEY = "log:v1";
 export const ARCHIVE_LIMIT = 200;
 
 /** Build one record. Media is described, never stored. */
-export function archiveRecord(msg, answered) {
-  return {
+export function archiveRecord(msg, outcome) {
+  const isObj = typeof outcome === "object" && outcome !== null;
+  const answered = isObj ? outcome.answered : !!outcome;
+  const r = {
     t: msg.date ? msg.date * 1000 : Date.now(),
     u: {
-      id: msg.from.id,
-      name: msg.from.first_name || msg.from.last_name || msg.from.username || String(msg.from.id),
+      id: msg.from?.id,
+      name: msg.from?.first_name || msg.from?.last_name || msg.from?.username || String(msg.from?.id ?? ""),
     },
-    c: { id: msg.chat.id, t: msg.chat.title || msg.chat.type },
+    c: { id: msg.chat?.id, t: msg.chat?.title || msg.chat?.type },
     m: msg.message_id,
     x: msg.text || msg.caption || "",
     k: mediaKind(msg),
     a: answered,
   };
+  if (isObj) {
+    if (outcome.ok !== undefined) r.ok = outcome.ok;
+    if (outcome.model) r.model = outcome.model;
+    if (outcome.reply) r.reply = String(outcome.reply).slice(0, 4000);
+    if (outcome.error) r.err = String(outcome.error).slice(0, 1000);
+  }
+  return r;
 }
 
 /** A short label for the media on a message, without touching any bytes. */

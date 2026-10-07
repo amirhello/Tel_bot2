@@ -88,4 +88,28 @@ await t("readArchive on an untouched namespace is empty", async () => {
   clear(env());
 });
 
+await t("archiveRecord preserves AI reply, model, and error details", () => {
+  const succ = archiveRecord(msg(), {
+    answered: true,
+    ok: true,
+    model: "gemini-3.8-flash",
+    reply: "پاسخ هوش مصنوعی",
+  });
+  assert.equal(succ.a, true);
+  assert.equal(succ.ok, true);
+  assert.equal(succ.model, "gemini-3.8-flash");
+  assert.equal(succ.reply, "پاسخ هوش مصنوعی");
+  assert.equal(succ.err, undefined);
+
+  const fail = archiveRecord(msg(), {
+    answered: true,
+    ok: false,
+    error: "429 quota exceeded",
+  });
+  assert.equal(fail.a, true);
+  assert.equal(fail.ok, false);
+  assert.equal(fail.err, "429 quota exceeded");
+  assert.equal(fail.reply, undefined);
+});
+
 done();

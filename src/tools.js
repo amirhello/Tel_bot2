@@ -37,12 +37,13 @@ export async function diagnostics(env) {
   };
 
   try {
-    const r = await complete(env, cfg, {
+    const diagCfg = { ...cfg, thinking: "off" };
+    const r = await complete(env, diagCfg, {
       system: "You are Sayyad. Answer with one short Persian word.",
       parts: [{ type: "text", text: "say: تست" }],
-      maxTokens: 64,
+      maxTokens: 120,
     });
-    out.checks.text = { ok: true, sample: r.text.slice(0, 120), usage: r.usage };
+    out.checks.text = { ok: true, sample: r.text.slice(0, 120), usage: r.usage, model: r.model };
     out.checks.model = out.checks.text;
   } catch (e) {
     out.checks.text = { ok: false, error: String(e?.message ?? e).slice(0, 300) };
@@ -51,15 +52,16 @@ export async function diagnostics(env) {
 
   if (env.DIAG_IMAGE) {
     try {
-      const rImg = await complete(env, cfg, {
+      const diagCfg = { ...cfg, thinking: "off" };
+      const rImg = await complete(env, diagCfg, {
         system: "You are Sayyad. Answer with one short Persian word.",
         parts: [
           { type: "image", mime: "image/png", data: env.DIAG_IMAGE },
           { type: "text", text: "تست تصویر" },
         ],
-        maxTokens: 64,
+        maxTokens: 120,
       });
-      out.checks.image = { ok: true, sample: rImg.text.slice(0, 120), usage: rImg.usage };
+      out.checks.image = { ok: true, sample: rImg.text.slice(0, 120), usage: rImg.usage, model: rImg.model };
     } catch (e) {
       out.checks.image = { ok: false, error: String(e?.message ?? e).slice(0, 300) };
     }

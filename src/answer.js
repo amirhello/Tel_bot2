@@ -91,14 +91,18 @@ export async function processMessage(env, msg) {
   } catch {
     /* getMe failed: archive it as unanswered rather than losing the record */
   }
-  await appendArchive(env, archiveRecord(msg, answered));
-
-  if (!config_enabled(cfg) || !answered) return;
+  if (!config_enabled(cfg) || !answered) {
+    await appendArchive(env, archiveRecord(msg, false));
+    return;
+  }
 
   await serialize(msg.chat.id, async () => {
+    let outcome = null;
+    let replyError = null;
     try {
-      await reply(env, msg, cfg);
+      outcome = await reply(env, msg, cfg);
     } catch (e) {
+      replyError = e;
       const reason = String(e?.message ?? e);
       await bumpStats(env, { errors: 1, lastError: reason.slice(0, 300) });
       // The pool carries the exact hour its quota frees up — far more useful than "later".
@@ -113,6 +117,17 @@ export async function processMessage(env, msg) {
       } catch {
         /* nothing more we can do */
       }
+    } finally {
+      await appendArchive(
+        env,
+        archiveRecord(msg, {
+          answered: true,
+          ok: !replyError,
+          model: outcome?.model,
+          reply: outcome?.text,
+          error: replyError ? String(replyError.message ?? replyError) : null,
+        }),
+      );
     }
   });
 }
@@ -127,16 +142,17 @@ async function reply(env, msg, cfg) {
 
   if (cmd === "ping") {
     await sendText(token, chatId, "🏓 pong", msg.message_id);
-    return;
+    return { text: "🏓 pong" };
   }
   if (cmd === "start" || cmd === "help") {
-    await sendText(token, chatId, HELP.replace("__MODE__", MODE_NAME[cfg.mode] ?? "Know-it-all"), msg.message_id);
-    return;
+    const helpMsg = HELP.replace("__MODE__", MODE_NAME[cfg.mode] ?? "Know-it-all");
+    await sendText(token, chatId, helpMsg, msg.message_id);
+    return { text: helpMsg };
   }
 
   // Checked before the typing indicator and before any model call, so an exhausted day
   // costs no quota and does not look like a hang.
-  if (await overDailyCap(env, cfg, msg)) return;
+  if (await overDailyCap(env, cfg, msg)) return { text: DAILY_LIMIT };
 
   await sendChatAction(token, chatId, "typing");
   await bumpStats(env, { requests: 1, lastUsed: new Date().toISOString() });
@@ -145,7 +161,7 @@ async function reply(env, msg, cfg) {
   const { media, note } = await collectMedia(env, msg, cfg);
   const { text: replyText, fromBot } = replyContext(msg, id);
 
-  const { text: answer } = await complete(env, cfg, {
+  const { text: answer, model: usedModel } = await complete(env, cfg, {
     system: buildSystemPrompt(cfg),
     parts: buildUserContent({ text, replyText, replyFromBot: fromBot, media, note }),
     maxTokens: cfg.maxTokens,
@@ -165,7 +181,7 @@ async function reply(env, msg, cfg) {
       await sendAudioFile(token, chatId, wav, "sayyad.wav", "audio/wav", msg.message_id);
       audioSent = true;
       await bumpStats(env, { replies: 1 });
-      return;
+      return { text: answer, model: usedModel, voice: true };
     } catch (voiceErr) {
       await bumpStats(env, { errors: 1, lastError: `voice failed: ${voiceErr?.message ?? voiceErr}`.slice(0, 300) });
     } finally {
@@ -174,12 +190,13 @@ async function reply(env, msg, cfg) {
     if (!audioSent) {
       await sendLong(token, chatId, answer, msg.message_id);
       await bumpStats(env, { replies: 1 });
-      return;
+      return { text: answer, model: usedModel };
     }
   }
 
   await sendLong(token, chatId, answer, msg.message_id);
   await bumpStats(env, { replies: 1 });
+  return { text: answer, model: usedModel };
 }
 
 /** Voice notes are answered with voice — unless either switch (input or voice) is off. */

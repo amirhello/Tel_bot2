@@ -151,8 +151,13 @@ export async function completeGemini(env, cfg, { system, parts, maxTokens }) {
     const text = readGeminiText(data);
     if (text) return { text, usage: data.usageMetadata ?? null, model };
 
-    const blocked = data?.promptFeedback?.blockReason ?? data?.promptFeedback?.safetyRatings?.[0]?.category;
-    last = new ApiError(`Gemini returned no text${blocked ? ` (blocked: ${blocked})` : ""}`, 200);
+    const candidate = data?.candidates?.[0];
+    const finishReason = candidate?.finishReason;
+    const blocked = data?.promptFeedback?.blockReason ?? candidate?.safetyRatings?.[0]?.category;
+    last = new ApiError(
+      `Gemini returned no text${finishReason ? ` (${finishReason})` : ""}${blocked ? ` (blocked: ${blocked})` : ""}`,
+      200,
+    );
     break; // the request itself worked; another shape would change nothing
   }
 

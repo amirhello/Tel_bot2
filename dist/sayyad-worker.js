@@ -11,19 +11,28 @@ const ARCHIVE_KEY = "log:v1";
 const ARCHIVE_LIMIT = 200;
 
 /** Build one record. Media is described, never stored. */
-function archiveRecord(msg, answered) {
-  return {
+function archiveRecord(msg, outcome) {
+  const isObj = typeof outcome === "object" && outcome !== null;
+  const answered = isObj ? outcome.answered : !!outcome;
+  const r = {
     t: msg.date ? msg.date * 1000 : Date.now(),
     u: {
-      id: msg.from.id,
-      name: msg.from.first_name || msg.from.last_name || msg.from.username || String(msg.from.id),
+      id: msg.from?.id,
+      name: msg.from?.first_name || msg.from?.last_name || msg.from?.username || String(msg.from?.id ?? ""),
     },
-    c: { id: msg.chat.id, t: msg.chat.title || msg.chat.type },
+    c: { id: msg.chat?.id, t: msg.chat?.title || msg.chat?.type },
     m: msg.message_id,
     x: msg.text || msg.caption || "",
     k: mediaKind(msg),
     a: answered,
   };
+  if (isObj) {
+    if (outcome.ok !== undefined) r.ok = outcome.ok;
+    if (outcome.model) r.model = outcome.model;
+    if (outcome.reply) r.reply = String(outcome.reply).slice(0, 4000);
+    if (outcome.error) r.err = String(outcome.error).slice(0, 1000);
+  }
+  return r;
 }
 
 /** A short label for the media on a message, without touching any bytes. */
@@ -603,8 +612,13 @@ async function completeGemini(env, cfg, { system, parts, maxTokens }) {
     const text = readGeminiText(data);
     if (text) return { text, usage: data.usageMetadata ?? null, model };
 
-    const blocked = data?.promptFeedback?.blockReason ?? data?.promptFeedback?.safetyRatings?.[0]?.category;
-    last = new ApiError(`Gemini returned no text${blocked ? ` (blocked: ${blocked})` : ""}`, 200);
+    const candidate = data?.candidates?.[0];
+    const finishReason = candidate?.finishReason;
+    const blocked = data?.promptFeedback?.blockReason ?? candidate?.safetyRatings?.[0]?.category;
+    last = new ApiError(
+      `Gemini returned no text${finishReason ? ` (${finishReason})` : ""}${blocked ? ` (blocked: ${blocked})` : ""}`,
+      200,
+    );
     break; // the request itself worked; another shape would change nothing
   }
 
@@ -1156,9 +1170,12 @@ label.check input{width:auto}
 .prev{color:var(--dim);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:120px;text-align:left}
 .tag{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--dim);white-space:nowrap}
 .tag.on{color:var(--ok);border-color:#1d4423}
+.tag.err{color:var(--bad);border-color:#5a1e22;background:rgba(248,81,73,.1)}
 .body{border-top:1px solid var(--line);padding:12px}
 .body .meta{font-size:12px;color:var(--dim)}
 .msg{white-space:pre-wrap;word-break:break-word;background:#111722;border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:8px;direction:rtl;text-align:right}
+.replybox{white-space:pre-wrap;word-break:break-word;background:#0d1e16;border:1px solid #1a4427;border-radius:8px;padding:10px;margin-top:8px;direction:rtl;text-align:right}
+.errbox{white-space:pre-wrap;word-break:break-word;background:#241113;border:1px solid #5a1e22;border-radius:8px;padding:10px;margin-top:8px;color:#fca5a5;direction:ltr;text-align:left;font-family:ui-monospace,monospace;font-size:13px}
 `;
 
 const LOGIN = `<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -1443,17 +1460,38 @@ function save(ev){
 }
 
 function logCard(it){
-  var det = el("details", "item");
+  var isErr = !!(it.err || it.ok === false);
+  var det = el("details", "item" + (isErr ? " err" : ""));
   var sum = document.createElement("summary");
   sum.appendChild(el("span", "when", stamp(it.t)));
-  sum.appendChild(el("span", "who", it.u.name));
-  sum.appendChild(el("span", "tag" + (it.a ? " on" : ""), it.a ? "answered" : "ignored"));
-  sum.appendChild(el("span", "where", it.c.t));
-  sum.appendChild(el("span", "prev", (it.k || "") + " · " + (it.x || "").replace(/\\s+/g, " ").slice(0, 90)));
+  sum.appendChild(el("span", "who", (it.u && it.u.name) || "user"));
+  var tagText = !it.a ? "ignored" : isErr ? "error" : "answered";
+  var tagCls = "tag" + (!it.a ? "" : isErr ? " err" : " on");
+  sum.appendChild(el("span", tagCls, tagText));
+  if (it.model) sum.appendChild(el("span", "tag", it.model));
+  sum.appendChild(el("span", "where", (it.c && it.c.t) || ""));
+  sum.appendChild(el("span", "prev", (it.k || "") + " · " + (it.x || "").replace(/\\s+/g, " ").slice(0, 70)));
   det.appendChild(sum);
   var body = el("div", "body");
-  body.appendChild(el("div", "meta", "user " + it.u.id + "  ·  chat " + it.c.id + "  ·  message " + it.m + "  ·  " + stamp(it.t)));
-  body.appendChild(el("div", "msg", it.x || "(no text)"));
+  var uid = it.u ? it.u.id : "";
+  var cid = it.c ? it.c.id : "";
+  body.appendChild(el("div", "meta", "user " + uid + "  ·  chat " + cid + "  ·  message " + it.m + "  ·  " + stamp(it.t) + (it.model ? "  ·  " + it.model : "")));
+  var inMsg = el("div", "msg");
+  inMsg.appendChild(el("b", null, "User: "));
+  inMsg.appendChild(document.createTextNode(it.x || "(no text)"));
+  body.appendChild(inMsg);
+  if (it.reply) {
+    var rep = el("div", "replybox");
+    rep.appendChild(el("b", null, "AI: "));
+    rep.appendChild(document.createTextNode(it.reply));
+    body.appendChild(rep);
+  }
+  if (it.err) {
+    var er = el("div", "errbox");
+    er.appendChild(el("b", null, "Error: "));
+    er.appendChild(document.createTextNode(it.err));
+    body.appendChild(er);
+  }
   det.appendChild(body);
   return det;
 }
@@ -2241,14 +2279,18 @@ async function processMessage(env, msg) {
   } catch {
     /* getMe failed: archive it as unanswered rather than losing the record */
   }
-  await appendArchive(env, archiveRecord(msg, answered));
-
-  if (!config_enabled(cfg) || !answered) return;
+  if (!config_enabled(cfg) || !answered) {
+    await appendArchive(env, archiveRecord(msg, false));
+    return;
+  }
 
   await serialize(msg.chat.id, async () => {
+    let outcome = null;
+    let replyError = null;
     try {
-      await reply(env, msg, cfg);
+      outcome = await reply(env, msg, cfg);
     } catch (e) {
+      replyError = e;
       const reason = String(e?.message ?? e);
       await bumpStats(env, { errors: 1, lastError: reason.slice(0, 300) });
       // The pool carries the exact hour its quota frees up — far more useful than "later".
@@ -2263,6 +2305,17 @@ async function processMessage(env, msg) {
       } catch {
         /* nothing more we can do */
       }
+    } finally {
+      await appendArchive(
+        env,
+        archiveRecord(msg, {
+          answered: true,
+          ok: !replyError,
+          model: outcome?.model,
+          reply: outcome?.text,
+          error: replyError ? String(replyError.message ?? replyError) : null,
+        }),
+      );
     }
   });
 }
@@ -2277,16 +2330,17 @@ async function reply(env, msg, cfg) {
 
   if (cmd === "ping") {
     await sendText(token, chatId, "🏓 pong", msg.message_id);
-    return;
+    return { text: "🏓 pong" };
   }
   if (cmd === "start" || cmd === "help") {
-    await sendText(token, chatId, HELP.replace("__MODE__", MODE_NAME[cfg.mode] ?? "Know-it-all"), msg.message_id);
-    return;
+    const helpMsg = HELP.replace("__MODE__", MODE_NAME[cfg.mode] ?? "Know-it-all");
+    await sendText(token, chatId, helpMsg, msg.message_id);
+    return { text: helpMsg };
   }
 
   // Checked before the typing indicator and before any model call, so an exhausted day
   // costs no quota and does not look like a hang.
-  if (await overDailyCap(env, cfg, msg)) return;
+  if (await overDailyCap(env, cfg, msg)) return { text: DAILY_LIMIT };
 
   await sendChatAction(token, chatId, "typing");
   await bumpStats(env, { requests: 1, lastUsed: new Date().toISOString() });
@@ -2295,7 +2349,7 @@ async function reply(env, msg, cfg) {
   const { media, note } = await collectMedia(env, msg, cfg);
   const { text: replyText, fromBot } = replyContext(msg, id);
 
-  const { text: answer } = await complete(env, cfg, {
+  const { text: answer, model: usedModel } = await complete(env, cfg, {
     system: buildSystemPrompt(cfg),
     parts: buildUserContent({ text, replyText, replyFromBot: fromBot, media, note }),
     maxTokens: cfg.maxTokens,
@@ -2315,7 +2369,7 @@ async function reply(env, msg, cfg) {
       await sendAudioFile(token, chatId, wav, "sayyad.wav", "audio/wav", msg.message_id);
       audioSent = true;
       await bumpStats(env, { replies: 1 });
-      return;
+      return { text: answer, model: usedModel, voice: true };
     } catch (voiceErr) {
       await bumpStats(env, { errors: 1, lastError: `voice failed: ${voiceErr?.message ?? voiceErr}`.slice(0, 300) });
     } finally {
@@ -2324,12 +2378,13 @@ async function reply(env, msg, cfg) {
     if (!audioSent) {
       await sendLong(token, chatId, answer, msg.message_id);
       await bumpStats(env, { replies: 1 });
-      return;
+      return { text: answer, model: usedModel };
     }
   }
 
   await sendLong(token, chatId, answer, msg.message_id);
   await bumpStats(env, { replies: 1 });
+  return { text: answer, model: usedModel };
 }
 
 /** Voice notes are answered with voice — unless either switch (input or voice) is off. */
@@ -2392,12 +2447,13 @@ async function diagnostics(env) {
   };
 
   try {
-    const r = await complete(env, cfg, {
+    const diagCfg = { ...cfg, thinking: "off" };
+    const r = await complete(env, diagCfg, {
       system: "You are Sayyad. Answer with one short Persian word.",
       parts: [{ type: "text", text: "say: تست" }],
-      maxTokens: 64,
+      maxTokens: 120,
     });
-    out.checks.text = { ok: true, sample: r.text.slice(0, 120), usage: r.usage };
+    out.checks.text = { ok: true, sample: r.text.slice(0, 120), usage: r.usage, model: r.model };
     out.checks.model = out.checks.text;
   } catch (e) {
     out.checks.text = { ok: false, error: String(e?.message ?? e).slice(0, 300) };
@@ -2406,15 +2462,16 @@ async function diagnostics(env) {
 
   if (env.DIAG_IMAGE) {
     try {
-      const rImg = await complete(env, cfg, {
+      const diagCfg = { ...cfg, thinking: "off" };
+      const rImg = await complete(env, diagCfg, {
         system: "You are Sayyad. Answer with one short Persian word.",
         parts: [
           { type: "image", mime: "image/png", data: env.DIAG_IMAGE },
           { type: "text", text: "تست تصویر" },
         ],
-        maxTokens: 64,
+        maxTokens: 120,
       });
-      out.checks.image = { ok: true, sample: rImg.text.slice(0, 120), usage: rImg.usage };
+      out.checks.image = { ok: true, sample: rImg.text.slice(0, 120), usage: rImg.usage, model: rImg.model };
     } catch (e) {
       out.checks.image = { ok: false, error: String(e?.message ?? e).slice(0, 300) };
     }
