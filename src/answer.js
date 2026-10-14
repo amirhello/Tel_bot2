@@ -32,8 +32,12 @@ const HELP =
   "• به **ویس نوت**‌ها جواب **صوتی** می‌دهم.\n\n" +
   "I'm __MODE__ mode right now.";
 
+
 const jobs = new Map();
 const capNotified = new Map();
+
+// Guard against Cloudflare's 30 s waitUntil ceiling so we always log and reply before termination.
+const REPLY_BUDGET_MS = 24_000;
 
 /**
  * "ساعت ۹:۳۰" — the exact moment the daily quota frees up, in Tehran time. Google resets
@@ -57,16 +61,28 @@ const exhaustedNotice = (resetAt) =>
     ? "در حال حاضر ترافیک و درخواست‌ها به مدل‌های هوش مصنوعی بالاست. لطفاً ۱ دقیقه دیگر دوباره پیام دهید."
     : `امروز از سقف روزانه‌ی همه‌ی مدل‌هام رد شدیم. ساعت ${clockTime(resetAt)} دوباره در خدمتم.`;
 
-/** One answer at a time per chat; anything else queues behind it. */
+/** One answer at a time per chat, bounded so an earlier slow request cannot starve waitUntil. */
 function serialize(key, job) {
   const prev = jobs.get(key) ?? Promise.resolve();
-  const next = prev.catch(() => {}).then(job);
+  const waitPrev = Promise.race([
+    prev.catch(() => {}),
+    new Promise((r) => setTimeout(r, 12_000)),
+  ]);
+  const next = waitPrev.then(job);
   const tail = next.catch(() => {});
   jobs.set(key, tail);
   tail.then(() => {
     if (jobs.get(key) === tail) jobs.delete(key);
   });
   return next;
+}
+
+function withBudget(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`processing timed out after ${Math.round(ms / 1000)}s`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 function hash(s) {
@@ -80,6 +96,7 @@ function hash(s) {
  * Sayyad ignores — then answers only what deserves an answer.
  */
 export async function processMessage(env, msg) {
+  const startedAt = Date.now();
   try {
     if (!msg?.from || msg.from.is_bot) return; // never answer bots
     if (!isSupportedChat(msg)) return;
@@ -103,20 +120,24 @@ export async function processMessage(env, msg) {
     }
 
     if (!enabled || !answered) {
-      await appendArchive(env, archiveRecord(msg, false)).catch(() => {});
+      const ignoreReason = !enabled
+        ? "bot disabled in admin panel"
+        : "group message without wake word (سید) or reply to bot";
+      await appendArchive(env, archiveRecord(msg, { answered: false, reason: ignoreReason })).catch(() => {});
       return;
     }
 
     await serialize(msg.chat.id, async () => {
       let outcome = null;
       let replyError = null;
+      let tgOut = null;
       try {
-        outcome = await reply(env, msg, cfg);
+        outcome = await withBudget(reply(env, msg, cfg), REPLY_BUDGET_MS);
+        tgOut = outcome?.tgOut ?? "delivered";
       } catch (e) {
         replyError = e;
         const reason = String(e?.message ?? e);
         await bumpStats(env, { errors: 1, lastError: reason.slice(0, 300) });
-        // The pool carries the exact hour its quota frees up — far more useful than "later".
         const text =
           e instanceof PoolExhausted
             ? exhaustedNotice(e.resetAt)
@@ -125,8 +146,9 @@ export async function processMessage(env, msg) {
               : ERRORS[Math.abs(hash(`${msg.chat.id}:${msg.message_id}`)) % ERRORS.length];
         try {
           await sendText(env.TELEGRAM_BOT_TOKEN, msg.chat.id, text, msg.message_id);
-        } catch {
-          /* nothing more we can do */
+          tgOut = "error notice delivered to user";
+        } catch (sendErr) {
+          tgOut = `failed to send error notice: ${String(sendErr?.message ?? sendErr).slice(0, 120)}`;
         }
       } finally {
         await appendArchive(
@@ -137,6 +159,11 @@ export async function processMessage(env, msg) {
             model: outcome?.model,
             reply: outcome?.text,
             error: replyError ? String(replyError.message ?? replyError) : null,
+            ms: Date.now() - startedAt,
+            reason: outcome?.reason,
+            voice: outcome?.voice,
+            voiceError: outcome?.voiceError,
+            tgOut,
           }),
         ).catch(() => {});
       }
@@ -156,17 +183,19 @@ async function reply(env, msg, cfg) {
 
   if (cmd === "ping") {
     await sendText(token, chatId, "🏓 pong", msg.message_id);
-    return { text: "🏓 pong" };
+    return { text: "🏓 pong", reason: "command /ping", tgOut: "text delivered" };
   }
   if (cmd === "start" || cmd === "help") {
     const helpMsg = HELP.replace("__MODE__", MODE_NAME[cfg.mode] ?? "Know-it-all");
     await sendText(token, chatId, helpMsg, msg.message_id);
-    return { text: helpMsg };
+    return { text: helpMsg, reason: `command /${cmd}`, tgOut: "text delivered" };
   }
 
   // Checked before the typing indicator and before any model call, so an exhausted day
   // costs no quota and does not look like a hang.
-  if (await overDailyCap(env, cfg, msg)) return { text: DAILY_LIMIT };
+  if (await overDailyCap(env, cfg, msg)) {
+    return { text: DAILY_LIMIT, reason: "daily cap reached", tgOut: "daily cap guard" };
+  }
 
   await sendChatAction(token, chatId, "typing");
   await bumpStats(env, { requests: 1, lastUsed: new Date().toISOString() });
@@ -189,28 +218,30 @@ async function reply(env, msg, cfg) {
     const elapsed = () => Date.now() - startAt;
     const keep = setInterval(() => sendChatAction(token, chatId, "upload_voice").catch(() => {}), 4000);
     let audioSent = false;
+    let vErrText = null;
     try {
       if (elapsed() > VOICE_BUDGET_MS) throw new Error("live voice: over the time budget");
       const wav = await speak(env, cfg, answer, { timeoutMs: Math.max(3000, VOICE_BUDGET_MS - elapsed()) });
       await sendAudioFile(token, chatId, wav, "sayyad.wav", "audio/wav", msg.message_id);
       audioSent = true;
       await bumpStats(env, { replies: 1 });
-      return { text: answer, model: usedModel, voice: true };
+      return { text: answer, model: usedModel, voice: true, tgOut: "audio delivered (sayyad.wav)" };
     } catch (voiceErr) {
-      await bumpStats(env, { errors: 1, lastError: `voice failed: ${voiceErr?.message ?? voiceErr}`.slice(0, 300) });
+      vErrText = `voice failed: ${voiceErr?.message ?? voiceErr}`.slice(0, 300);
+      await bumpStats(env, { errors: 1, lastError: vErrText });
     } finally {
       clearInterval(keep);
     }
     if (!audioSent) {
       await sendLong(token, chatId, answer, msg.message_id);
       await bumpStats(env, { replies: 1 });
-      return { text: answer, model: usedModel };
+      return { text: answer, model: usedModel, voice: false, voiceError: vErrText, tgOut: "text fallback delivered" };
     }
   }
 
   await sendLong(token, chatId, answer, msg.message_id);
   await bumpStats(env, { replies: 1 });
-  return { text: answer, model: usedModel };
+  return { text: answer, model: usedModel, tgOut: "text delivered" };
 }
 
 /** Voice notes are answered with voice — unless either switch (input or voice) is off. */
@@ -223,7 +254,7 @@ async function overDailyCap(env, cfg, msg) {
   if (usedToday(await loadStats(env)) < cfg.dailyCap) return false;
 
   const last = capNotified.get(msg.chat.id) ?? 0;
-  if (Date.now() - last < 3_600_000) return true;
+  if (Date.now() - last < 60_000) return true;
   capNotified.set(msg.chat.id, Date.now());
   try {
     await sendText(env.TELEGRAM_BOT_TOKEN, msg.chat.id, DAILY_LIMIT, msg.message_id);

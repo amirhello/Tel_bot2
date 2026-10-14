@@ -19,7 +19,8 @@ export function isCommand(text) {
 export function shouldAnswer(msg, botId, chatType) {
   if (chatType === "private") return true;
   const text = normalizeFa(msg.text || msg.caption || "");
-  if (text.includes(TRIGGER)) return true;
+  if (isCommand(text)) return true;
+  if (/(?<![\p{L}])سید/u.test(text)) return true;
   if (msg.reply_to_message?.from?.id === botId) return true;
   return false;
 }

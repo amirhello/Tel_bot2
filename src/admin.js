@@ -411,15 +411,24 @@ function logCard(it){
   var tagCls = "tag" + (!it.a ? "" : isErr ? " err" : " on");
   sum.appendChild(el("span", tagCls, tagText));
   if (it.model) sum.appendChild(el("span", "tag", it.model));
+  if (it.ms !== undefined) sum.appendChild(el("span", "tag", it.ms + " ms"));
+  if (it.verr) sum.appendChild(el("span", "tag err", "voice err"));
   sum.appendChild(el("span", "where", (it.c && it.c.t) || ""));
   sum.appendChild(el("span", "prev", (it.k || "") + " · " + (it.x || "").replace(/\\s+/g, " ").slice(0, 70)));
   det.appendChild(sum);
   var body = el("div", "body");
   var uid = it.u ? it.u.id : "";
   var cid = it.c ? it.c.id : "";
-  body.appendChild(el("div", "meta", "user " + uid + "  ·  chat " + cid + "  ·  message " + it.m + "  ·  " + stamp(it.t) + (it.model ? "  ·  " + it.model : "")));
+  var metaStr = "user " + uid + "  ·  chat " + cid + "  ·  message " + it.m + "  ·  " + stamp(it.t);
+  if (it.model) metaStr += "  ·  model: " + it.model;
+  if (it.ms !== undefined) metaStr += "  ·  " + it.ms + " ms";
+  if (it.tgOut) metaStr += "  ·  out: " + it.tgOut;
+  body.appendChild(el("div", "meta", metaStr));
+  if (it.reason) {
+    body.appendChild(el("div", "meta", "info: " + it.reason));
+  }
   var inMsg = el("div", "msg");
-  inMsg.appendChild(el("b", null, "User: "));
+  inMsg.appendChild(el("b", null, "User (" + (it.k || "text") + "): "));
   inMsg.appendChild(document.createTextNode(it.x || "(no text)"));
   body.appendChild(inMsg);
   if (it.reply) {
@@ -427,6 +436,12 @@ function logCard(it){
     rep.appendChild(el("b", null, "AI: "));
     rep.appendChild(document.createTextNode(it.reply));
     body.appendChild(rep);
+  }
+  if (it.verr) {
+    var ver = el("div", "errbox");
+    ver.appendChild(el("b", null, "Voice Error: "));
+    ver.appendChild(document.createTextNode(it.verr));
+    body.appendChild(ver);
   }
   if (it.err) {
     var er = el("div", "errbox");

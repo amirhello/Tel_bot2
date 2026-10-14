@@ -74,8 +74,8 @@ async function runGeminiPool(env, cfg, payload) {
         dirty.add(e.model);
         continue;
       }
-      // Safety net: ANY quota error from upstream MUST park this model and try the next model
-      if (/quota|resource_exhausted/i.test(e?.message)) {
+      // Safety net: ANY quota or high-demand error from upstream MUST park this model and try the next model
+      if (/quota|resource_exhausted|high demand|spikes in demand|overloaded|temporarily unavailable/i.test(e?.message)) {
         minuteQuota.set(model, Date.now() + 60_000);
         continue;
       }

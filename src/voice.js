@@ -9,7 +9,7 @@
 // immediately and only gets one waitUntil window (30 s) to finish the job.
 
 const LIVE_ENDPOINT =
-  "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
+  "https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
 export const DEFAULT_MODEL = "gemini-3.8-live";
 export const FALLBACK_VOICE_MODELS = [
@@ -238,9 +238,10 @@ export async function speak(env, cfg, text, opts = {}) {
     try {
       return await speakOnce(key, model, words, Math.max(1, remaining));
     } catch (e) {
-      lastErr = e;
-      if (!/model|not found|unknown|404|unsupported|unavailable/i.test(e.message)) {
-        throw e;
+      const clean = String(e?.message ?? e).replace(/key=[^&\s]+/gi, "key=[REDACTED]");
+      lastErr = new Error(clean);
+      if (!/model|not found|unknown|404|unsupported|unavailable|closed before any audio/i.test(clean)) {
+        throw lastErr;
       }
     }
   }

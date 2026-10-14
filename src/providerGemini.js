@@ -97,11 +97,13 @@ export function readGeminiText(data) {
  * A spent quota (day or minute) is not retried with backoff on the same model —
  * we want to move on to the next model in the pool immediately.
  */
+const HIGH_DEMAND_RE = /quota|resource_exhausted|high demand|spikes in demand|overloaded|temporarily unavailable/i;
+
 const retryableForGemini = (e) =>
   isTransient(e) &&
   quotaKind(e.message) !== "day" &&
   quotaKind(e.message) !== "minute" &&
-  !/quota|resource_exhausted/i.test(e.message);
+  !HIGH_DEMAND_RE.test(e.message);
 
 /**
  * Models differ in which knobs they accept — Gemma rejects thinkingConfig, some tiers
@@ -135,7 +137,7 @@ export async function completeGemini(env, cfg, { system, parts, maxTokens }) {
       if (e.status === 404) throw new UnknownModelError(model, `${model}: ${e.message}`);
       const isQuota =
         (e.status === 429 || e.status === 503) &&
-        (quotaKind(e.message) !== "other" || /quota|resource_exhausted/i.test(e.message));
+        (quotaKind(e.message) !== "other" || HIGH_DEMAND_RE.test(e.message));
       if (isQuota) {
         if (quotaKind(e.message) === "day") {
           throw new DailyQuotaError(model, `${model}: ${e.message}`);
