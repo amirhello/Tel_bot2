@@ -121,8 +121,45 @@ const server = createServer(async (req, res) => {
   }
 });
 
+async function printStartupBanner(port) {
+  let publicIp = process.env.PUBLIC_IP || process.env.SERVER_IP || null;
+  if (!publicIp) {
+    try {
+      const res = await fetch("https://api.ipify.org", { signal: AbortSignal.timeout(2000) });
+      if (res.ok) {
+        const ip = (await res.text()).trim();
+        if (ip && ip.length >= 7 && ip.length <= 45) publicIp = ip;
+      }
+    } catch {}
+  }
+
+  const baseLocal = `http://localhost:${port}`;
+  const basePublic = publicIp ? `http://${publicIp}:${port}` : null;
+  const baseCustom = process.env.PUBLIC_URL ? process.env.PUBLIC_URL.replace(/\/+$/, "") : null;
+  const primaryBase = baseCustom || basePublic || baseLocal;
+
+  console.log("\n" + "=".repeat(66));
+  console.log("  🤖 SAYYAD TELEGRAM BOT — CONTROL PANEL & DIAGNOSTIC LINKS");
+  console.log("=".repeat(66));
+  console.log(`  ⚙️  Admin Dashboard:    ${primaryBase}/admin`);
+  console.log(`  🩺  System Diagnostics:  ${primaryBase}/diag`);
+  console.log(`  📄  Diagnostics (JSON):  ${primaryBase}/diag?format=json`);
+  console.log(`  🔑  Key Pool API Status: ${primaryBase}/admin/api/keys`);
+  console.log(`  📊  Stats & Logs API:    ${primaryBase}/admin/api/stats`);
+  console.log(`  💓  Healthcheck / Root:  ${primaryBase}/`);
+
+  if (basePublic && primaryBase !== basePublic) {
+    console.log("-".repeat(66));
+    console.log(`  🌐  Direct Public Link:  http://${publicIp}:${port}/admin`);
+  }
+  if (primaryBase !== baseLocal) {
+    console.log(`  🏠  Localhost Link:      ${baseLocal}/admin`);
+  }
+  console.log("=".repeat(66) + "\n");
+}
+
 server.listen(port, () => {
-  console.log(`🌐 Web & Admin panel listening on http://0.0.0.0:${port}`);
+  printStartupBanner(port).catch(() => {});
 });
 
 // 3. Main Telegram Long Polling Loop
