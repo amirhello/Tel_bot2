@@ -3,8 +3,10 @@
   "version": "2.0.0",
   "private": true,
   "type": "module",
+  "main": "bot.js",
   "description": "Sayyad — a modular Telegram bot on Cloudflare Workers, Gemini + any OpenAI-compatible provider",
   "scripts": {
+    "start": "node bot.js",
     "build": "node build.mjs",
     "test": "node build.mjs && node test/run-all.mjs",
     "dev": "wrangler dev",

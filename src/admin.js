@@ -14,6 +14,7 @@ import {
   saveConfig,
   saveQuota,
 } from "./store.js";
+import { getKeyPoolStatus } from "./keyPool.js";
 
 const COOKIE = "sayyad_admin";
 const MEDIA_KINDS = ["image", "video", "audio"];
@@ -641,6 +642,12 @@ export async function handleAdmin(req, env, path) {
     if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
     const items = await readArchive(env);
     return json({ count: items.length, items });
+  }
+
+  if (path === "/admin/api/keys") {
+    if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
+    const keys = getKeyPoolStatus(env);
+    return json({ count: keys.length, keys });
   }
 
   if (path === "/admin/api/quota") {

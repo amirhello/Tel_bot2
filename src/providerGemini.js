@@ -118,7 +118,7 @@ function shapes(cfg) {
 }
 
 export async function completeGemini(env, cfg, { system, parts, maxTokens }) {
-  const apiKey = env.GEMINI_API_KEY;
+  const apiKey = cfg?.apiKey || env.GEMINI_API_KEY;
   if (!apiKey) throw new ApiError("GEMINI_API_KEY secret is not set", 500);
 
   const model = cfg.provider.model;

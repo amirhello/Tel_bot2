@@ -37,7 +37,14 @@ export function endpointOf(cfg, model = cfg.provider.model) {
  * failure (bad prompt, outage) is not a quota problem and must not silently reroute.
  * Returns the answer, or throws PoolExhausted when every model is spent for the day.
  */
+import { acquireKey, extractKeys } from "./keyPool.js";
+
 async function runGeminiPool(env, cfg, payload) {
+  const keys = extractKeys(env);
+  if (!keys.length && !env.GEMINI_API_KEY) {
+    throw new ApiError("GEMINI_API_KEY secret is not set", 500);
+  }
+
   const pool = Array.isArray(cfg.provider.modelPool) && cfg.provider.modelPool.length
     ? cfg.provider.modelPool
     : [cfg.provider.model];
@@ -51,35 +58,50 @@ async function runGeminiPool(env, cfg, payload) {
     if ((quota[model] ?? 0) > now) continue;
     if ((minuteQuota.get(model) ?? 0) > now) continue;
 
-    try {
-      const use = { ...cfg, provider: { ...cfg.provider, model } };
-      const r = await completeGemini(env, use, payload);
-      if (dirty.size) await saveQuota(env, quota);
-      return { ...r, model };
-    } catch (e) {
-      last = e;
+    let keyAttempts = 0;
+    const maxKeys = 25;
 
-      if (e instanceof DailyQuotaError) {
-        quota[e.model] = e.resetAt;
-        dirty.add(e.model);
-        continue;
+    while (keyAttempts < maxKeys) {
+      keyAttempts++;
+      const keyHandle = acquireKey(env, { model });
+      const apiKey = keyHandle?.key || env.GEMINI_API_KEY;
+
+      if (!apiKey) break;
+
+      try {
+        const use = { ...cfg, apiKey, provider: { ...cfg.provider, model } };
+        const r = await completeGemini(env, use, payload);
+        keyHandle?.release();
+        if (dirty.size) await saveQuota(env, quota);
+        return { ...r, model };
+      } catch (e) {
+        last = e;
+        keyHandle?.release(e);
+
+        if (e instanceof DailyQuotaError) {
+          quota[e.model] = e.resetAt;
+          dirty.add(e.model);
+          // If more keys exist in pool, try them on this model before abandoning it
+          if (keyHandle) continue;
+          break;
+        }
+        if (e instanceof MinuteQuotaError) {
+          minuteQuota.set(e.model, e.resetAt);
+          if (keyHandle) continue;
+          break;
+        }
+        if (e instanceof UnknownModelError) {
+          quota[e.model] = nextPacificMidnight();
+          dirty.add(e.model);
+          break; // A 404 model name cannot succeed with any key
+        }
+        if (/quota|resource_exhausted|high demand|spikes in demand|overloaded|temporarily unavailable/i.test(e?.message)) {
+          minuteQuota.set(model, Date.now() + 60_000);
+          if (keyHandle) continue;
+          break;
+        }
+        throw e;
       }
-      if (e instanceof MinuteQuotaError) {
-        minuteQuota.set(e.model, e.resetAt);
-        continue;
-      }
-      if (e instanceof UnknownModelError) {
-        // A typo costs one request; parking it for the day keeps it from costing more.
-        quota[e.model] = nextPacificMidnight();
-        dirty.add(e.model);
-        continue;
-      }
-      // Safety net: ANY quota or high-demand error from upstream MUST park this model and try the next model
-      if (/quota|resource_exhausted|high demand|spikes in demand|overloaded|temporarily unavailable/i.test(e?.message)) {
-        minuteQuota.set(model, Date.now() + 60_000);
-        continue;
-      }
-      throw e;
     }
   }
 

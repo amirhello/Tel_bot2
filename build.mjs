@@ -34,6 +34,7 @@ for (const file of files) {
 
   const deps = new Set();
   for (const m of raw.matchAll(IMPORT_RE)) {
+    if (m[2].startsWith("node:")) continue;
     deps.add(resolveModule(file, m[2]));
   }
   edges.set(file, deps);
