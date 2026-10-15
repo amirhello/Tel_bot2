@@ -56,7 +56,7 @@ const env = {
   CONFIG: new FileKV(join(process.cwd(), "data"), "store.json"),
 };
 
-const port = Number(process.env.PORT || 8080);
+const port = Number(process.env.PORT || process.env.SERVER_PORT || 10638);
 let running = true;
 
 // 2. Start HTTP server for /admin, /diag and health-checks
@@ -122,8 +122,8 @@ const server = createServer(async (req, res) => {
 });
 
 async function printStartupBanner(port) {
-  let publicIp = process.env.PUBLIC_IP || process.env.SERVER_IP || null;
-  if (!publicIp) {
+  let publicIp = process.env.PUBLIC_IP || process.env.SERVER_IP || "78.154.103.39";
+  if (!publicIp || publicIp === "127.0.0.1") {
     try {
       const res = await fetch("https://api.ipify.org", { signal: AbortSignal.timeout(2000) });
       if (res.ok) {
@@ -158,7 +158,7 @@ async function printStartupBanner(port) {
   console.log("=".repeat(66) + "\n");
 }
 
-server.listen(port, () => {
+server.listen(port, "0.0.0.0", () => {
   printStartupBanner(port).catch(() => {});
 });
 
