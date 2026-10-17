@@ -8,7 +8,7 @@ import { ApiError, callJson, isShapeError } from "./http.js";
 export function toOpenAIPart(part) {
   if (part.type === "text") return { type: "text", text: part.text };
   if (part.type === "image") return { type: "image_url", image_url: { url: `data:${part.mime};base64,${part.data}` } };
-  if (part.type === "video") return { type: "video_url", video_url: { url: `data:${part.mime};base64,${part.data}` } };
+  if (part.type === "video") return { type: "text", text: "[Video attached: not supported by this provider]" };
   if (part.type === "audio") return { type: "input_audio", input_audio: { data: part.data, format: audioFormat(part.mime) } };
   return null;
 }

@@ -1,7 +1,7 @@
 // ============================================================================
 //  Sayyad — Telegram bot on Cloudflare Workers
 //  GENERATED FILE. Do not edit by hand: edit ./src and run "node build.mjs".
-//  Module order, resolved from the import graph: archive.js, http.js, store.js, providerGemini.js, providerOpenai.js, keyPool.js, llm.js, text.js, trigger.js, prompt.js, admin.js, telegram.js, media.js, voice.js, answer.js, tools.js, index.js, nodeStore.js
+//  Module order, resolved from the import graph: archive.js, http.js, keyPool.js, store.js, providerGemini.js, providerOpenai.js, llm.js, text.js, trigger.js, prompt.js, admin.js, telegram.js, media.js, voice.js, answer.js, tools.js, index.js, nodeStore.js
 // ============================================================================
 
 // ------------------------------ src/archive.js ------------------------------
@@ -164,6 +164,380 @@ const isShapeError = (e) => e instanceof ApiError && (e.status === 400 || e.stat
 /** A missing credential is the only reason to try the other provider. */
 const isCredentialError = (e) => e instanceof ApiError && (e.status === 500 && /API key|secret/i.test(e.message));
 
+// ------------------------------ src/keyPool.js ------------------------------
+// Multi-key pool manager for Google Gemini API keys.
+// Provides Round-Robin load balancing, per-key concurrency locking (one in-flight request per key),
+// RPM/RPD cooldown tracking, dead key isolation, and JSON file persistence.
+
+
+
+
+let roundRobinIndex = 0;
+let keyPoolCache = null;
+let stateFilePath = null;
+
+function getStatePath() {
+  if (stateFilePath) return stateFilePath;
+  try {
+    const cwd = typeof process !== "undefined" && process.cwd ? process.cwd() : ".";
+    if (typeof join === "function") return join(cwd, "data", "keys-state.json");
+    return "keys-state.json";
+  } catch {
+    return "keys-state.json";
+  }
+}
+
+function setStateFilePath(path) {
+  stateFilePath = path;
+}
+
+function cleanKey(item) {
+  if (!item || typeof item !== "string") return "";
+  return item.replace(/^[\s\{\}\[\]"'`]+|[\s\{\}\[\]"'`]+$/g, "").trim();
+}
+
+/** Extract list of raw keys from environment or config. */
+function extractKeys(env) {
+  let raw = undefined;
+  if (env && ("GEMINI_API_KEYS" in env || "GEMINI_API_KEY" in env)) {
+    raw = env.GEMINI_API_KEYS || env.GEMINI_API_KEY;
+  } else if (typeof process !== "undefined") {
+    raw = process.env?.GEMINI_API_KEYS || process.env?.GEMINI_API_KEY;
+  }
+
+  if (!raw) return [];
+
+  if (Array.isArray(raw)) {
+    return raw.map(cleanKey).filter((k) => k.length >= 1 && !k.startsWith("#"));
+  }
+
+  const str = String(raw).trim();
+
+  // Try parsing JSON array or object if strictly valid JSON
+  if ((str.startsWith("[") && str.endsWith("]")) || (str.startsWith("{") && str.endsWith("}"))) {
+    try {
+      const parsed = JSON.parse(str);
+      if (Array.isArray(parsed)) {
+        return parsed.map(cleanKey).filter((k) => k.length >= 1 && !k.startsWith("#"));
+      }
+      if (parsed && typeof parsed === "object") {
+        return Object.values(parsed).map(cleanKey).filter((k) => k.length >= 1 && !k.startsWith("#"));
+      }
+    } catch {
+      // If not strict JSON (e.g. unquoted {apikey1, apikey2}), fall through to delimiter splitting
+    }
+  }
+
+  return str
+    .split(/[\r\n,;]+/)
+    .map(cleanKey)
+    .filter((k) => k.length >= 1 && !k.startsWith("#"));
+}
+
+/** Load or initialize the persistent state of all keys. */
+function loadState(keys) {
+  let saved = {};
+  const filePath = getStatePath();
+  try {
+    if (typeof existsSync === "function" && existsSync(filePath)) {
+      if (typeof readFileSync === "function") {
+        saved = JSON.parse(readFileSync(filePath, "utf-8")) || {};
+      }
+    }
+  } catch {
+    /* fallback to clean memory state if file read fails */
+  }
+
+  const now = Date.now();
+  return keys.map((key, idx) => {
+    const s = saved[key] || {};
+    return {
+      key,
+      id: idx + 1,
+      inUse: false, // In-flight lock resets on restart
+      lastUsed: s.lastUsed || 0,
+      requestsToday: s.requestsToday || 0,
+      lastResetDay: s.lastResetDay || new Date().toISOString().slice(0, 10),
+      rpmCooldownUntil: s.rpmCooldownUntil && s.rpmCooldownUntil > now ? s.rpmCooldownUntil : 0,
+      rpdCooldownUntil: s.rpdCooldownUntil && s.rpdCooldownUntil > now ? s.rpdCooldownUntil : 0,
+      modelRpdCooldown: s.modelRpdCooldown && typeof s.modelRpdCooldown === "object" ? s.modelRpdCooldown : {},
+      modelRpmCooldown: s.modelRpmCooldown && typeof s.modelRpmCooldown === "object" ? s.modelRpmCooldown : {},
+      highDemandCooldownUntil: s.highDemandCooldownUntil && s.highDemandCooldownUntil > now ? s.highDemandCooldownUntil : 0,
+      disabled: Boolean(s.disabled),
+      lastError: s.lastError || null,
+    };
+  });
+}
+
+/** Persist state to local JSON file safely. */
+function saveState(pool) {
+  const filePath = getStatePath();
+  try {
+    if (typeof dirname !== "function" || typeof existsSync !== "function" || typeof writeFileSync !== "function") return;
+    const dir = dirname(filePath);
+    if (!existsSync(dir) && typeof mkdirSync === "function") mkdirSync(dir, { recursive: true });
+
+    const obj = {};
+    for (const item of pool) {
+      obj[item.key] = {
+        lastUsed: item.lastUsed,
+        requestsToday: item.requestsToday,
+        lastResetDay: item.lastResetDay,
+        rpmCooldownUntil: item.rpmCooldownUntil,
+        rpdCooldownUntil: item.rpdCooldownUntil,
+        modelRpdCooldown: item.modelRpdCooldown || {},
+        modelRpmCooldown: item.modelRpmCooldown || {},
+        highDemandCooldownUntil: item.highDemandCooldownUntil,
+        disabled: item.disabled,
+        lastError: item.lastError,
+      };
+    }
+    writeFileSync(filePath, JSON.stringify(obj, null, 2), "utf-8");
+  } catch {
+    /* file persistence is non-blocking and safe */
+  }
+}
+
+/** Get or initialize the active key pool. */
+function getKeyPool(env) {
+  const keys = extractKeys(env);
+  if (!keys.length) return [];
+
+  if (
+    !keyPoolCache ||
+    keyPoolCache.length !== keys.length ||
+    !keys.every((k, i) => keyPoolCache[i]?.key === k)
+  ) {
+    keyPoolCache = loadState(keys);
+  }
+  return keyPoolCache;
+}
+
+/** Reset in-memory key pool cache (useful for tests or hot-reload). */
+function clearKeyPoolCache() {
+  keyPoolCache = null;
+  roundRobinIndex = 0;
+}
+
+/**
+ * Acquire the next available key using Round-Robin, enforcing concurrency lock (inUse)
+ * and skipping cooling/disabled keys.
+ */
+function acquireKey(env, opts = {}) {
+  const pool = getKeyPool(env);
+  if (!pool.length) return null;
+
+  const now = Date.now();
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  // Check rollover for today counters
+  for (const item of pool) {
+    if (item.lastResetDay !== todayStr) {
+      item.requestsToday = 0;
+      item.lastResetDay = todayStr;
+      if (item.rpdCooldownUntil && item.rpdCooldownUntil <= now) {
+        item.rpdCooldownUntil = 0;
+      }
+      item.modelRpdCooldown = {};
+      item.modelRpmCooldown = {};
+    }
+  }
+
+  const count = pool.length;
+  for (let step = 0; step < count; step++) {
+    const idx = (roundRobinIndex + step) % count;
+    const item = pool[idx];
+
+    if (item.disabled) continue;
+    if (item.inUse) continue; // One concurrent request per key rule
+    if (item.rpmCooldownUntil > now) continue;
+    if (opts?.model && item.modelRpmCooldown?.[opts.model] > now) continue;
+    if (item.rpdCooldownUntil > now) continue;
+    if (opts?.model && item.modelRpdCooldown?.[opts.model] > now) continue;
+    if (item.highDemandCooldownUntil > now) continue;
+
+    // Found available key! Lock it and advance round-robin index
+    item.inUse = true;
+    item.lastUsed = now;
+    item.requestsToday++;
+    roundRobinIndex = (idx + 1) % count;
+
+    let released = false;
+    const release = (err) => {
+      if (released) return;
+      released = true;
+      item.inUse = false;
+      if (err) recordKeyError(item, err, opts?.model);
+      saveState(pool);
+    };
+
+    return {
+      key: item.key,
+      id: item.id,
+      index: idx,
+      release,
+    };
+  }
+
+  return null; // All keys are currently busy or in cooldown
+}
+
+/**
+ * Acquire next available key, waiting up to maxWaitMs (default 1500ms) if all keys are busy or cooling down.
+ */
+async function acquireKeyWithWait(env, opts = {}) {
+  const maxWaitMs = typeof opts?.maxWaitMs === "number" ? opts.maxWaitMs : 1500;
+  const pollIntervalMs = typeof opts?.pollIntervalMs === "number" ? opts.pollIntervalMs : 1500;
+  const start = Date.now();
+
+  while (true) {
+    const handle = acquireKey(env, opts);
+    if (handle) return handle;
+
+    const pool = getKeyPool(env);
+    if (!pool.length) return null;
+
+    const usableKeys = pool.filter((k) => !k.disabled);
+    if (!usableKeys.length) return null;
+
+    const now = Date.now();
+    const elapsed = now - start;
+    if (elapsed >= maxWaitMs) return null;
+
+    // Find earliest time when any usable key might be available
+    let earliestAvailable = Infinity;
+    for (const item of usableKeys) {
+      if (item.inUse) {
+        earliestAvailable = Math.min(earliestAvailable, now + 500);
+      } else {
+        const modelRpd = opts?.model ? (item.modelRpdCooldown?.[opts.model] || 0) : 0;
+        const modelRpm = opts?.model ? (item.modelRpmCooldown?.[opts.model] || 0) : 0;
+        const itemCooldown = Math.max(
+          item.rpmCooldownUntil || 0,
+          item.highDemandCooldownUntil || 0,
+          modelRpd,
+          modelRpm,
+          item.rpdCooldownUntil || 0,
+        );
+        if (itemCooldown <= now) {
+          earliestAvailable = now;
+        } else {
+          earliestAvailable = Math.min(earliestAvailable, itemCooldown);
+        }
+      }
+    }
+
+    if (earliestAvailable > now + (maxWaitMs - elapsed)) {
+      return null;
+    }
+
+    const waitMs = Math.min(pollIntervalMs, Math.max(100, earliestAvailable - now), maxWaitMs - elapsed);
+    if (waitMs <= 0) return null;
+
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+}
+
+/** Classify error and apply proper cooldown or quarantine. */
+function recordKeyError(item, err, reqModel) {
+  const now = Date.now();
+  const msg = String(err?.message ?? err);
+  const status = Number(err?.status ?? 0);
+  item.lastError = msg.slice(0, 300);
+
+  // 1. Invalid or revoked API key -> permanently quarantine immediately
+  if (
+    (status === 400 || status === 403 || !status) &&
+    (/API_KEY_INVALID|key.*invalid|unregistered callers|API key not valid|forbidden|not authorized|permission/i.test(msg))
+  ) {
+    item.disabled = true;
+    return;
+  }
+
+  // 2. Safety filter block -> Key is healthy! Do NOT penalize key
+  if (/blocked.*safety|prompt_blocked|finishReason.*safety/i.test(msg)) {
+    return;
+  }
+
+  // 3. Daily quota exhaustion -> 24 hours cooldown for model or key
+  if (
+    (status === 429 || status === 503) &&
+    (/per.?day|daily|requests_per_day/i.test(msg) || err?.name === "DailyQuotaError")
+  ) {
+    const model = err?.model || reqModel;
+    if (model) {
+      if (!item.modelRpdCooldown) item.modelRpdCooldown = {};
+      item.modelRpdCooldown[model] = now + 24 * 3600_000;
+    } else {
+      item.rpdCooldownUntil = now + 24 * 3600_000;
+    }
+    return;
+  }
+
+  // 4. Minute RPM rate limit -> 60 seconds cooldown (do not disable)
+  if (
+    status === 429 ||
+    err?.name === "MinuteQuotaError" ||
+    /resource_exhausted|quota exceeded|too many requests|rate.?limit/i.test(msg)
+  ) {
+    const model = err?.model || reqModel;
+    if (model) {
+      if (!item.modelRpmCooldown) item.modelRpmCooldown = {};
+      item.modelRpmCooldown[model] = now + 60_000;
+    } else {
+      item.rpmCooldownUntil = now + 60_000;
+    }
+    return;
+  }
+
+  // 5. Server high demand / overload -> 30 seconds cooldown
+  if (status === 503 || /high demand|spikes in demand|overloaded/i.test(msg)) {
+    item.highDemandCooldownUntil = now + 30_000;
+  }
+}
+
+/** Diagnostic overview of all keys in pool for admin dashboard. */
+function getKeyPoolStatus(env) {
+  const pool = getKeyPool(env);
+  const now = Date.now();
+
+  return pool.map((item) => {
+    let status = "active";
+    let detail = "Ready";
+
+    if (item.disabled) {
+      status = "invalid";
+      detail = "Disabled / Invalid";
+    } else if (item.rpdCooldownUntil > now || Object.values(item.modelRpdCooldown || {}).some((t) => t > now)) {
+      status = "daily_quota";
+      const maxCooldown = Math.max(item.rpdCooldownUntil || 0, ...Object.values(item.modelRpdCooldown || {}));
+      const hoursLeft = Math.ceil((maxCooldown - now) / 3600_000);
+      detail = `Daily quota reached (~${hoursLeft}h left)`;
+    } else if (item.rpmCooldownUntil > now) {
+      status = "rpm_cooldown";
+      const secsLeft = Math.ceil((item.rpmCooldownUntil - now) / 1000);
+      detail = `Minute limit cooldown (${secsLeft}s left)`;
+    } else if (item.highDemandCooldownUntil > now) {
+      status = "busy_cooldown";
+      const secsLeft = Math.ceil((item.highDemandCooldownUntil - now) / 1000);
+      detail = `High demand cooldown (${secsLeft}s left)`;
+    } else if (item.inUse) {
+      status = "in_use";
+      detail = "Processing request";
+    }
+
+    return {
+      id: item.id,
+      key: item.key, // Unmasked as requested in poll A10
+      status,
+      detail,
+      requestsToday: item.requestsToday,
+      lastError: item.lastError,
+      lastUsed: item.lastUsed ? new Date(item.lastUsed).toISOString() : null,
+    };
+  });
+}
+
 // ------------------------------ src/store.js ------------------------------
 // Everything that touches the KV namespace: config, stats and migration.
 
@@ -188,19 +562,25 @@ function nextPacificMidnight(now = Date.now()) {
  * Tried strongest-first. Names are provider-specific: if one is wrong the provider
  * answers 404 and the model is parked for a day instead of being retried forever.
  */
-const DEFAULT_MODEL_POOL = [
+const MULTIMODAL_MODELS = [
+  "gemini-3.5-flash-lite",
   "gemini-3.8-flash",
   "gemini-3.7-flash",
   "gemini-3.6-flash",
-  "gemini-3.5-flash",
   "gemini-3-flash",
   "gemini-2.5-flash",
-  "gemini-3.5-flash-lite",
   "gemini-3.1-flash-lite",
-  "gemini-2.5-flash-lite",
+];
+
+const TEXT_EXTENDED_MODELS = [
   "Antigravity",
   "gemma-4-26b",
   "gemma-4-31b",
+];
+
+const DEFAULT_MODEL_POOL = [
+  ...MULTIMODAL_MODELS,
+  ...TEXT_EXTENDED_MODELS,
 ];
 
 /* ------------------------------------------------------------------ config */
@@ -233,7 +613,7 @@ function defaultConfig(personas) {
     dailyCap: 1000, // across the whole model pool, not per model
     provider: {
       kind: "gemini",
-      model: "gemini-3.8-flash",
+      model: "gemini-3.5-flash-lite",
       baseUrl: DEFAULT_BASE_URLS.gemini,
       modelPool: [...DEFAULT_MODEL_POOL],
     },
@@ -524,13 +904,22 @@ function toGeminiPart(part) {
   return null;
 }
 
+const THINKING_BUDGETS = {
+  off: 0,
+  minimal: 1024,
+  low: 2048,
+  medium: 4096,
+  high: 8192,
+};
+
 /**
- * thinkingConfig. Gemini 3 cannot be switched off, so "off" simply omits the block and
- * lets the model use its own default.
+ * thinkingConfig. Google Gemini REST API expects thinkingConfig.thinkingBudget (integer token count:
+ * minimal: 1024, low: 2048, medium: 4096, high: 8192, off: 0).
  */
 function thinkingConfig(cfg) {
-  if (!cfg.thinking || cfg.thinking === "off") return {};
-  return { thinkingConfig: { thinkingLevel: cfg.thinking, includeThoughts: false } };
+  if (!cfg?.thinking) return {};
+  const budget = THINKING_BUDGETS[cfg.thinking] !== undefined ? THINKING_BUDGETS[cfg.thinking] : 4096;
+  return { thinkingConfig: { thinkingBudget: budget } };
 }
 
 function safetySettings(cfg) {
@@ -646,7 +1035,7 @@ async function completeGemini(env, cfg, { system, parts, maxTokens }) {
 function toOpenAIPart(part) {
   if (part.type === "text") return { type: "text", text: part.text };
   if (part.type === "image") return { type: "image_url", image_url: { url: `data:${part.mime};base64,${part.data}` } };
-  if (part.type === "video") return { type: "video_url", video_url: { url: `data:${part.mime};base64,${part.data}` } };
+  if (part.type === "video") return { type: "text", text: "[Video attached: not supported by this provider]" };
   if (part.type === "audio") return { type: "input_audio", input_audio: { data: part.data, format: audioFormat(part.mime) } };
   return null;
 }
@@ -708,286 +1097,7 @@ const readContent = (data) =>
     .replace(/<\s*think[\s\S]*?<\s*\/\s*think\s*>/g, "")
     .trim();
 
-// ------------------------------ src/keyPool.js ------------------------------
-// Multi-key pool manager for Google Gemini API keys.
-// Provides Round-Robin load balancing, per-key concurrency locking (one in-flight request per key),
-// RPM/RPD cooldown tracking, dead key isolation, and JSON file persistence.
-
-
-
-
-let roundRobinIndex = 0;
-let keyPoolCache = null;
-let stateFilePath = null;
-
-function getStatePath() {
-  if (stateFilePath) return stateFilePath;
-  try {
-    const cwd = typeof process !== "undefined" && process.cwd ? process.cwd() : ".";
-    return join(cwd, "data", "keys-state.json");
-  } catch {
-    return "keys-state.json";
-  }
-}
-
-function setStateFilePath(path) {
-  stateFilePath = path;
-}
-
-/** Extract list of raw keys from environment or config. */
-function extractKeys(env) {
-  if (env && ("GEMINI_API_KEYS" in env || "GEMINI_API_KEY" in env)) {
-    const raw = env.GEMINI_API_KEYS || env.GEMINI_API_KEY;
-    if (!raw) return [];
-    if (Array.isArray(raw)) return raw.map((k) => String(k).trim()).filter((k) => k.length >= 3);
-    return String(raw).split(/[\r\n,]+/).map((k) => k.trim()).filter((k) => k.length >= 3);
-  }
-
-  const procRaw = typeof process !== "undefined" ? (process.env?.GEMINI_API_KEYS || process.env?.GEMINI_API_KEY) : undefined;
-  if (procRaw) {
-    if (Array.isArray(procRaw)) return procRaw.map((k) => String(k).trim()).filter((k) => k.length >= 3);
-    return String(procRaw).split(/[\r\n,]+/).map((k) => k.trim()).filter((k) => k.length >= 3);
-  }
-  return [];
-}
-
-/** Load or initialize the persistent state of all keys. */
-function loadState(keys) {
-  let saved = {};
-  const filePath = getStatePath();
-  try {
-    if (existsSync(filePath)) {
-      saved = JSON.parse(readFileSync(filePath, "utf-8")) || {};
-    }
-  } catch {
-    /* fallback to clean memory state if file read fails */
-  }
-
-  const now = Date.now();
-  return keys.map((key, idx) => {
-    const s = saved[key] || {};
-    return {
-      key,
-      id: idx + 1,
-      inUse: false, // In-flight lock resets on restart
-      lastUsed: s.lastUsed || 0,
-      requestsToday: s.requestsToday || 0,
-      lastResetDay: s.lastResetDay || new Date().toISOString().slice(0, 10),
-      rpmCooldownUntil: s.rpmCooldownUntil && s.rpmCooldownUntil > now ? s.rpmCooldownUntil : 0,
-      rpdCooldownUntil: s.rpdCooldownUntil && s.rpdCooldownUntil > now ? s.rpdCooldownUntil : 0,
-      highDemandCooldownUntil: s.highDemandCooldownUntil && s.highDemandCooldownUntil > now ? s.highDemandCooldownUntil : 0,
-      disabled: Boolean(s.disabled),
-      lastError: s.lastError || null,
-    };
-  });
-}
-
-/** Persist state to local JSON file safely. */
-function saveState(pool) {
-  const filePath = getStatePath();
-  try {
-    const dir = dirname(filePath);
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-
-    const obj = {};
-    for (const item of pool) {
-      obj[item.key] = {
-        lastUsed: item.lastUsed,
-        requestsToday: item.requestsToday,
-        lastResetDay: item.lastResetDay,
-        rpmCooldownUntil: item.rpmCooldownUntil,
-        rpdCooldownUntil: item.rpdCooldownUntil,
-        highDemandCooldownUntil: item.highDemandCooldownUntil,
-        disabled: item.disabled,
-        lastError: item.lastError,
-      };
-    }
-    writeFileSync(filePath, JSON.stringify(obj, null, 2), "utf-8");
-  } catch {
-    /* file persistence is non-blocking and safe */
-  }
-}
-
-/** Get or initialize the active key pool. */
-function getKeyPool(env) {
-  const keys = extractKeys(env);
-  if (!keys.length) return [];
-
-  if (
-    !keyPoolCache ||
-    keyPoolCache.length !== keys.length ||
-    !keys.every((k, i) => keyPoolCache[i]?.key === k)
-  ) {
-    keyPoolCache = loadState(keys);
-  }
-  return keyPoolCache;
-}
-
-/** Reset in-memory key pool cache (useful for tests or hot-reload). */
-function clearKeyPoolCache() {
-  keyPoolCache = null;
-  roundRobinIndex = 0;
-}
-
-/**
- * Acquire the next available key using Round-Robin, enforcing concurrency lock (inUse)
- * and skipping cooling/disabled keys.
- */
-function acquireKey(env, opts = {}) {
-  const pool = getKeyPool(env);
-  if (!pool.length) return null;
-
-  const now = Date.now();
-  const todayStr = new Date().toISOString().slice(0, 10);
-
-  // Check rollover for today counters
-  for (const item of pool) {
-    if (item.lastResetDay !== todayStr) {
-      item.requestsToday = 0;
-      item.lastResetDay = todayStr;
-      if (item.rpdCooldownUntil && item.rpdCooldownUntil <= now) {
-        item.rpdCooldownUntil = 0;
-      }
-    }
-  }
-
-  const count = pool.length;
-  for (let step = 0; step < count; step++) {
-    const idx = (roundRobinIndex + step) % count;
-    const item = pool[idx];
-
-    if (item.disabled) continue;
-    if (item.inUse) continue; // One concurrent request per key rule
-    if (item.rpmCooldownUntil > now) continue;
-    if (item.rpdCooldownUntil > now) continue;
-    if (item.highDemandCooldownUntil > now) continue;
-
-    // Found available key! Lock it and advance round-robin index
-    item.inUse = true;
-    item.lastUsed = now;
-    item.requestsToday++;
-    roundRobinIndex = (idx + 1) % count;
-
-    let released = false;
-    const release = (err) => {
-      if (released) return;
-      released = true;
-      item.inUse = false;
-      if (err) recordKeyError(item, err);
-      saveState(pool);
-    };
-
-    return {
-      key: item.key,
-      id: item.id,
-      index: idx,
-      release,
-    };
-  }
-
-  return null; // All keys are currently busy or in cooldown
-}
-
-/** Classify error and apply proper cooldown or quarantine. */
-function recordKeyError(item, err) {
-  const now = Date.now();
-  const msg = String(err?.message ?? err);
-  const status = Number(err?.status ?? 0);
-  item.lastError = msg.slice(0, 300);
-
-  // 1. Invalid or revoked API key -> permanently disable
-  if (status === 400 && /API_KEY_INVALID|key.*invalid|unregistered callers|API key not valid/i.test(msg)) {
-    item.disabled = true;
-    return;
-  }
-  if (status === 403 && /forbidden|not authorized|permission/i.test(msg)) {
-    item.disabled = true;
-    return;
-  }
-
-  // 2. Safety filter block -> Key is healthy! Do NOT penalize key
-  if (/blocked.*safety|prompt_blocked|finishReason.*safety/i.test(msg)) {
-    return;
-  }
-
-  // 3. Daily quota exhaustion -> 24 hours cooldown
-  if (
-    (status === 429 || status === 503) &&
-    (/per.?day|daily|requests_per_day/i.test(msg) || err?.name === "DailyQuotaError")
-  ) {
-    item.rpdCooldownUntil = now + 24 * 3600_000;
-    return;
-  }
-
-  // 4. Minute RPM rate limit -> 60 seconds cooldown
-  if (
-    status === 429 ||
-    err?.name === "MinuteQuotaError" ||
-    /resource_exhausted|quota exceeded|too many requests|rate.?limit/i.test(msg)
-  ) {
-    item.rpmCooldownUntil = now + 60_000;
-    return;
-  }
-
-  // 5. Server high demand / overload -> 30 seconds cooldown
-  if (status === 503 || /high demand|spikes in demand|overloaded/i.test(msg)) {
-    item.highDemandCooldownUntil = now + 30_000;
-  }
-}
-
-/** Diagnostic overview of all keys in pool for admin dashboard. */
-function getKeyPoolStatus(env) {
-  const pool = getKeyPool(env);
-  const now = Date.now();
-
-  return pool.map((item) => {
-    let status = "active";
-    let detail = "Ready";
-
-    if (item.disabled) {
-      status = "invalid";
-      detail = "Disabled / Invalid";
-    } else if (item.rpdCooldownUntil > now) {
-      status = "daily_quota";
-      const hoursLeft = Math.ceil((item.rpdCooldownUntil - now) / 3600_000);
-      detail = `Daily quota reached (~${hoursLeft}h left)`;
-    } else if (item.rpmCooldownUntil > now) {
-      status = "rpm_cooldown";
-      const secsLeft = Math.ceil((item.rpmCooldownUntil - now) / 1000);
-      detail = `Minute limit cooldown (${secsLeft}s left)`;
-    } else if (item.highDemandCooldownUntil > now) {
-      status = "busy_cooldown";
-      const secsLeft = Math.ceil((item.highDemandCooldownUntil - now) / 1000);
-      detail = `High demand cooldown (${secsLeft}s left)`;
-    } else if (item.inUse) {
-      status = "in_use";
-      detail = "Processing request";
-    }
-
-    return {
-      id: item.id,
-      key: item.key, // Unmasked as requested in poll A10
-      status,
-      detail,
-      requestsToday: item.requestsToday,
-      lastError: item.lastError,
-      lastUsed: item.lastUsed ? new Date(item.lastUsed).toISOString() : null,
-    };
-  });
-}
-
 // ------------------------------ src/llm.js ------------------------------
-// Provider dispatcher. Picks the configured backend, walks a Gemini model pool when the
-// daily quota runs out, and falls back to the other provider when a key is missing.
-//
-// The rest of the bot never sees a provider-specific wire format: it hands over neutral
-// parts and gets back plain text.
-
-
-
-
-
-
 const PROVIDERS = { gemini: completeGemini, openai: completeOpenAI };
 
 /** In-memory parking for per-minute rate limits (RPM/TPM). Costs 0 KV writes. */
@@ -995,12 +1105,53 @@ const minuteQuota = new Map();
 
 function clearMinuteQuota() {
   minuteQuota.clear();
+  clearKeyPoolCache();
 }
 
 function providerFor(cfg) {
   const impl = PROVIDERS[cfg.provider?.kind];
   if (!impl) throw new ApiError(`unknown provider "${cfg.provider?.kind}"`, 500);
   return impl;
+}
+
+/** Check if payload contains visual or audio media. */
+function hasMediaPayload(payload) {
+  return Array.isArray(payload?.parts) && payload.parts.some((p) => p && (p.type === "image" || p.type === "video" || p.type === "audio"));
+}
+
+/** Check if model name supports multimodal input. */
+function isMultimodalModel(model) {
+  const m = String(model || "").toLowerCase();
+  if (m.includes("gemma") || m === "antigravity") return false;
+  return m.startsWith("gemini") || (Array.isArray(MULTIMODAL_MODELS) && MULTIMODAL_MODELS.includes(model));
+}
+
+/** Map model names when falling back across providers. */
+function mapModelForProvider(model, targetKind, baseUrl = "") {
+  if (!model) return targetKind === "gemini" ? "gemini-3.5-flash-lite" : "gpt-4o-mini";
+  const m = String(model).trim();
+
+  if (targetKind === "gemini") {
+    if (m.startsWith("gemini-") || m === "Antigravity" || m.startsWith("gemma-")) {
+      return m;
+    }
+    return "gemini-3.5-flash-lite";
+  }
+
+  if (targetKind === "openai") {
+    if (!m.startsWith("gemini-") && m !== "Antigravity" && !m.startsWith("gemma-")) {
+      return m;
+    }
+    const isOpenRouter = String(baseUrl).includes("openrouter.ai");
+    if (isOpenRouter) {
+      if (m.startsWith("gemini-")) return "google/gemini-2.5-flash";
+      if (m.startsWith("gemma-")) return "google/gemma-2-27b-it";
+      return "openai/gpt-4o-mini";
+    }
+    return "gpt-4o-mini";
+  }
+
+  return m;
 }
 
 /** Describe what the configured provider will actually call. Shown by /diag. */
@@ -1016,17 +1167,19 @@ function endpointOf(cfg, model = cfg.provider.model) {
  * failure (bad prompt, outage) is not a quota problem and must not silently reroute.
  * Returns the answer, or throws PoolExhausted when every model is spent for the day.
  */
-
-
 async function runGeminiPool(env, cfg, payload) {
   const keys = extractKeys(env);
   if (!keys.length && !env.GEMINI_API_KEY) {
     throw new ApiError("GEMINI_API_KEY secret is not set", 500);
   }
 
-  const pool = Array.isArray(cfg.provider.modelPool) && cfg.provider.modelPool.length
+  const rawPool = Array.isArray(cfg.provider.modelPool) && cfg.provider.modelPool.length
     ? cfg.provider.modelPool
     : [cfg.provider.model];
+
+  // Modality-aware routing: filter to multimodal models if media is present
+  const hasMedia = hasMediaPayload(payload);
+  const pool = hasMedia ? rawPool.filter(isMultimodalModel) : rawPool;
 
   const quota = await loadQuota(env);
   const now = Date.now();
@@ -1037,37 +1190,42 @@ async function runGeminiPool(env, cfg, payload) {
     if ((quota[model] ?? 0) > now) continue;
     if ((minuteQuota.get(model) ?? 0) > now) continue;
 
-    let keyAttempts = 0;
-    const maxKeys = 25;
+    const poolKeys = getKeyPool(env);
+    const usableKeys = poolKeys.filter((k) => !k.disabled);
+    const totalUsableKeys = Math.max(1, usableKeys.length);
 
-    while (keyAttempts < maxKeys) {
-      keyAttempts++;
-      const keyHandle = acquireKey(env, { model });
-      const apiKey = keyHandle?.key || env.GEMINI_API_KEY;
+    let modelDailyFailures = 0;
+    let modelMinuteFailures = 0;
+    let lastModelQuotaError = null;
+    let attemptsOnModel = 0;
 
-      if (!apiKey) break;
+    while (attemptsOnModel < totalUsableKeys) {
+      attemptsOnModel++;
+      const keyHandle = await acquireKeyWithWait(env, { model, maxWaitMs: 0 });
+      if (!keyHandle) {
+        break; // No available key for this model
+      }
+
+      const apiKey = keyHandle.key;
 
       try {
         const use = { ...cfg, apiKey, provider: { ...cfg.provider, model } };
         const r = await completeGemini(env, use, payload);
-        keyHandle?.release();
+        keyHandle.release();
         if (dirty.size) await saveQuota(env, quota);
         return { ...r, model };
       } catch (e) {
         last = e;
-        keyHandle?.release(e);
+        lastModelQuotaError = e;
+        keyHandle.release(e);
 
         if (e instanceof DailyQuotaError) {
-          quota[e.model] = e.resetAt;
-          dirty.add(e.model);
-          // If more keys exist in pool, try them on this model before abandoning it
-          if (keyHandle) continue;
-          break;
+          modelDailyFailures++;
+          continue; // Try next key for this model
         }
         if (e instanceof MinuteQuotaError) {
-          minuteQuota.set(e.model, e.resetAt);
-          if (keyHandle) continue;
-          break;
+          modelMinuteFailures++;
+          continue; // Try next key for this model
         }
         if (e instanceof UnknownModelError) {
           quota[e.model] = nextPacificMidnight();
@@ -1075,12 +1233,38 @@ async function runGeminiPool(env, cfg, payload) {
           break; // A 404 model name cannot succeed with any key
         }
         if (/quota|resource_exhausted|high demand|spikes in demand|overloaded|temporarily unavailable/i.test(e?.message)) {
-          minuteQuota.set(model, Date.now() + 60_000);
-          if (keyHandle) continue;
-          break;
+          modelMinuteFailures++;
+          continue;
         }
         throw e;
       }
+    }
+
+    // FIX BUG-01: Only park the model globally if ALL keys in the pool fail on that model
+    const currentPool = getKeyPool(env);
+    const currentUsable = currentPool.filter((k) => !k.disabled);
+    const allKeysDailyExhausted =
+      currentUsable.length > 0 &&
+      currentUsable.every((k) => (k.rpdCooldownUntil > now) || (k.modelRpdCooldown?.[model] > now));
+    const allKeysMinuteExhausted =
+      currentUsable.length > 0 &&
+      currentUsable.every(
+        (k) =>
+          (k.rpmCooldownUntil > now) ||
+          (k.modelRpmCooldown?.[model] > now) ||
+          (k.highDemandCooldownUntil > now) ||
+          (k.rpdCooldownUntil > now) ||
+          (k.modelRpdCooldown?.[model] > now),
+      );
+
+    if (allKeysDailyExhausted || (currentUsable.length > 0 && modelDailyFailures >= currentUsable.length)) {
+      quota[model] = lastModelQuotaError?.resetAt || nextPacificMidnight();
+      dirty.add(model);
+    } else if (
+      allKeysMinuteExhausted ||
+      (currentUsable.length > 0 && (modelDailyFailures + modelMinuteFailures) >= currentUsable.length)
+    ) {
+      minuteQuota.set(model, lastModelQuotaError?.resetAt || (Date.now() + 60_000));
     }
   }
 
@@ -1111,19 +1295,24 @@ async function complete(env, cfg, payload) {
     } catch (e) {
       // A gemini key that is missing is the one case where the other provider can help.
       if (!isCredentialError(e)) throw e;
-      return completeOpenAI(env, { ...cfg, provider: { ...cfg.provider, kind: "openai", baseUrl: DEFAULT_BASE_URLS.openai } }, payload);
+      const baseUrl = DEFAULT_BASE_URLS.openai;
+      const model = mapModelForProvider(cfg.provider?.model, "openai", baseUrl);
+      return completeOpenAI(env, { ...cfg, provider: { ...cfg.provider, kind: "openai", model, baseUrl } }, payload);
     }
   }
 
   const order = ["openai", "gemini"];
   let last;
   for (const kind of order) {
+    const baseUrl = kind === cfg.provider.kind ? cfg.provider.baseUrl : DEFAULT_BASE_URLS[kind];
+    const model = mapModelForProvider(cfg.provider?.model, kind, baseUrl);
     const use = {
       ...cfg,
       provider: {
         ...cfg.provider,
         kind,
-        baseUrl: kind === cfg.provider.kind ? cfg.provider.baseUrl : DEFAULT_BASE_URLS[kind],
+        model,
+        baseUrl,
       },
     };
     try {
@@ -1185,6 +1374,18 @@ function splitText(text, limit = 3900) {
     let cut = rest.lastIndexOf("\n", limit);
     if (cut < limit * 0.5) cut = rest.lastIndexOf(" ", limit);
     if (cut < limit * 0.3) cut = limit;
+
+    // Check if cut point falls between a UTF-16 surrogate pair (High surrogate 0xD800-0xDBFF)
+    if (cut > 0) {
+      const code = rest.charCodeAt(cut - 1);
+      if (code >= 0xd800 && code <= 0xdbff) {
+        cut--;
+      }
+    }
+    if (cut <= 0) {
+      cut = (rest.charCodeAt(0) >= 0xd800 && rest.charCodeAt(0) <= 0xdbff && rest.length >= 2) ? 2 : 1;
+    }
+
     out.push(rest.slice(0, cut).trimEnd());
     rest = rest.slice(cut).replace(/^\s+/, "");
   }
@@ -1205,8 +1406,112 @@ function normalizeFa(s) {
     .replace(/[\u200C\u200E\u200F]/g, " ");
 }
 
+function isRtlText(s) {
+  return /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/.test(String(s ?? ""));
+}
+
+/**
+ * Converts markdown tables (| h1 | h2 |\n|---|---|\n| d1 | d2 |)
+ * to Telegram native <table bordered striped> (Bot API 10.3+).
+ */
+function renderMarkdownTables(text) {
+  return text.replace(/(?:^|\n)((?:\|[^\n]+\|\r?\n)(?:\|[\s\-:|]+\|\r?\n)(?:\|[^\n]+\|\r?\n?)+)/g, (_m, tableBlock) => {
+    const lines = tableBlock.trim().split(/\r?\n/).filter(Boolean);
+    if (lines.length < 2) return tableBlock;
+
+    const parseCells = (line) =>
+      line
+        .replace(/^\||\|$/g, "")
+        .split("|")
+        .map((c) => esc(c.trim()));
+
+    const headers = parseCells(lines[0]);
+    const rows = lines.slice(2).map(parseCells);
+
+    const thead = `<thead><tr>${headers.map((h) => `<th>${h}</th>`).join("")}</tr></thead>`;
+    const tbody = `<tbody>${rows
+      .map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`)
+      .join("")}</tbody>`;
+
+    return `\n<table bordered striped>${thead}${tbody}</table>\n`;
+  });
+}
+
+/**
+ * Converts markdown blockquotes (> quote) to Telegram <blockquote expandable>.
+ */
+function renderBlockquotes(text) {
+  return text.replace(/(?:^|\n)((?:>[^\n]*\r?\n?)+)/g, (_m, block) => {
+    const content = block
+      .split(/\r?\n/)
+      .map((l) => l.replace(/^>\s?/, ""))
+      .join("\n")
+      .trim();
+    if (!content) return "";
+    return `\n<blockquote expandable>${esc(content)}</blockquote>\n`;
+  });
+}
+
+/**
+ * Converts markdown to Telegram Rich Message HTML (Bot API 10.3+).
+ * Supports <table bordered striped>, <blockquote expandable>, <details><summary>,
+ * <tg-button>, <footer>, <h3>, with guaranteed closed tags.
+ */
+function mdToRichHtml(md, opts = {}) {
+  let s = String(md ?? "").trim();
+  if (!s) return "";
+
+  const slots = [];
+  const keep = (rendered) => {
+    slots.push(rendered);
+    return `\u0000S${slots.length - 1}\u0000`;
+  };
+
+  // 1. Preserve pre/code blocks
+  s = s.replace(/```[a-zA-Z0-9]*\n?([\s\S]*?)```/g, (_m, code) =>
+    keep(`<pre><code>${esc(code.replace(/\n$/, ""))}</code></pre>`));
+  s = s.replace(/`([^`\n]+)`/g, (_m, code) => keep(`<code>${esc(code)}</code>`));
+
+  // 2. Render markdown tables
+  s = s.replace(/(?:^|\n)((?:\|[^\n]+\|\r?\n)(?:\|[\s\-:|]+\|\r?\n)(?:\|[^\n]+\|\r?\n?)+)/g, (match) =>
+    keep(renderMarkdownTables(match)));
+
+  // 3. Render blockquotes as expandable
+  s = s.replace(/(?:^|\n)((?:>[^\n]*\r?\n?)+)/g, (match) =>
+    keep(renderBlockquotes(match)));
+
+  // 4. Preserve native rich tags if already emitted by model or template
+  s = s.replace(/<(tg-button-row|tg-button|table|details|summary|blockquote|figure|footer|h[1-6]|p)[^>]*>[\s\S]*?<\/\1>/gi, (tag) => keep(tag));
+  s = s.replace(/<img[^>]*>/gi, (tag) => keep(tag));
+
+  // 5. Convert headers ### Header to <h3>Header</h3>
+  s = s.replace(/^#{1,4}\s+(.+)$/gm, (_m, h) => keep(`<h3>${esc(h)}</h3>`));
+
+  // 6. Escape general text
+  s = esc(s);
+
+  // 7. Inline styling
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  s = s.replace(/(^|[^*\w\\])\*([^*\n]+)\*/g, "$1<i>$2</i>");
+  s = s.replace(/(^|[^_\w\\])_([^_\n]+)_/g, "$1<i>$2</i>");
+  s = s.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, '<a href="$2">$1</a>');
+
+  // 8. Restore preserved slots
+  s = s.replace(/\u0000S(\d+)\u0000/g, (_m, i) => slots[Number(i)]);
+
+  // 9. Append footer if provided
+  if (opts.footer) {
+    s += `\n<footer>${esc(opts.footer)}</footer>`;
+  }
+
+  return s.trim();
+}
+
 /** Base64-encode bytes in chunks, so a multi-megabyte buffer cannot blow the stack. */
 function toBase64(bytes) {
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(bytes).toString("base64");
+  }
   let bin = "";
   const CH = 0x8000;
   for (let i = 0; i < bytes.length; i += CH) {
@@ -1244,17 +1549,26 @@ function isSupportedChat(msg) {
   return Boolean(msg?.chat) && CHAT_TYPES.has(msg.chat.type);
 }
 
-function isCommand(text) {
-  const m = /^\/(start|help|ping)(@\S+)?/i.exec(String(text ?? "").trim());
-  return m ? m[1].toLowerCase() : null;
+function isCommand(text, myBotUsername) {
+  const m = /^\/(start|help|ping)(?:@(\S+))?(?:\s|$)/i.exec(String(text ?? "").trim());
+  if (!m) return null;
+  const targetBot = m[2];
+  if (targetBot && myBotUsername) {
+    const cleanTarget = targetBot.toLowerCase().replace(/^@/, "");
+    const cleanMine = myBotUsername.toLowerCase().replace(/^@/, "");
+    if (cleanTarget !== cleanMine) {
+      return null;
+    }
+  }
+  return m[1].toLowerCase();
 }
 
 /** Groups: only when the wake word appears, or when Sayyad itself is replied to. */
-function shouldAnswer(msg, botId, chatType) {
+function shouldAnswer(msg, botId, chatType, myBotUsername) {
   if (chatType === "private") return true;
   const text = normalizeFa(msg.text || msg.caption || "");
-  if (isCommand(text)) return true;
-  if (/(?<![\p{L}])سید/u.test(text)) return true;
+  if (isCommand(text, myBotUsername)) return true;
+  if (/(?<![\p{L}])سید(?![\p{L}])/u.test(text)) return true;
   if (msg.reply_to_message?.from?.id === botId) return true;
   return false;
 }
@@ -1387,6 +1701,120 @@ const json = (data, status = 200, headers = {}) =>
     headers: { "content-type": "application/json; charset=utf-8", ...headers },
   });
 
+if (typeof crypto !== "undefined" && crypto.subtle && typeof crypto.subtle.timingSafeEqual !== "function" && typeof crypto.timingSafeEqual === "function") {
+  try {
+    crypto.subtle.timingSafeEqual = crypto.timingSafeEqual;
+  } catch {}
+}
+
+/** Constant-time comparison to prevent timing attacks. */
+function timingSafeEqual(a, b) {
+  if (typeof a === "string" && typeof b === "string") {
+    const enc = new TextEncoder();
+    const bufA = enc.encode(a);
+    const bufB = enc.encode(b);
+    if (bufA.byteLength !== bufB.byteLength) return false;
+    const fn = crypto.subtle?.timingSafeEqual ?? crypto.timingSafeEqual;
+    if (typeof fn === "function") return fn(bufA, bufB);
+    let diff = 0;
+    for (let i = 0; i < bufA.byteLength; i++) diff |= bufA[i] ^ bufB[i];
+    return diff === 0;
+  }
+  if (a instanceof Uint8Array && b instanceof Uint8Array) {
+    if (a.byteLength !== b.byteLength) return false;
+    const fn = crypto.subtle?.timingSafeEqual ?? crypto.timingSafeEqual;
+    if (typeof fn === "function") return fn(a, b);
+    let diff = 0;
+    for (let i = 0; i < a.byteLength; i++) diff |= a[i] ^ b[i];
+    return diff === 0;
+  }
+  return false;
+}
+
+/** Constant-time password verification using SHA-256 digest + timingSafeEqual. */
+async function verifyPassword(provided, expected) {
+  if (typeof provided !== "string" || typeof expected !== "string") return false;
+  const enc = new TextEncoder();
+  const [hashA, hashB] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(provided)),
+    crypto.subtle.digest("SHA-256", enc.encode(expected)),
+  ]);
+  const bufA = new Uint8Array(hashA);
+  const bufB = new Uint8Array(hashB);
+  const fn = crypto.subtle?.timingSafeEqual ?? crypto.timingSafeEqual;
+  if (typeof fn === "function") return fn(bufA, bufB);
+  let diff = 0;
+  for (let i = 0; i < bufA.byteLength; i++) diff |= bufA[i] ^ bufB[i];
+  return diff === 0;
+}
+
+const failedLoginAttempts = new Map();
+const MAX_FAILED_ATTEMPTS = 5;
+const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
+function resetLoginRateLimit() {
+  failedLoginAttempts.clear();
+}
+
+function getClientIp(req) {
+  if (req?.headers?.get && typeof req.headers.get === "function") {
+    const cf = req.headers.get("cf-connecting-ip");
+    if (cf) return cf.trim();
+    const xff = req.headers.get("x-forwarded-for");
+    if (xff) return xff.split(",")[0].trim();
+    const xri = req.headers.get("x-real-ip");
+    if (xri) return xri.trim();
+  }
+  if (req?.headers) {
+    const cf = req.headers["cf-connecting-ip"];
+    if (cf) return String(cf).trim();
+    const xff = req.headers["x-forwarded-for"];
+    if (xff) return String(Array.isArray(xff) ? xff[0] : xff).split(",")[0].trim();
+    const xri = req.headers["x-real-ip"];
+    if (xri) return String(xri).trim();
+  }
+  if (req?.socket?.remoteAddress) return req.socket.remoteAddress;
+  return "127.0.0.1";
+}
+
+function isLoginRateLimited(ip) {
+  const now = Date.now();
+  const list = failedLoginAttempts.get(ip) || [];
+  const recent = list.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+  if (recent.length !== list.length) {
+    if (recent.length === 0) failedLoginAttempts.delete(ip);
+    else failedLoginAttempts.set(ip, recent);
+  }
+  return recent.length >= MAX_FAILED_ATTEMPTS;
+}
+
+function recordFailedLogin(ip) {
+  const now = Date.now();
+  const list = failedLoginAttempts.get(ip) || [];
+  const recent = list.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+  recent.push(now);
+  failedLoginAttempts.set(ip, recent);
+}
+
+function clearFailedLogin(ip) {
+  failedLoginAttempts.delete(ip);
+}
+
+function isHttps(req) {
+  try {
+    if (req.url && new URL(req.url).protocol === "https:") return true;
+  } catch {}
+  let proto = "";
+  if (req?.headers?.get && typeof req.headers.get === "function") {
+    proto = req.headers.get("x-forwarded-proto") ?? "";
+    const cfVisitor = req.headers.get("cf-visitor") ?? "";
+    if (cfVisitor.includes('"https"')) return true;
+  } else if (req?.headers) {
+    proto = req.headers["x-forwarded-proto"] ?? "";
+  }
+  return proto.toLowerCase() === "https";
+}
+
 /** Stateless session: the cookie is an HMAC of the admin password, so nothing is stored. */
 async function signSecret(password) {
   const enc = new TextEncoder();
@@ -1396,7 +1824,12 @@ async function signSecret(password) {
 }
 
 function readCookie(req, name) {
-  const raw = req.headers.get("cookie") ?? "";
+  let raw = "";
+  if (req?.headers?.get && typeof req.headers.get === "function") {
+    raw = req.headers.get("cookie") ?? "";
+  } else if (req?.headers?.cookie) {
+    raw = req.headers.cookie ?? "";
+  }
   for (const part of raw.split(";")) {
     const [k, ...v] = part.trim().split("=");
     if (k === name) return decodeURIComponent(v.join("="));
@@ -1409,7 +1842,8 @@ async function isAuthed(req, env) {
   const cookie = readCookie(req, COOKIE);
   if (!cookie) return false;
   try {
-    return cookie === (await signSecret(env.ADMIN_PASSWORD));
+    const want = await signSecret(env.ADMIN_PASSWORD);
+    return timingSafeEqual(cookie, want);
   } catch {
     return false;
   }
@@ -1976,14 +2410,28 @@ async function handleAdmin(req, env, path) {
   }
 
   if (path === "/admin/api/login" && req.method === "POST") {
+    const ip = getClientIp(req);
+    if (isLoginRateLimited(ip)) {
+      return new Response(renderLogin("Too many failed login attempts. Please try again in 5 minutes."), {
+        status: 429,
+        headers: { "content-type": "text/html; charset=utf-8", "retry-after": "300" },
+      });
+    }
+
     const ct = req.headers.get("content-type") ?? "";
     const body = ct.includes("application/json")
       ? await req.json().catch(() => ({}))
       : Object.fromEntries(await req.formData());
-    if (!env.ADMIN_PASSWORD || body.password !== env.ADMIN_PASSWORD) {
+
+    const ok = env.ADMIN_PASSWORD && (await verifyPassword(body.password, env.ADMIN_PASSWORD));
+    if (!ok) {
+      recordFailedLogin(ip);
       return new Response(renderLogin("Wrong password."), { status: 401, headers: { "content-type": "text/html; charset=utf-8" } });
     }
-    const cookie = `${COOKIE}=${await signSecret(env.ADMIN_PASSWORD)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000`;
+
+    clearFailedLogin(ip);
+    const secure = isHttps(req) ? "; Secure" : "";
+    const cookie = `${COOKIE}=${await signSecret(env.ADMIN_PASSWORD)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000${secure}`;
     return new Response(null, { status: 303, headers: { location: "/admin", "set-cookie": cookie } });
   }
 
@@ -2005,7 +2453,15 @@ async function handleAdmin(req, env, path) {
 
   if (path === "/admin/api/keys") {
     if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
-    const keys = getKeyPoolStatus(env);
+    const rawKeys = getKeyPoolStatus(env);
+    const keys = rawKeys.map((item) => {
+      const key = item.key;
+      const masked =
+        typeof key === "string"
+          ? (key.length > 10 ? key.slice(0, 6) + "..." + key.slice(-4) : key.slice(0, 6) + "..." + key.slice(-4))
+          : key;
+      return { ...item, key: masked };
+    });
     return json({ count: keys.length, keys });
   }
 
@@ -2044,10 +2500,6 @@ async function handleAdmin(req, env, path) {
 }
 
 // ------------------------------ src/telegram.js ------------------------------
-// Telegram Bot API client and the outbound half of a reply.
-
-
-
 const api = (token, method) => `https://api.telegram.org/bot${token}/${method}`;
 
 /** Call any Bot API method. Throws only on transport errors; Telegram errors come back as ok:false. */
@@ -2063,6 +2515,7 @@ async function tg(token, method, payload) {
 const getMe = (token) => tg(token, "getMe");
 
 let botIdCache = null;
+let botUsernameCache = null;
 
 /** The bot's own id, fetched once per isolate. Telegram asks for it on every answer. */
 async function botId(env) {
@@ -2070,7 +2523,17 @@ async function botId(env) {
   const me = await getMe(env.TELEGRAM_BOT_TOKEN);
   if (!me?.ok) throw new Error(`getMe failed: ${me?.description ?? "unknown"}`);
   botIdCache = me.result.id;
+  botUsernameCache = me.result.username;
   return botIdCache;
+}
+
+async function botUsername(env) {
+  if (botUsernameCache) return botUsernameCache;
+  const me = await getMe(env.TELEGRAM_BOT_TOKEN);
+  if (!me?.ok) return null;
+  botIdCache = me.result.id;
+  botUsernameCache = me.result.username;
+  return botUsernameCache;
 }
 
 const setWebhook = (token, url, secretToken) =>
@@ -2084,11 +2547,40 @@ const setWebhook = (token, url, secretToken) =>
 
 const deleteWebhook = (token) => tg(token, "deleteWebhook", { drop_pending_updates: false });
 const getWebhookInfo = (token) => tg(token, "getWebhookInfo");
-const sendChatAction = (token, chatId, action = "typing") => tg(token, "sendChatAction", { chat_id: chatId, action });
+const sendChatAction = (token, chatId, action = "typing", threadId) => {
+  const payload = { chat_id: chatId, action };
+  const tid = typeof threadId === "object" ? (threadId?.message_thread_id ?? threadId?.threadId) : threadId;
+  if (tid) payload.message_thread_id = tid;
+  return tg(token, "sendChatAction", payload);
+};
+
+/**
+ * Send a rich message (Bot API 10.3+) supporting native tables, expandable quotes,
+ * buttons and native RTL. Returns telegram API response or null.
+ */
+async function sendRichMessage(token, chatId, html, replyTo, isRtl = true) {
+  const base = { chat_id: chatId };
+  if (replyTo) base.reply_parameters = { message_id: replyTo, allow_sending_without_reply: true };
+
+  const payload = {
+    ...base,
+    rich_message: { html, is_rtl: Boolean(isRtl) },
+  };
+
+  try {
+    return await tg(token, "sendRichMessage", payload);
+  } catch {
+    return null;
+  }
+}
 
 /** Send a message, trying HTML first and degrading to plain text if Telegram objects. */
-async function sendText(token, chatId, text, replyTo) {
+async function sendText(token, chatId, text, replyTo, threadIdOrOpts) {
   const base = { chat_id: chatId };
+  const tid = typeof threadIdOrOpts === "object"
+    ? (threadIdOrOpts?.message_thread_id ?? threadIdOrOpts?.threadId)
+    : threadIdOrOpts;
+  if (tid) base.message_thread_id = tid;
   // reply_parameters, not reply_to_message_id: a deleted target never costs us the message.
   if (replyTo) base.reply_parameters = { message_id: replyTo, allow_sending_without_reply: true };
 
@@ -2101,19 +2593,22 @@ async function sendText(token, chatId, text, replyTo) {
 }
 
 /**
- * Send a long answer. The split is measured on the *rendered* HTML, because markdown grows
- * once it becomes tags — otherwise a bold-heavy answer silently blows past the 4096 limit.
+ * Send a long answer using standard Telegram sendMessage (HTML parse_mode).
  */
-async function sendLong(token, chatId, text, replyTo) {
-  for (const chunk of splitText(text, 3200)) {
+async function sendLong(token, chatId, text, replyTo, opts = {}) {
+  const options = typeof opts === "object" && opts !== null ? opts : { message_thread_id: opts };
+  const tid = options.message_thread_id ?? options.threadId;
+  const chunks = splitText(text, 3200);
+
+  for (const chunk of chunks) {
     const rendered = mdToHtml(chunk).length;
     if (rendered <= 3900) {
-      await sendText(token, chatId, chunk, replyTo);
+      await sendText(token, chatId, chunk, replyTo, tid);
       continue;
     }
     const narrower = Math.max(600, Math.floor((chunk.length * 3800) / rendered));
     for (const sub of splitText(chunk, narrower)) {
-      await sendText(token, chatId, sub, replyTo);
+      await sendText(token, chatId, sub, replyTo, tid);
     }
   }
 }
@@ -2131,12 +2626,16 @@ async function downloadFile(token, fileId) {
  * Send an audio file so it plays in the chat. WAV is not a format every client likes for
  * `sendAudio`, so a refusal falls back to `sendDocument` — the user still gets the sound.
  */
-async function sendAudioFile(token, chatId, bytes, fileName, mime, replyTo) {
+async function sendAudioFile(token, chatId, bytes, fileName, mime, replyTo, threadIdOrOpts) {
   const blob = () => new Blob([bytes], { type: mime });
+  const tid = typeof threadIdOrOpts === "object"
+    ? (threadIdOrOpts?.message_thread_id ?? threadIdOrOpts?.threadId)
+    : threadIdOrOpts;
 
   const post = (method, field) => {
     const form = new FormData();
     form.append("chat_id", String(chatId));
+    if (tid) form.append("message_thread_id", String(tid));
     if (replyTo) form.append("reply_parameters", JSON.stringify({ message_id: replyTo, allow_sending_without_reply: true }));
     form.append(field, blob(), fileName);
     return fetch(api(token, method), { method: "POST", body: form })
@@ -2368,12 +2867,33 @@ function base64Bytes(b64) {
  * A turn that produced *some* audio but died before `turnComplete` still counts as a
  * success — a slightly short answer beats an error message.
  */
-async function speakOnce(key, model, words, timeoutMs) {
+async function connectLiveSocket(key) {
+  const wsUrl = LIVE_ENDPOINT.replace(/^http/i, "ws") + `?key=${encodeURIComponent(key)}`;
+
+  if (typeof globalThis.WebSocket === "function") {
+    try {
+      const ws = new globalThis.WebSocket(wsUrl);
+      if (ws) return ws;
+    } catch {
+      /* fallback to fetch */
+    }
+  }
+
   const res = await fetch(`${LIVE_ENDPOINT}?key=${encodeURIComponent(key)}`, {
     headers: { Upgrade: "websocket" },
   });
-  const ws = res.webSocket;
+  const ws = res?.webSocket;
   if (!ws) throw new Error("live voice: WebSocket upgrade was refused");
+  return ws;
+}
+
+/**
+ * Say `text` out loud. Resolves with a WAV (Uint8Array), throws on anything unexpected.
+ * A turn that produced *some* audio but died before `turnComplete` still counts as a
+ * success — a slightly short answer beats an error message.
+ */
+async function speakOnce(key, model, words, timeoutMs) {
+  const ws = await connectLiveSocket(key);
 
   return await new Promise((resolve, reject) => {
     const chunks = [];
@@ -2461,13 +2981,21 @@ async function speakOnce(key, model, words, timeoutMs) {
       /* read-only in some runtimes */
     }
 
-    send({
-      setup: {
-        model: `models/${model}`,
-        generationConfig: { responseModalities: ["AUDIO"] },
-        systemInstruction: { parts: [{ text: SPEAK_PROMPT }] },
-      },
-    });
+    const sendSetup = () => {
+      send({
+        setup: {
+          model: `models/${model}`,
+          generationConfig: { responseModalities: ["AUDIO"] },
+          systemInstruction: { parts: [{ text: SPEAK_PROMPT }] },
+        },
+      });
+    };
+
+    if (ws.readyState === 0) {
+      ws.addEventListener("open", sendSetup, { once: true });
+    } else {
+      sendSetup();
+    }
   });
 }
 
@@ -2548,9 +3076,6 @@ const HELP =
 const jobs = new Map();
 const capNotified = new Map();
 
-// Guard against Cloudflare's 30 s waitUntil ceiling so we always log and reply before termination.
-const REPLY_BUDGET_MS = 24_000;
-
 /**
  * "ساعت ۹:۳۰" — the exact moment the daily quota frees up, in Tehran time. Google resets
  * RPD at midnight Pacific: 09:30 Tehran in summer, 08:30 in winter.
@@ -2589,14 +3114,6 @@ function serialize(key, job) {
   return next;
 }
 
-function withBudget(promise, ms) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`processing timed out after ${Math.round(ms / 1000)}s`)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
-
 function hash(s) {
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
@@ -2622,12 +3139,14 @@ async function processMessage(env, msg) {
         answered = true;
       } else {
         let id = null;
+        let myBotUsername = null;
         try {
           id = await botId(env);
+          myBotUsername = await botUsername(env);
         } catch {
           /* getMe failed: ignore, shouldAnswer will still check trigger word */
         }
-        answered = shouldAnswer(msg, id, msg.chat?.type);
+        answered = shouldAnswer(msg, id, msg.chat?.type, myBotUsername);
       }
     }
 
@@ -2644,7 +3163,7 @@ async function processMessage(env, msg) {
       let replyError = null;
       let tgOut = null;
       try {
-        outcome = await withBudget(reply(env, msg, cfg), REPLY_BUDGET_MS);
+        outcome = await reply(env, msg, cfg);
         tgOut = outcome?.tgOut ?? "delivered";
       } catch (e) {
         replyError = e;
@@ -2657,7 +3176,7 @@ async function processMessage(env, msg) {
               ? RATE_LIMITED
               : ERRORS[Math.abs(hash(`${msg.chat.id}:${msg.message_id}`)) % ERRORS.length];
         try {
-          await sendText(env.TELEGRAM_BOT_TOKEN, msg.chat.id, text, msg.message_id);
+          await sendText(env.TELEGRAM_BOT_TOKEN, msg.chat.id, text, msg.message_id, msg.message_thread_id);
           tgOut = "error notice delivered to user";
         } catch (sendErr) {
           tgOut = `failed to send error notice: ${String(sendErr?.message ?? sendErr).slice(0, 120)}`;
@@ -2690,16 +3209,18 @@ const config_enabled = (cfg) => cfg.enabled !== false;
 async function reply(env, msg, cfg) {
   const token = env.TELEGRAM_BOT_TOKEN;
   const chatId = msg.chat.id;
+  const threadId = msg.message_thread_id;
   const text = msg.text || msg.caption || "";
-  const cmd = isCommand(text);
+  const myName = await botUsername(env).catch(() => null);
+  const cmd = isCommand(text, myName);
 
   if (cmd === "ping") {
-    await sendText(token, chatId, "🏓 pong", msg.message_id);
+    await sendText(token, chatId, "🏓 pong", msg.message_id, threadId);
     return { text: "🏓 pong", reason: "command /ping", tgOut: "text delivered" };
   }
   if (cmd === "start" || cmd === "help") {
     const helpMsg = HELP.replace("__MODE__", MODE_NAME[cfg.mode] ?? "Know-it-all");
-    await sendText(token, chatId, helpMsg, msg.message_id);
+    await sendText(token, chatId, helpMsg, msg.message_id, threadId);
     return { text: helpMsg, reason: `command /${cmd}`, tgOut: "text delivered" };
   }
 
@@ -2709,18 +3230,29 @@ async function reply(env, msg, cfg) {
     return { text: DAILY_LIMIT, reason: "daily cap reached", tgOut: "daily cap guard" };
   }
 
-  await sendChatAction(token, chatId, "typing");
+  await sendChatAction(token, chatId, "typing", threadId).catch(() => {});
   await bumpStats(env, { requests: 1, lastUsed: new Date().toISOString() });
 
-  const id = msg.reply_to_message ? await botId(env).catch(() => null) : null;
-  const { media, note } = await collectMedia(env, msg, cfg);
-  const { text: replyText, fromBot } = replyContext(msg, id);
+  const typingHeartbeat = setInterval(() => {
+    sendChatAction(token, chatId, "typing", threadId).catch(() => {});
+  }, 4000);
 
-  const { text: answer, model: usedModel } = await complete(env, cfg, {
-    system: buildSystemPrompt(cfg),
-    parts: buildUserContent({ text, replyText, replyFromBot: fromBot, media, note }),
-    maxTokens: cfg.maxTokens,
-  });
+  let answer, usedModel;
+  try {
+    const id = msg.reply_to_message ? await botId(env).catch(() => null) : null;
+    const { media, note } = await collectMedia(env, msg, cfg);
+    const { text: replyText, fromBot } = replyContext(msg, id);
+
+    const res = await complete(env, cfg, {
+      system: buildSystemPrompt(cfg),
+      parts: buildUserContent({ text, replyText, replyFromBot: fromBot, media, note }),
+      maxTokens: cfg.maxTokens,
+    });
+    answer = res.text;
+    usedModel = res.model;
+  } finally {
+    clearInterval(typingHeartbeat);
+  }
 
   // A voice note deserves a voice back: the text answer above becomes a Live API turn
   // and comes back as audio. Anything that goes wrong here is caught by processMessage
@@ -2728,13 +3260,13 @@ async function reply(env, msg, cfg) {
   if (voiceReply(msg, cfg)) {
     const startAt = Date.now();
     const elapsed = () => Date.now() - startAt;
-    const keep = setInterval(() => sendChatAction(token, chatId, "upload_voice").catch(() => {}), 4000);
+    const keep = setInterval(() => sendChatAction(token, chatId, "upload_voice", threadId).catch(() => {}), 4000);
     let audioSent = false;
     let vErrText = null;
     try {
       if (elapsed() > VOICE_BUDGET_MS) throw new Error("live voice: over the time budget");
       const wav = await speak(env, cfg, answer, { timeoutMs: Math.max(3000, VOICE_BUDGET_MS - elapsed()) });
-      await sendAudioFile(token, chatId, wav, "sayyad.wav", "audio/wav", msg.message_id);
+      await sendAudioFile(token, chatId, wav, "sayyad.wav", "audio/wav", msg.message_id, threadId);
       audioSent = true;
       await bumpStats(env, { replies: 1 });
       return { text: answer, model: usedModel, voice: true, tgOut: "audio delivered (sayyad.wav)" };
@@ -2745,13 +3277,13 @@ async function reply(env, msg, cfg) {
       clearInterval(keep);
     }
     if (!audioSent) {
-      await sendLong(token, chatId, answer, msg.message_id);
+      await sendLong(token, chatId, answer, msg.message_id, { model: usedModel, message_thread_id: threadId });
       await bumpStats(env, { replies: 1 });
       return { text: answer, model: usedModel, voice: false, voiceError: vErrText, tgOut: "text fallback delivered" };
     }
   }
 
-  await sendLong(token, chatId, answer, msg.message_id);
+  await sendLong(token, chatId, answer, msg.message_id, { model: usedModel, message_thread_id: threadId });
   await bumpStats(env, { replies: 1 });
   return { text: answer, model: usedModel, tgOut: "text delivered" };
 }
@@ -2769,7 +3301,7 @@ async function overDailyCap(env, cfg, msg) {
   if (Date.now() - last < 60_000) return true;
   capNotified.set(msg.chat.id, Date.now());
   try {
-    await sendText(env.TELEGRAM_BOT_TOKEN, msg.chat.id, DAILY_LIMIT, msg.message_id);
+    await sendText(env.TELEGRAM_BOT_TOKEN, msg.chat.id, DAILY_LIMIT, msg.message_id, msg.message_thread_id);
   } catch {
     /* the guard still works even if the notice does not get through */
   }
@@ -2899,6 +3431,11 @@ const seen = new Set();
 
 export default {
   async fetch(req, env, ctx) {
+    const contentLength = Number(req.headers.get("content-length"));
+    if (contentLength && contentLength > 2 * 1024 * 1024) {
+      return new Response("Payload Too Large", { status: 413 });
+    }
+
     const url = new URL(req.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
 
@@ -2907,13 +3444,16 @@ export default {
     if (path === "/") return json({ ok: true, bot: "sayyad" });
 
     if (path === "/setup") {
+      if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
       return json(await setup(req, env, url).catch((e) => ({ error: String(e?.message ?? e) })));
     }
     if (path === "/setup/reset") {
+      if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
       return json(await resetWebhook(env).catch((e) => ({ error: String(e?.message ?? e) })));
     }
 
     if (path === "/diag") {
+      if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
       const report = await diagnostics(env).catch((e) => ({ error: String(e?.message ?? e) }));
       if (url.searchParams.get("format") === "json") return json(report);
       return new Response(reportPage("Sayyad diagnostics", report), {
@@ -2935,14 +3475,15 @@ export default {
 async function webhook(req, env, ctx) {
   if (!env.TELEGRAM_BOT_TOKEN) return new Response("TELEGRAM_BOT_TOKEN is not set", { status: 500 });
 
-  // Verified by the secret we handed out at /setup if header is present.
+  // Strictly require secret token when ADMIN_PASSWORD is configured
   if (env.ADMIN_PASSWORD) {
     const got = req.headers.get("x-telegram-bot-api-secret-token");
-    if (got) {
-      const want = await signWebhookSecret(env.ADMIN_PASSWORD);
-      if (got !== want) {
-        return new Response("forbidden", { status: 403 });
-      }
+    if (!got) {
+      return new Response("forbidden", { status: 403 });
+    }
+    const want = await signWebhookSecret(env.ADMIN_PASSWORD);
+    if (!timingSafeEqual(got, want)) {
+      return new Response("forbidden", { status: 403 });
     }
   }
 
@@ -2977,6 +3518,9 @@ class FileKV {
       if (existsSync(this.filePath)) {
         const raw = readFileSync(this.filePath, "utf-8");
         this.data = JSON.parse(raw) || {};
+      } else if (existsSync(`${this.filePath}.tmp`)) {
+        const raw = readFileSync(`${this.filePath}.tmp`, "utf-8");
+        this.data = JSON.parse(raw) || {};
       }
     } catch {
       this.data = {};
@@ -2986,7 +3530,9 @@ class FileKV {
   save() {
     try {
       if (!existsSync(this.dir)) mkdirSync(this.dir, { recursive: true });
-      writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), "utf-8");
+      const tmpPath = `${this.filePath}.tmp`;
+      writeFileSync(tmpPath, JSON.stringify(this.data, null, 2), "utf-8");
+      renameSync(tmpPath, this.filePath);
     } catch (err) {
       console.error("FileKV save failed:", err?.message || err);
     }
@@ -3018,4 +3564,4 @@ class FileKV {
   }
 }
 
-export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MinuteQuotaError, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, STATS_KEY, THINKING_LEVELS, TRIGGER, UnknownModelError, acquireKey, appendArchive, archiveRecord, botId, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, detectMedia, diagnostics, downloadFile, endpointOf, esc, extractKeys, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, isAuthed, isCommand, isCredentialError, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mdToHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiText, readPatch, renderDashboard, renderLogin, replyContext, reportPage, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendText, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday };
+export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, UnknownModelError, acquireKey, acquireKeyWithWait, appendArchive, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, detectMedia, diagnostics, downloadFile, endpointOf, esc, extractKeys, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, hasMediaPayload, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiText, readPatch, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword };

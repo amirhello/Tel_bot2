@@ -10,17 +10,26 @@ export function isSupportedChat(msg) {
   return Boolean(msg?.chat) && CHAT_TYPES.has(msg.chat.type);
 }
 
-export function isCommand(text) {
-  const m = /^\/(start|help|ping)(@\S+)?/i.exec(String(text ?? "").trim());
-  return m ? m[1].toLowerCase() : null;
+export function isCommand(text, myBotUsername) {
+  const m = /^\/(start|help|ping)(?:@(\S+))?(?:\s|$)/i.exec(String(text ?? "").trim());
+  if (!m) return null;
+  const targetBot = m[2];
+  if (targetBot && myBotUsername) {
+    const cleanTarget = targetBot.toLowerCase().replace(/^@/, "");
+    const cleanMine = myBotUsername.toLowerCase().replace(/^@/, "");
+    if (cleanTarget !== cleanMine) {
+      return null;
+    }
+  }
+  return m[1].toLowerCase();
 }
 
 /** Groups: only when the wake word appears, or when Sayyad itself is replied to. */
-export function shouldAnswer(msg, botId, chatType) {
+export function shouldAnswer(msg, botId, chatType, myBotUsername) {
   if (chatType === "private") return true;
   const text = normalizeFa(msg.text || msg.caption || "");
-  if (isCommand(text)) return true;
-  if (/(?<![\p{L}])سید/u.test(text)) return true;
+  if (isCommand(text, myBotUsername)) return true;
+  if (/(?<![\p{L}])سید(?![\p{L}])/u.test(text)) return true;
   if (msg.reply_to_message?.from?.id === botId) return true;
   return false;
 }

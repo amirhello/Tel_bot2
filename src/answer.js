@@ -4,7 +4,7 @@ import { appendArchive, archiveRecord } from "./archive.js";
 import { PoolExhausted, complete } from "./llm.js";
 import { collectMedia } from "./media.js";
 import { DEFAULT_PERSONAS, buildSystemPrompt, buildUserContent, replyContext } from "./prompt.js";
-import { botId, sendAudioFile, sendChatAction, sendLong, sendText } from "./telegram.js";
+import { botId, botUsername, sendAudioFile, sendChatAction, sendLong, sendText } from "./telegram.js";
 import { isCommand, isSupportedChat, shouldAnswer } from "./trigger.js";
 import { bumpStats, loadConfig, loadStats, usedToday } from "./store.js";
 import { speak } from "./voice.js";
@@ -35,9 +35,6 @@ const HELP =
 
 const jobs = new Map();
 const capNotified = new Map();
-
-// Guard against Cloudflare's 30 s waitUntil ceiling so we always log and reply before termination.
-const REPLY_BUDGET_MS = 24_000;
 
 /**
  * "ساعت ۹:۳۰" — the exact moment the daily quota frees up, in Tehran time. Google resets
@@ -77,14 +74,6 @@ function serialize(key, job) {
   return next;
 }
 
-function withBudget(promise, ms) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`processing timed out after ${Math.round(ms / 1000)}s`)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
-
 function hash(s) {
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
@@ -110,12 +99,14 @@ export async function processMessage(env, msg) {
         answered = true;
       } else {
         let id = null;
+        let myBotUsername = null;
         try {
           id = await botId(env);
+          myBotUsername = await botUsername(env);
         } catch {
           /* getMe failed: ignore, shouldAnswer will still check trigger word */
         }
-        answered = shouldAnswer(msg, id, msg.chat?.type);
+        answered = shouldAnswer(msg, id, msg.chat?.type, myBotUsername);
       }
     }
 
@@ -132,7 +123,7 @@ export async function processMessage(env, msg) {
       let replyError = null;
       let tgOut = null;
       try {
-        outcome = await withBudget(reply(env, msg, cfg), REPLY_BUDGET_MS);
+        outcome = await reply(env, msg, cfg);
         tgOut = outcome?.tgOut ?? "delivered";
       } catch (e) {
         replyError = e;
@@ -145,7 +136,7 @@ export async function processMessage(env, msg) {
               ? RATE_LIMITED
               : ERRORS[Math.abs(hash(`${msg.chat.id}:${msg.message_id}`)) % ERRORS.length];
         try {
-          await sendText(env.TELEGRAM_BOT_TOKEN, msg.chat.id, text, msg.message_id);
+          await sendText(env.TELEGRAM_BOT_TOKEN, msg.chat.id, text, msg.message_id, msg.message_thread_id);
           tgOut = "error notice delivered to user";
         } catch (sendErr) {
           tgOut = `failed to send error notice: ${String(sendErr?.message ?? sendErr).slice(0, 120)}`;
@@ -178,16 +169,18 @@ const config_enabled = (cfg) => cfg.enabled !== false;
 async function reply(env, msg, cfg) {
   const token = env.TELEGRAM_BOT_TOKEN;
   const chatId = msg.chat.id;
+  const threadId = msg.message_thread_id;
   const text = msg.text || msg.caption || "";
-  const cmd = isCommand(text);
+  const myName = await botUsername(env).catch(() => null);
+  const cmd = isCommand(text, myName);
 
   if (cmd === "ping") {
-    await sendText(token, chatId, "🏓 pong", msg.message_id);
+    await sendText(token, chatId, "🏓 pong", msg.message_id, threadId);
     return { text: "🏓 pong", reason: "command /ping", tgOut: "text delivered" };
   }
   if (cmd === "start" || cmd === "help") {
     const helpMsg = HELP.replace("__MODE__", MODE_NAME[cfg.mode] ?? "Know-it-all");
-    await sendText(token, chatId, helpMsg, msg.message_id);
+    await sendText(token, chatId, helpMsg, msg.message_id, threadId);
     return { text: helpMsg, reason: `command /${cmd}`, tgOut: "text delivered" };
   }
 
@@ -197,18 +190,29 @@ async function reply(env, msg, cfg) {
     return { text: DAILY_LIMIT, reason: "daily cap reached", tgOut: "daily cap guard" };
   }
 
-  await sendChatAction(token, chatId, "typing");
+  await sendChatAction(token, chatId, "typing", threadId).catch(() => {});
   await bumpStats(env, { requests: 1, lastUsed: new Date().toISOString() });
 
-  const id = msg.reply_to_message ? await botId(env).catch(() => null) : null;
-  const { media, note } = await collectMedia(env, msg, cfg);
-  const { text: replyText, fromBot } = replyContext(msg, id);
+  const typingHeartbeat = setInterval(() => {
+    sendChatAction(token, chatId, "typing", threadId).catch(() => {});
+  }, 4000);
 
-  const { text: answer, model: usedModel } = await complete(env, cfg, {
-    system: buildSystemPrompt(cfg),
-    parts: buildUserContent({ text, replyText, replyFromBot: fromBot, media, note }),
-    maxTokens: cfg.maxTokens,
-  });
+  let answer, usedModel;
+  try {
+    const id = msg.reply_to_message ? await botId(env).catch(() => null) : null;
+    const { media, note } = await collectMedia(env, msg, cfg);
+    const { text: replyText, fromBot } = replyContext(msg, id);
+
+    const res = await complete(env, cfg, {
+      system: buildSystemPrompt(cfg),
+      parts: buildUserContent({ text, replyText, replyFromBot: fromBot, media, note }),
+      maxTokens: cfg.maxTokens,
+    });
+    answer = res.text;
+    usedModel = res.model;
+  } finally {
+    clearInterval(typingHeartbeat);
+  }
 
   // A voice note deserves a voice back: the text answer above becomes a Live API turn
   // and comes back as audio. Anything that goes wrong here is caught by processMessage
@@ -216,13 +220,13 @@ async function reply(env, msg, cfg) {
   if (voiceReply(msg, cfg)) {
     const startAt = Date.now();
     const elapsed = () => Date.now() - startAt;
-    const keep = setInterval(() => sendChatAction(token, chatId, "upload_voice").catch(() => {}), 4000);
+    const keep = setInterval(() => sendChatAction(token, chatId, "upload_voice", threadId).catch(() => {}), 4000);
     let audioSent = false;
     let vErrText = null;
     try {
       if (elapsed() > VOICE_BUDGET_MS) throw new Error("live voice: over the time budget");
       const wav = await speak(env, cfg, answer, { timeoutMs: Math.max(3000, VOICE_BUDGET_MS - elapsed()) });
-      await sendAudioFile(token, chatId, wav, "sayyad.wav", "audio/wav", msg.message_id);
+      await sendAudioFile(token, chatId, wav, "sayyad.wav", "audio/wav", msg.message_id, threadId);
       audioSent = true;
       await bumpStats(env, { replies: 1 });
       return { text: answer, model: usedModel, voice: true, tgOut: "audio delivered (sayyad.wav)" };
@@ -233,13 +237,13 @@ async function reply(env, msg, cfg) {
       clearInterval(keep);
     }
     if (!audioSent) {
-      await sendLong(token, chatId, answer, msg.message_id);
+      await sendLong(token, chatId, answer, msg.message_id, { model: usedModel, message_thread_id: threadId });
       await bumpStats(env, { replies: 1 });
       return { text: answer, model: usedModel, voice: false, voiceError: vErrText, tgOut: "text fallback delivered" };
     }
   }
 
-  await sendLong(token, chatId, answer, msg.message_id);
+  await sendLong(token, chatId, answer, msg.message_id, { model: usedModel, message_thread_id: threadId });
   await bumpStats(env, { replies: 1 });
   return { text: answer, model: usedModel, tgOut: "text delivered" };
 }
@@ -257,7 +261,7 @@ async function overDailyCap(env, cfg, msg) {
   if (Date.now() - last < 60_000) return true;
   capNotified.set(msg.chat.id, Date.now());
   try {
-    await sendText(env.TELEGRAM_BOT_TOKEN, msg.chat.id, DAILY_LIMIT, msg.message_id);
+    await sendText(env.TELEGRAM_BOT_TOKEN, msg.chat.id, DAILY_LIMIT, msg.message_id, msg.message_thread_id);
   } catch {
     /* the guard still works even if the notice does not get through */
   }

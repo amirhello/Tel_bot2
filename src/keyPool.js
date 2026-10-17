@@ -13,7 +13,8 @@ function getStatePath() {
   if (stateFilePath) return stateFilePath;
   try {
     const cwd = typeof process !== "undefined" && process.cwd ? process.cwd() : ".";
-    return join(cwd, "data", "keys-state.json");
+    if (typeof join === "function") return join(cwd, "data", "keys-state.json");
+    return "keys-state.json";
   } catch {
     return "keys-state.json";
   }
@@ -23,21 +24,47 @@ export function setStateFilePath(path) {
   stateFilePath = path;
 }
 
+function cleanKey(item) {
+  if (!item || typeof item !== "string") return "";
+  return item.replace(/^[\s\{\}\[\]"'`]+|[\s\{\}\[\]"'`]+$/g, "").trim();
+}
+
 /** Extract list of raw keys from environment or config. */
 export function extractKeys(env) {
+  let raw = undefined;
   if (env && ("GEMINI_API_KEYS" in env || "GEMINI_API_KEY" in env)) {
-    const raw = env.GEMINI_API_KEYS || env.GEMINI_API_KEY;
-    if (!raw) return [];
-    if (Array.isArray(raw)) return raw.map((k) => String(k).trim()).filter((k) => k.length >= 3);
-    return String(raw).split(/[\r\n,]+/).map((k) => k.trim()).filter((k) => k.length >= 3);
+    raw = env.GEMINI_API_KEYS || env.GEMINI_API_KEY;
+  } else if (typeof process !== "undefined") {
+    raw = process.env?.GEMINI_API_KEYS || process.env?.GEMINI_API_KEY;
   }
 
-  const procRaw = typeof process !== "undefined" ? (process.env?.GEMINI_API_KEYS || process.env?.GEMINI_API_KEY) : undefined;
-  if (procRaw) {
-    if (Array.isArray(procRaw)) return procRaw.map((k) => String(k).trim()).filter((k) => k.length >= 3);
-    return String(procRaw).split(/[\r\n,]+/).map((k) => k.trim()).filter((k) => k.length >= 3);
+  if (!raw) return [];
+
+  if (Array.isArray(raw)) {
+    return raw.map(cleanKey).filter((k) => k.length >= 1 && !k.startsWith("#"));
   }
-  return [];
+
+  const str = String(raw).trim();
+
+  // Try parsing JSON array or object if strictly valid JSON
+  if ((str.startsWith("[") && str.endsWith("]")) || (str.startsWith("{") && str.endsWith("}"))) {
+    try {
+      const parsed = JSON.parse(str);
+      if (Array.isArray(parsed)) {
+        return parsed.map(cleanKey).filter((k) => k.length >= 1 && !k.startsWith("#"));
+      }
+      if (parsed && typeof parsed === "object") {
+        return Object.values(parsed).map(cleanKey).filter((k) => k.length >= 1 && !k.startsWith("#"));
+      }
+    } catch {
+      // If not strict JSON (e.g. unquoted {apikey1, apikey2}), fall through to delimiter splitting
+    }
+  }
+
+  return str
+    .split(/[\r\n,;]+/)
+    .map(cleanKey)
+    .filter((k) => k.length >= 1 && !k.startsWith("#"));
 }
 
 /** Load or initialize the persistent state of all keys. */
@@ -45,8 +72,10 @@ function loadState(keys) {
   let saved = {};
   const filePath = getStatePath();
   try {
-    if (existsSync(filePath)) {
-      saved = JSON.parse(readFileSync(filePath, "utf-8")) || {};
+    if (typeof existsSync === "function" && existsSync(filePath)) {
+      if (typeof readFileSync === "function") {
+        saved = JSON.parse(readFileSync(filePath, "utf-8")) || {};
+      }
     }
   } catch {
     /* fallback to clean memory state if file read fails */
@@ -64,6 +93,8 @@ function loadState(keys) {
       lastResetDay: s.lastResetDay || new Date().toISOString().slice(0, 10),
       rpmCooldownUntil: s.rpmCooldownUntil && s.rpmCooldownUntil > now ? s.rpmCooldownUntil : 0,
       rpdCooldownUntil: s.rpdCooldownUntil && s.rpdCooldownUntil > now ? s.rpdCooldownUntil : 0,
+      modelRpdCooldown: s.modelRpdCooldown && typeof s.modelRpdCooldown === "object" ? s.modelRpdCooldown : {},
+      modelRpmCooldown: s.modelRpmCooldown && typeof s.modelRpmCooldown === "object" ? s.modelRpmCooldown : {},
       highDemandCooldownUntil: s.highDemandCooldownUntil && s.highDemandCooldownUntil > now ? s.highDemandCooldownUntil : 0,
       disabled: Boolean(s.disabled),
       lastError: s.lastError || null,
@@ -75,8 +106,9 @@ function loadState(keys) {
 export function saveState(pool) {
   const filePath = getStatePath();
   try {
+    if (typeof dirname !== "function" || typeof existsSync !== "function" || typeof writeFileSync !== "function") return;
     const dir = dirname(filePath);
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    if (!existsSync(dir) && typeof mkdirSync === "function") mkdirSync(dir, { recursive: true });
 
     const obj = {};
     for (const item of pool) {
@@ -86,6 +118,8 @@ export function saveState(pool) {
         lastResetDay: item.lastResetDay,
         rpmCooldownUntil: item.rpmCooldownUntil,
         rpdCooldownUntil: item.rpdCooldownUntil,
+        modelRpdCooldown: item.modelRpdCooldown || {},
+        modelRpmCooldown: item.modelRpmCooldown || {},
         highDemandCooldownUntil: item.highDemandCooldownUntil,
         disabled: item.disabled,
         lastError: item.lastError,
@@ -137,6 +171,8 @@ export function acquireKey(env, opts = {}) {
       if (item.rpdCooldownUntil && item.rpdCooldownUntil <= now) {
         item.rpdCooldownUntil = 0;
       }
+      item.modelRpdCooldown = {};
+      item.modelRpmCooldown = {};
     }
   }
 
@@ -148,7 +184,9 @@ export function acquireKey(env, opts = {}) {
     if (item.disabled) continue;
     if (item.inUse) continue; // One concurrent request per key rule
     if (item.rpmCooldownUntil > now) continue;
+    if (opts?.model && item.modelRpmCooldown?.[opts.model] > now) continue;
     if (item.rpdCooldownUntil > now) continue;
+    if (opts?.model && item.modelRpdCooldown?.[opts.model] > now) continue;
     if (item.highDemandCooldownUntil > now) continue;
 
     // Found available key! Lock it and advance round-robin index
@@ -162,7 +200,7 @@ export function acquireKey(env, opts = {}) {
       if (released) return;
       released = true;
       item.inUse = false;
-      if (err) recordKeyError(item, err);
+      if (err) recordKeyError(item, err, opts?.model);
       saveState(pool);
     };
 
@@ -177,19 +215,74 @@ export function acquireKey(env, opts = {}) {
   return null; // All keys are currently busy or in cooldown
 }
 
+/**
+ * Acquire next available key, waiting up to maxWaitMs (default 1500ms) if all keys are busy or cooling down.
+ */
+export async function acquireKeyWithWait(env, opts = {}) {
+  const maxWaitMs = typeof opts?.maxWaitMs === "number" ? opts.maxWaitMs : 1500;
+  const pollIntervalMs = typeof opts?.pollIntervalMs === "number" ? opts.pollIntervalMs : 1500;
+  const start = Date.now();
+
+  while (true) {
+    const handle = acquireKey(env, opts);
+    if (handle) return handle;
+
+    const pool = getKeyPool(env);
+    if (!pool.length) return null;
+
+    const usableKeys = pool.filter((k) => !k.disabled);
+    if (!usableKeys.length) return null;
+
+    const now = Date.now();
+    const elapsed = now - start;
+    if (elapsed >= maxWaitMs) return null;
+
+    // Find earliest time when any usable key might be available
+    let earliestAvailable = Infinity;
+    for (const item of usableKeys) {
+      if (item.inUse) {
+        earliestAvailable = Math.min(earliestAvailable, now + 500);
+      } else {
+        const modelRpd = opts?.model ? (item.modelRpdCooldown?.[opts.model] || 0) : 0;
+        const modelRpm = opts?.model ? (item.modelRpmCooldown?.[opts.model] || 0) : 0;
+        const itemCooldown = Math.max(
+          item.rpmCooldownUntil || 0,
+          item.highDemandCooldownUntil || 0,
+          modelRpd,
+          modelRpm,
+          item.rpdCooldownUntil || 0,
+        );
+        if (itemCooldown <= now) {
+          earliestAvailable = now;
+        } else {
+          earliestAvailable = Math.min(earliestAvailable, itemCooldown);
+        }
+      }
+    }
+
+    if (earliestAvailable > now + (maxWaitMs - elapsed)) {
+      return null;
+    }
+
+    const waitMs = Math.min(pollIntervalMs, Math.max(100, earliestAvailable - now), maxWaitMs - elapsed);
+    if (waitMs <= 0) return null;
+
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+}
+
 /** Classify error and apply proper cooldown or quarantine. */
-function recordKeyError(item, err) {
+function recordKeyError(item, err, reqModel) {
   const now = Date.now();
   const msg = String(err?.message ?? err);
   const status = Number(err?.status ?? 0);
   item.lastError = msg.slice(0, 300);
 
-  // 1. Invalid or revoked API key -> permanently disable
-  if (status === 400 && /API_KEY_INVALID|key.*invalid|unregistered callers|API key not valid/i.test(msg)) {
-    item.disabled = true;
-    return;
-  }
-  if (status === 403 && /forbidden|not authorized|permission/i.test(msg)) {
+  // 1. Invalid or revoked API key -> permanently quarantine immediately
+  if (
+    (status === 400 || status === 403 || !status) &&
+    (/API_KEY_INVALID|key.*invalid|unregistered callers|API key not valid|forbidden|not authorized|permission/i.test(msg))
+  ) {
     item.disabled = true;
     return;
   }
@@ -199,22 +292,34 @@ function recordKeyError(item, err) {
     return;
   }
 
-  // 3. Daily quota exhaustion -> 24 hours cooldown
+  // 3. Daily quota exhaustion -> 24 hours cooldown for model or key
   if (
     (status === 429 || status === 503) &&
     (/per.?day|daily|requests_per_day/i.test(msg) || err?.name === "DailyQuotaError")
   ) {
-    item.rpdCooldownUntil = now + 24 * 3600_000;
+    const model = err?.model || reqModel;
+    if (model) {
+      if (!item.modelRpdCooldown) item.modelRpdCooldown = {};
+      item.modelRpdCooldown[model] = now + 24 * 3600_000;
+    } else {
+      item.rpdCooldownUntil = now + 24 * 3600_000;
+    }
     return;
   }
 
-  // 4. Minute RPM rate limit -> 60 seconds cooldown
+  // 4. Minute RPM rate limit -> 60 seconds cooldown (do not disable)
   if (
     status === 429 ||
     err?.name === "MinuteQuotaError" ||
     /resource_exhausted|quota exceeded|too many requests|rate.?limit/i.test(msg)
   ) {
-    item.rpmCooldownUntil = now + 60_000;
+    const model = err?.model || reqModel;
+    if (model) {
+      if (!item.modelRpmCooldown) item.modelRpmCooldown = {};
+      item.modelRpmCooldown[model] = now + 60_000;
+    } else {
+      item.rpmCooldownUntil = now + 60_000;
+    }
     return;
   }
 
@@ -236,9 +341,10 @@ export function getKeyPoolStatus(env) {
     if (item.disabled) {
       status = "invalid";
       detail = "Disabled / Invalid";
-    } else if (item.rpdCooldownUntil > now) {
+    } else if (item.rpdCooldownUntil > now || Object.values(item.modelRpdCooldown || {}).some((t) => t > now)) {
       status = "daily_quota";
-      const hoursLeft = Math.ceil((item.rpdCooldownUntil - now) / 3600_000);
+      const maxCooldown = Math.max(item.rpdCooldownUntil || 0, ...Object.values(item.modelRpdCooldown || {}));
+      const hoursLeft = Math.ceil((maxCooldown - now) / 3600_000);
       detail = `Daily quota reached (~${hoursLeft}h left)`;
     } else if (item.rpmCooldownUntil > now) {
       status = "rpm_cooldown";

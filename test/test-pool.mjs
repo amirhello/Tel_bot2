@@ -69,8 +69,8 @@ await t("a rejected knob is dropped one at a time until the model accepts the bo
 });
 
 await t("thinkingConfig and safetySettings follow the config", () => {
-  assert.deepEqual(thinkingConfig(cfg({ thinking: "high" })), { thinkingConfig: { thinkingLevel: "high", includeThoughts: false } });
-  assert.deepEqual(thinkingConfig(cfg({ thinking: "off" })), {});
+  assert.deepEqual(thinkingConfig(cfg({ thinking: "high" })), { thinkingConfig: { thinkingBudget: 8192 } });
+  assert.deepEqual(thinkingConfig(cfg({ thinking: "off" })), { thinkingConfig: { thinkingBudget: 0 } });
   assert.equal(safetySettings(cfg()).length, 4);
   const noThink = buildGeminiBody(cfg(), payload, { noThinking: true });
   assert.equal(noThink.generationConfig.thinkingConfig, undefined);
@@ -85,7 +85,7 @@ await t("a per-minute 429 becomes MinuteQuotaError and is not retried with delay
   responder = () => quotaErr(5, "per minute");
   await assert.rejects(() => completeGemini(env({ GEMINI_API_KEY: "k" }), cfg(), payload), (e) => {
     assert.ok(e instanceof MinuteQuotaError);
-    assert.equal(e.model, "gemini-3.8-flash");
+    assert.equal(e.model, "gemini-3.5-flash-lite");
     assert.ok(e.resetAt > Date.now() && e.resetAt <= Date.now() + 61_000);
     return true;
   });
@@ -97,7 +97,7 @@ await t("a per-day 429 becomes DailyQuotaError and is not retried", async () => 
   responder = () => quotaErr(20, "per day");
   await assert.rejects(() => completeGemini(env({ GEMINI_API_KEY: "k" }), cfg(), payload), (e) => {
     assert.ok(e instanceof DailyQuotaError);
-    assert.equal(e.model, "gemini-3.8-flash");
+    assert.equal(e.model, "gemini-3.5-flash-lite");
     assert.equal(e.resetAt, nextPacificMidnight());
     return true;
   });
@@ -118,33 +118,33 @@ await t("the pool starts with the strongest model and only moves on a quota prob
   const r = await complete(env({ GEMINI_API_KEY: "k" }), cfg(), payload);
   assert.equal(r.text, "from-first");
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, geminiURL("gemini-3.8-flash"));
+  assert.equal(calls[0].url, geminiURL("gemini-3.5-flash-lite"));
 });
 
 await t("a spent model is parked and the next one answers", async () => {
   clearMinuteQuota();
   const e = env({ GEMINI_API_KEY: "k" });
   calls = [];
-  responder = (url) => (url.includes("gemini-3.8-flash") ? quotaErr(20, "per day") : ok("from-second"));
+  responder = (url) => (url.includes("gemini-3.5-flash-lite") ? quotaErr(20, "per day") : ok("from-second"));
   const r = await complete(e, cfg(), payload);
   assert.equal(r.text, "from-second");
   assert.equal(calls.length, 2);
 
   const parked = JSON.parse(e.CONFIG.store["quota:v1"]);
-  assert.equal(parked["gemini-3.8-flash"], nextPacificMidnight(), "the spent model is remembered");
-  assert.equal("gemini-3.7-flash" in parked, false, "the healthy one is not parked");
+  assert.equal(parked["gemini-3.5-flash-lite"], nextPacificMidnight(), "the spent model is remembered");
+  assert.equal("gemini-3.8-flash" in parked, false, "the healthy one is not parked");
 });
 
 await t("a minute-spent model is parked in-memory for 60s and the next one answers", async () => {
   clearMinuteQuota();
   const e = env({ GEMINI_API_KEY: "k" });
   calls = [];
-  responder = (url) => (url.includes("gemini-3.8-flash") ? quotaErr(5, "per minute") : ok("from-second"));
+  responder = (url) => (url.includes("gemini-3.5-flash-lite") ? quotaErr(5, "per minute") : ok("from-second"));
   const r = await complete(e, cfg(), payload);
   assert.equal(r.text, "from-second");
   assert.equal(calls.length, 2);
 
-  assert.ok((minuteQuota.get("gemini-3.8-flash") ?? 0) > Date.now(), "parked in memory");
+  assert.ok((minuteQuota.get("gemini-3.5-flash-lite") ?? 0) > Date.now(), "parked in memory");
   assert.equal(e.CONFIG.store["quota:v1"], undefined, "no writes to KV for minute quota");
 
   // immediate second call skips the minute-parked model
@@ -152,7 +152,7 @@ await t("a minute-spent model is parked in-memory for 60s and the next one answe
   responder = () => ok("from-second-again");
   assert.equal((await complete(e, cfg(), payload)).text, "from-second-again");
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, geminiURL("gemini-3.7-flash"));
+  assert.equal(calls[0].url, geminiURL("gemini-3.8-flash"));
   clearMinuteQuota();
 });
 
@@ -171,26 +171,28 @@ await t("Google API 429 with metric name falls back to next model in pool", asyn
     },
     429,
   );
-  responder = (url) => (url.includes("gemini-3.8-flash") ? googleErr : ok("from-second-model"));
+  responder = (url) => (url.includes("gemini-3.5-flash-lite") ? googleErr : ok("from-second-model"));
   const r = await complete(e, cfg(), payload);
   assert.equal(r.text, "from-second-model");
   assert.equal(calls.length, 2);
-  assert.ok(minuteQuota.has("gemini-3.8-flash"));
+  assert.ok(minuteQuota.has("gemini-3.5-flash-lite"));
   clearMinuteQuota();
 });
 
 await t("a parked model is skipped without spending a request on it", async () => {
+  clearMinuteQuota();
   const resetAt = nextPacificMidnight();
-  const e = env({ GEMINI_API_KEY: "k", CONFIG: fakeKV({ "quota:v1": JSON.stringify({ "gemini-3.8-flash": resetAt }) }) });
+  const e = env({ GEMINI_API_KEY: "k", CONFIG: fakeKV({ "quota:v1": JSON.stringify({ "gemini-3.5-flash-lite": resetAt }) }) });
   calls = [];
   responder = () => ok("from-second");
   const r = await complete(e, cfg(), payload);
   assert.equal(r.text, "from-second");
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, geminiURL("gemini-3.7-flash"), "went straight to the next model");
+  assert.equal(calls[0].url, geminiURL("gemini-3.8-flash"), "went straight to the next model");
 });
 
 await t("a genuine failure never silently reroutes to another model", async () => {
+  clearMinuteQuota();
   const e = env({ GEMINI_API_KEY: "k" });
   calls = [];
   responder = () => json({ error: { message: "upstream exploded" } }, 500);
@@ -200,16 +202,17 @@ await t("a genuine failure never silently reroutes to another model", async () =
 });
 
 await t("a typo in the pool is parked for the day instead of retried forever", async () => {
+  clearMinuteQuota();
   const e = env({ GEMINI_API_KEY: "k" });
   calls = [];
   responder = (url) => (url.includes("typo-model") ? json({ error: { message: "not found" } }, 404) : ok("real"));
   const c = cfg();
-  c.provider.modelPool = ["typo-model", "gemini-3.8-flash"];
+  c.provider.modelPool = ["typo-model", "gemini-3.5-flash-lite"];
   const r = await complete(e, c, payload);
   assert.equal(r.text, "real");
   const parked = JSON.parse(e.CONFIG.store["quota:v1"]);
   assert.ok(parked["typo-model"], "the bad name was recorded");
-  assert.equal(parked["gemini-3.8-flash"], undefined, "the working model stays available");
+  assert.equal(parked["gemini-3.5-flash-lite"], undefined, "the working model stays available");
 
   // second call must skip the typo entirely
   calls = [];
@@ -220,6 +223,7 @@ await t("a typo in the pool is parked for the day instead of retried forever", a
 });
 
 await t("when every model is spent the error carries the hour it frees up", async () => {
+  clearMinuteQuota();
   const pool = cfg().provider.modelPool;
   const e = env({ GEMINI_API_KEY: "k", CONFIG: fakeKV() });
   calls = [];
@@ -237,6 +241,7 @@ await t("when every model is spent the error carries the hour it frees up", asyn
 });
 
 await t("the resume time is when the last parked model frees up", async () => {
+  clearMinuteQuota();
   const soon = Date.now() + 60_000;
   const later = Date.now() + 3 * 3600_000;
   const q = { a: soon, b: later };
@@ -248,12 +253,13 @@ await t("the resume time is when the last parked model frees up", async () => {
 });
 
 await t("a quota entry expires by itself, so no cleanup job is needed", async () => {
-  const past = { "gemini-3.8-flash": Date.now() - 1000 };
+  clearMinuteQuota();
+  const past = { "gemini-3.5-flash-lite": Date.now() - 1000 };
   const e = env({ GEMINI_API_KEY: "k", CONFIG: fakeKV({ "quota:v1": JSON.stringify(past) }) });
   calls = [];
   responder = () => ok("fresh again");
   assert.equal((await complete(e, cfg(), payload)).text, "fresh again");
-  assert.equal(calls[0].url, geminiURL("gemini-3.8-flash"), "an expired entry is retried");
+  assert.equal(calls[0].url, geminiURL("gemini-3.5-flash-lite"), "an expired entry is retried");
 });
 
 await t("the quota store survives a broken KV read", async () => {
@@ -275,8 +281,8 @@ await t("a missing Gemini key still falls back to an OpenAI-compatible provider"
 await t("the shipped default pool is ordered strongest-first and de-duplicated", () => {
   assert.ok(DEFAULT_MODEL_POOL.length >= 8);
   assert.equal(new Set(DEFAULT_MODEL_POOL).size, DEFAULT_MODEL_POOL.length);
-  assert.equal(DEFAULT_MODEL_POOL[0], "gemini-3.8-flash");
-  assert.ok(DEFAULT_MODEL_POOL.includes("gemini-3.5-flash-lite"), "a high-daily-quota fallback must be present");
+  assert.equal(DEFAULT_MODEL_POOL[0], "gemini-3.5-flash-lite");
+  assert.ok(DEFAULT_MODEL_POOL.includes("gemini-3.8-flash"), "a high-quality fallback must be present");
   assert.ok(DEFAULT_MODEL_POOL.includes("Antigravity"), "last resort included");
 });
 

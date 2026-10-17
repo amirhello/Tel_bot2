@@ -21,19 +21,25 @@ export function nextPacificMidnight(now = Date.now()) {
  * Tried strongest-first. Names are provider-specific: if one is wrong the provider
  * answers 404 and the model is parked for a day instead of being retried forever.
  */
-export const DEFAULT_MODEL_POOL = [
+export const MULTIMODAL_MODELS = [
+  "gemini-3.5-flash-lite",
   "gemini-3.8-flash",
   "gemini-3.7-flash",
   "gemini-3.6-flash",
-  "gemini-3.5-flash",
   "gemini-3-flash",
   "gemini-2.5-flash",
-  "gemini-3.5-flash-lite",
   "gemini-3.1-flash-lite",
-  "gemini-2.5-flash-lite",
+];
+
+export const TEXT_EXTENDED_MODELS = [
   "Antigravity",
   "gemma-4-26b",
   "gemma-4-31b",
+];
+
+export const DEFAULT_MODEL_POOL = [
+  ...MULTIMODAL_MODELS,
+  ...TEXT_EXTENDED_MODELS,
 ];
 
 /* ------------------------------------------------------------------ config */
@@ -66,7 +72,7 @@ export function defaultConfig(personas) {
     dailyCap: 1000, // across the whole model pool, not per model
     provider: {
       kind: "gemini",
-      model: "gemini-3.8-flash",
+      model: "gemini-3.5-flash-lite",
       baseUrl: DEFAULT_BASE_URLS.gemini,
       modelPool: [...DEFAULT_MODEL_POOL],
     },

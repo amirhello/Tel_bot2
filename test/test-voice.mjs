@@ -55,6 +55,17 @@ let modelReply = "**جواب** صوتی [با لینک](https://x) و `کد`";
 
 function installFetch(script = happyScript, opts = {}) {
   lastSock = null;
+
+  globalThis.WebSocket = class MockWebSocket {
+    constructor(url) {
+      if (opts.refuseUpgrade) {
+        throw new Error("live voice: WebSocket upgrade was refused");
+      }
+      lastSock = fakeSocket(script);
+      return lastSock;
+    }
+  };
+
   globalThis.fetch = async (url, init) => {
     const u = String(url);
 
@@ -283,6 +294,64 @@ await t("with the voice switch off a note falls back to a text answer", async ()
   assert.equal(tg.filter((c) => c.method === "sendAudio").length, 0, "switch respected");
   assert.equal(sentMessages().length, 1, "plain text answer instead");
   assert.ok(sentMessages()[0].body.text.includes("جواب"), "the model's answer, rendered");
+});
+
+await t("native WebSocket waits for open event when connecting (readyState 0)", async () => {
+  let openHandler = null;
+  const mockSock = {
+    readyState: 0,
+    sent: [],
+    closed: false,
+    accepted: true,
+    addEventListener(type, fn) {
+      if (type === "open") openHandler = fn;
+      if (type === "message") this.onMsg = fn;
+      if (type === "close") this.onClose = fn;
+      if (type === "error") this.onError = fn;
+    },
+    send(data) {
+      this.sent.push(JSON.parse(data));
+      if (JSON.parse(data).setup) {
+        this.onMsg({ data: JSON.stringify({ setupComplete: {} }) });
+      } else if (JSON.parse(data).clientContent) {
+        this.onMsg({ data: JSON.stringify({ serverContent: { modelTurn: { parts: [{ inlineData: { data: PCM_B64 } }] } } }) });
+        this.onMsg({ data: JSON.stringify({ serverContent: { turnComplete: true } }) });
+      }
+    },
+    close() { this.closed = true; },
+  };
+
+  const origWs = globalThis.WebSocket;
+  globalThis.WebSocket = class {
+    constructor() {
+      setTimeout(() => {
+        mockSock.readyState = 1;
+        openHandler?.();
+      }, 5);
+      return mockSock;
+    }
+  };
+
+  try {
+    const wav = await speak(env({ GEMINI_API_KEY: "AQ.test" }), {}, "سلام");
+    assert.ok(wav instanceof Uint8Array);
+    assert.equal(mockSock.sent[0].setup.model, "models/gemini-3.8-live");
+  } finally {
+    globalThis.WebSocket = origWs;
+  }
+});
+
+await t("falls back to fetch with Upgrade header when globalThis.WebSocket is undefined", async () => {
+  const origWs = globalThis.WebSocket;
+  globalThis.WebSocket = undefined;
+  try {
+    setup();
+    const wav = await speak(env({ GEMINI_API_KEY: "AQ.test" }), {}, "سلام دنیا");
+    assert.ok(wav instanceof Uint8Array);
+    assert.ok(lastSock.accepted);
+  } finally {
+    globalThis.WebSocket = origWs;
+  }
 });
 
 done("voice");

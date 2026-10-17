@@ -24,10 +24,12 @@ await t("ordinary group chatter is ignored", () => {
   assert.equal(shouldAnswer(group({ text: "سیب که سیب می‌فروشم" }), BOT, "supergroup"), false);
 });
 
-await t("matching is by substring, so names starting with سید count too", () => {
-  // Documented consequence of "any message containing the word سید": a person named سیدر
-  // will trigger the bot. Change this test if the trigger should become word-boundary aware.
-  assert.equal(shouldAnswer(group({ text: "سیدر" }), BOT, "supergroup"), true);
+await t("words like سیدی، سیدها or attached names do not trigger false wake-ups", () => {
+  assert.equal(shouldAnswer(group({ text: "سیدر" }), BOT, "supergroup"), false);
+  assert.equal(shouldAnswer(group({ text: "سیدی" }), BOT, "supergroup"), false);
+  assert.equal(shouldAnswer(group({ text: "سیدها" }), BOT, "supergroup"), false);
+  assert.equal(shouldAnswer(group({ text: "سیدعلی" }), BOT, "supergroup"), false);
+  assert.equal(shouldAnswer(group({ text: "سید علی" }), BOT, "supergroup"), true);
 });
 
 await t("replying to Sayyad counts as addressing it", () => {
@@ -47,6 +49,9 @@ await t("commands are recognised with and without a bot suffix", () => {
   assert.equal(isCommand("/start please"), "start");
   assert.equal(isCommand("سید /start"), null);
   assert.equal(isCommand(""), null);
+  assert.equal(isCommand("/start@other_bot", "sayyad_bot"), null);
+  assert.equal(isCommand("/start@sayyad_bot", "sayyad_bot"), "start");
+  assert.equal(isCommand("/help", "sayyad_bot"), "help");
 });
 
 await t("only chat types the bot can live in are accepted", () => {

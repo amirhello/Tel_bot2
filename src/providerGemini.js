@@ -55,13 +55,22 @@ export function toGeminiPart(part) {
   return null;
 }
 
+export const THINKING_BUDGETS = {
+  off: 0,
+  minimal: 1024,
+  low: 2048,
+  medium: 4096,
+  high: 8192,
+};
+
 /**
- * thinkingConfig. Gemini 3 cannot be switched off, so "off" simply omits the block and
- * lets the model use its own default.
+ * thinkingConfig. Google Gemini REST API expects thinkingConfig.thinkingBudget (integer token count:
+ * minimal: 1024, low: 2048, medium: 4096, high: 8192, off: 0).
  */
 export function thinkingConfig(cfg) {
-  if (!cfg.thinking || cfg.thinking === "off") return {};
-  return { thinkingConfig: { thinkingLevel: cfg.thinking, includeThoughts: false } };
+  if (!cfg?.thinking) return {};
+  const budget = THINKING_BUDGETS[cfg.thinking] !== undefined ? THINKING_BUDGETS[cfg.thinking] : 4096;
+  return { thinkingConfig: { thinkingBudget: budget } };
 }
 
 export function safetySettings(cfg) {

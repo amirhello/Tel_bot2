@@ -1,6 +1,6 @@
 // Entrypoint. Routing only — every decision lives in another module.
 
-import { handleAdmin, json } from "./admin.js";
+import { handleAdmin, isAuthed, json, timingSafeEqual } from "./admin.js";
 import { processMessage } from "./answer.js";
 import { diagnostics, reportPage, resetWebhook, setup, signWebhookSecret } from "./tools.js";
 
@@ -8,6 +8,11 @@ const seen = new Set();
 
 export default {
   async fetch(req, env, ctx) {
+    const contentLength = Number(req.headers.get("content-length"));
+    if (contentLength && contentLength > 2 * 1024 * 1024) {
+      return new Response("Payload Too Large", { status: 413 });
+    }
+
     const url = new URL(req.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
 
@@ -16,13 +21,16 @@ export default {
     if (path === "/") return json({ ok: true, bot: "sayyad" });
 
     if (path === "/setup") {
+      if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
       return json(await setup(req, env, url).catch((e) => ({ error: String(e?.message ?? e) })));
     }
     if (path === "/setup/reset") {
+      if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
       return json(await resetWebhook(env).catch((e) => ({ error: String(e?.message ?? e) })));
     }
 
     if (path === "/diag") {
+      if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
       const report = await diagnostics(env).catch((e) => ({ error: String(e?.message ?? e) }));
       if (url.searchParams.get("format") === "json") return json(report);
       return new Response(reportPage("Sayyad diagnostics", report), {
@@ -44,14 +52,15 @@ export default {
 async function webhook(req, env, ctx) {
   if (!env.TELEGRAM_BOT_TOKEN) return new Response("TELEGRAM_BOT_TOKEN is not set", { status: 500 });
 
-  // Verified by the secret we handed out at /setup if header is present.
+  // Strictly require secret token when ADMIN_PASSWORD is configured
   if (env.ADMIN_PASSWORD) {
     const got = req.headers.get("x-telegram-bot-api-secret-token");
-    if (got) {
-      const want = await signWebhookSecret(env.ADMIN_PASSWORD);
-      if (got !== want) {
-        return new Response("forbidden", { status: 403 });
-      }
+    if (!got) {
+      return new Response("forbidden", { status: 403 });
+    }
+    const want = await signWebhookSecret(env.ADMIN_PASSWORD);
+    if (!timingSafeEqual(got, want)) {
+      return new Response("forbidden", { status: 403 });
     }
   }
 

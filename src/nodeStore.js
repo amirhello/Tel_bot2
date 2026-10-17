@@ -1,7 +1,7 @@
 // File-based KV storage for Node.js environments.
 // Matches Cloudflare KV API (get, put, delete) with zero external dependencies.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export class FileKV {
@@ -17,6 +17,9 @@ export class FileKV {
       if (existsSync(this.filePath)) {
         const raw = readFileSync(this.filePath, "utf-8");
         this.data = JSON.parse(raw) || {};
+      } else if (existsSync(`${this.filePath}.tmp`)) {
+        const raw = readFileSync(`${this.filePath}.tmp`, "utf-8");
+        this.data = JSON.parse(raw) || {};
       }
     } catch {
       this.data = {};
@@ -26,7 +29,9 @@ export class FileKV {
   save() {
     try {
       if (!existsSync(this.dir)) mkdirSync(this.dir, { recursive: true });
-      writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), "utf-8");
+      const tmpPath = `${this.filePath}.tmp`;
+      writeFileSync(tmpPath, JSON.stringify(this.data, null, 2), "utf-8");
+      renameSync(tmpPath, this.filePath);
     } catch (err) {
       console.error("FileKV save failed:", err?.message || err);
     }

@@ -28,6 +28,120 @@ const json = (data, status = 200, headers = {}) =>
     headers: { "content-type": "application/json; charset=utf-8", ...headers },
   });
 
+if (typeof crypto !== "undefined" && crypto.subtle && typeof crypto.subtle.timingSafeEqual !== "function" && typeof crypto.timingSafeEqual === "function") {
+  try {
+    crypto.subtle.timingSafeEqual = crypto.timingSafeEqual;
+  } catch {}
+}
+
+/** Constant-time comparison to prevent timing attacks. */
+export function timingSafeEqual(a, b) {
+  if (typeof a === "string" && typeof b === "string") {
+    const enc = new TextEncoder();
+    const bufA = enc.encode(a);
+    const bufB = enc.encode(b);
+    if (bufA.byteLength !== bufB.byteLength) return false;
+    const fn = crypto.subtle?.timingSafeEqual ?? crypto.timingSafeEqual;
+    if (typeof fn === "function") return fn(bufA, bufB);
+    let diff = 0;
+    for (let i = 0; i < bufA.byteLength; i++) diff |= bufA[i] ^ bufB[i];
+    return diff === 0;
+  }
+  if (a instanceof Uint8Array && b instanceof Uint8Array) {
+    if (a.byteLength !== b.byteLength) return false;
+    const fn = crypto.subtle?.timingSafeEqual ?? crypto.timingSafeEqual;
+    if (typeof fn === "function") return fn(a, b);
+    let diff = 0;
+    for (let i = 0; i < a.byteLength; i++) diff |= a[i] ^ b[i];
+    return diff === 0;
+  }
+  return false;
+}
+
+/** Constant-time password verification using SHA-256 digest + timingSafeEqual. */
+export async function verifyPassword(provided, expected) {
+  if (typeof provided !== "string" || typeof expected !== "string") return false;
+  const enc = new TextEncoder();
+  const [hashA, hashB] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(provided)),
+    crypto.subtle.digest("SHA-256", enc.encode(expected)),
+  ]);
+  const bufA = new Uint8Array(hashA);
+  const bufB = new Uint8Array(hashB);
+  const fn = crypto.subtle?.timingSafeEqual ?? crypto.timingSafeEqual;
+  if (typeof fn === "function") return fn(bufA, bufB);
+  let diff = 0;
+  for (let i = 0; i < bufA.byteLength; i++) diff |= bufA[i] ^ bufB[i];
+  return diff === 0;
+}
+
+const failedLoginAttempts = new Map();
+const MAX_FAILED_ATTEMPTS = 5;
+const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
+export function resetLoginRateLimit() {
+  failedLoginAttempts.clear();
+}
+
+function getClientIp(req) {
+  if (req?.headers?.get && typeof req.headers.get === "function") {
+    const cf = req.headers.get("cf-connecting-ip");
+    if (cf) return cf.trim();
+    const xff = req.headers.get("x-forwarded-for");
+    if (xff) return xff.split(",")[0].trim();
+    const xri = req.headers.get("x-real-ip");
+    if (xri) return xri.trim();
+  }
+  if (req?.headers) {
+    const cf = req.headers["cf-connecting-ip"];
+    if (cf) return String(cf).trim();
+    const xff = req.headers["x-forwarded-for"];
+    if (xff) return String(Array.isArray(xff) ? xff[0] : xff).split(",")[0].trim();
+    const xri = req.headers["x-real-ip"];
+    if (xri) return String(xri).trim();
+  }
+  if (req?.socket?.remoteAddress) return req.socket.remoteAddress;
+  return "127.0.0.1";
+}
+
+function isLoginRateLimited(ip) {
+  const now = Date.now();
+  const list = failedLoginAttempts.get(ip) || [];
+  const recent = list.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+  if (recent.length !== list.length) {
+    if (recent.length === 0) failedLoginAttempts.delete(ip);
+    else failedLoginAttempts.set(ip, recent);
+  }
+  return recent.length >= MAX_FAILED_ATTEMPTS;
+}
+
+function recordFailedLogin(ip) {
+  const now = Date.now();
+  const list = failedLoginAttempts.get(ip) || [];
+  const recent = list.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+  recent.push(now);
+  failedLoginAttempts.set(ip, recent);
+}
+
+function clearFailedLogin(ip) {
+  failedLoginAttempts.delete(ip);
+}
+
+function isHttps(req) {
+  try {
+    if (req.url && new URL(req.url).protocol === "https:") return true;
+  } catch {}
+  let proto = "";
+  if (req?.headers?.get && typeof req.headers.get === "function") {
+    proto = req.headers.get("x-forwarded-proto") ?? "";
+    const cfVisitor = req.headers.get("cf-visitor") ?? "";
+    if (cfVisitor.includes('"https"')) return true;
+  } else if (req?.headers) {
+    proto = req.headers["x-forwarded-proto"] ?? "";
+  }
+  return proto.toLowerCase() === "https";
+}
+
 /** Stateless session: the cookie is an HMAC of the admin password, so nothing is stored. */
 export async function signSecret(password) {
   const enc = new TextEncoder();
@@ -37,7 +151,12 @@ export async function signSecret(password) {
 }
 
 function readCookie(req, name) {
-  const raw = req.headers.get("cookie") ?? "";
+  let raw = "";
+  if (req?.headers?.get && typeof req.headers.get === "function") {
+    raw = req.headers.get("cookie") ?? "";
+  } else if (req?.headers?.cookie) {
+    raw = req.headers.cookie ?? "";
+  }
   for (const part of raw.split(";")) {
     const [k, ...v] = part.trim().split("=");
     if (k === name) return decodeURIComponent(v.join("="));
@@ -50,7 +169,8 @@ export async function isAuthed(req, env) {
   const cookie = readCookie(req, COOKIE);
   if (!cookie) return false;
   try {
-    return cookie === (await signSecret(env.ADMIN_PASSWORD));
+    const want = await signSecret(env.ADMIN_PASSWORD);
+    return timingSafeEqual(cookie, want);
   } catch {
     return false;
   }
@@ -617,14 +737,28 @@ export async function handleAdmin(req, env, path) {
   }
 
   if (path === "/admin/api/login" && req.method === "POST") {
+    const ip = getClientIp(req);
+    if (isLoginRateLimited(ip)) {
+      return new Response(renderLogin("Too many failed login attempts. Please try again in 5 minutes."), {
+        status: 429,
+        headers: { "content-type": "text/html; charset=utf-8", "retry-after": "300" },
+      });
+    }
+
     const ct = req.headers.get("content-type") ?? "";
     const body = ct.includes("application/json")
       ? await req.json().catch(() => ({}))
       : Object.fromEntries(await req.formData());
-    if (!env.ADMIN_PASSWORD || body.password !== env.ADMIN_PASSWORD) {
+
+    const ok = env.ADMIN_PASSWORD && (await verifyPassword(body.password, env.ADMIN_PASSWORD));
+    if (!ok) {
+      recordFailedLogin(ip);
       return new Response(renderLogin("Wrong password."), { status: 401, headers: { "content-type": "text/html; charset=utf-8" } });
     }
-    const cookie = `${COOKIE}=${await signSecret(env.ADMIN_PASSWORD)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000`;
+
+    clearFailedLogin(ip);
+    const secure = isHttps(req) ? "; Secure" : "";
+    const cookie = `${COOKIE}=${await signSecret(env.ADMIN_PASSWORD)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000${secure}`;
     return new Response(null, { status: 303, headers: { location: "/admin", "set-cookie": cookie } });
   }
 
@@ -646,7 +780,15 @@ export async function handleAdmin(req, env, path) {
 
   if (path === "/admin/api/keys") {
     if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
-    const keys = getKeyPoolStatus(env);
+    const rawKeys = getKeyPoolStatus(env);
+    const keys = rawKeys.map((item) => {
+      const key = item.key;
+      const masked =
+        typeof key === "string"
+          ? (key.length > 10 ? key.slice(0, 6) + "..." + key.slice(-4) : key.slice(0, 6) + "..." + key.slice(-4))
+          : key;
+      return { ...item, key: masked };
+    });
     return json({ count: keys.length, keys });
   }
 

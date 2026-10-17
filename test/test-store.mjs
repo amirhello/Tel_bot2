@@ -8,7 +8,7 @@ await t("a fresh KV gets a complete, valid config", () => {
   assert.equal(c.schemaVersion, 3);
   assert.equal(c.enabled, true);
   assert.equal(c.provider.kind, "gemini");
-  assert.equal(c.provider.model, "gemini-3.8-flash");
+  assert.equal(c.provider.model, "gemini-3.5-flash-lite");
   assert.equal(c.thinking, "medium");
   assert.deepEqual(Object.keys(c.media).sort(), ["audio", "image", "video"]);
   assert.equal(c.safety.harassment, "BLOCK_NONE");

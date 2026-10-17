@@ -45,6 +45,24 @@ await t("splitText never returns an empty message", () => {
   assert.deepEqual(splitText("کوتاه"), ["کوتاه"]);
 });
 
+await t("splitText never splits a UTF-16 surrogate pair across chunks", () => {
+  const str = "abcde" + "💖" + "fghi";
+  const parts = splitText(str, 6);
+  assert.equal(parts[0], "abcde");
+  assert.equal(parts[1], "💖fghi");
+  for (const part of parts) {
+    for (let i = 0; i < part.length; i++) {
+      const code = part.charCodeAt(i);
+      if (code >= 0xd800 && code <= 0xdbff) {
+        assert.ok(i + 1 < part.length && part.charCodeAt(i + 1) >= 0xdc00 && part.charCodeAt(i + 1) <= 0xdfff, "lone high surrogate found");
+      }
+      if (code >= 0xdc00 && code <= 0xdfff) {
+        assert.ok(i > 0 && part.charCodeAt(i - 1) >= 0xd800 && part.charCodeAt(i - 1) <= 0xdbff, "lone low surrogate found");
+      }
+    }
+  }
+});
+
 await t("normalizeFa folds every spelling of the wake word", () => {
   for (const v of ["سید", "سيّد", "سِــيــد", "سيــد"]) {
     assert.ok(normalizeFa(v).includes("سید"), `no match: ${v}`);

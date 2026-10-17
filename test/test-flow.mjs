@@ -1,7 +1,7 @@
 import { assert, t, done, M, env, json, fakeKV } from "./harness.mjs";
 
 const worker = M.default;
-const { signWebhookSecret } = M;
+const { signWebhookSecret, signSecret } = M;
 
 const BOT = 777;
 
@@ -22,12 +22,12 @@ globalThis.fetch = async (url, init) => {
   if (u.endsWith("/deleteWebhook")) return json({ ok: true, result: true });
   if (u.endsWith("/getWebhookInfo")) return json({ ok: true, result: { url: "https://x.dev", pending_update_count: 0 } });
 
-  if (u.includes("/sendMessage")) {
+  if (u.includes("/sendMessage") || u.includes("/sendRichMessage")) {
     const body = JSON.parse(init.body);
-    // mirror the real API's refusals so the splitting and fallback code is exercised
-    if (typeof body.text !== "string") return json({ ok: false, description: "can't parse entities" });
-    if (body.text.length > 4096) return json({ ok: false, description: "message is too long" });
-    tg.push({ method: "sendMessage", body });
+    const text = body.text ?? body?.rich_message?.html;
+    if (typeof text !== "string") return json({ ok: false, description: "can't parse entities" });
+    if (text.length > 4096) return json({ ok: false, description: "message is too long" });
+    tg.push({ method: "sendMessage", body: { ...body, text } });
     return json({ ok: true, result: { message_id: 1 } });
   }
   if (u.includes("/sendChatAction")) {
@@ -63,6 +63,7 @@ function setup(extra = {}, kvSeed = {}) {
   modelFail = null;
   lastModelBody = null;
   M.clearMinuteQuota?.();
+  M.clearKeyPoolCache?.();
   E = env({ GEMINI_API_KEY: "AQ.test", OPENROUTER_API_KEY: "sk-or-x", ...extra, CONFIG: fakeKV(kvSeed) });
   return E;
 }
@@ -376,6 +377,13 @@ await t("two messages in one chat never overlap", async () => {
   assert.equal(peak, 1, "requests overlapped inside the same chat");
 });
 
+async function authedRequest(url, opts = {}) {
+  const cookie = `sayyad_admin=${await signSecret(E.ADMIN_PASSWORD)}`;
+  const headers = new Headers(opts.headers || {});
+  headers.set("cookie", cookie);
+  return new Request(url, { ...opts, headers });
+}
+
 /* ---------------------------------------------------------------- routes */
 
 await t("the root answers and /setup points Telegram at this Worker", async () => {
@@ -383,7 +391,7 @@ await t("the root answers and /setup points Telegram at this Worker", async () =
   const root = await worker.fetch(new Request("https://x.dev/"), E, { waitUntil() {} });
   assert.equal((await root.json()).ok, true);
 
-  const s = await worker.fetch(new Request("https://x.dev/setup"), E, { waitUntil() {} });
+  const s = await worker.fetch(await authedRequest("https://x.dev/setup"), E, { waitUntil() {} });
   const d = await s.json();
   assert.equal(d.target, "https://x.dev");
   assert.equal(d.secret_token_used, true);
@@ -392,7 +400,7 @@ await t("the root answers and /setup points Telegram at this Worker", async () =
 
 await t("/diag reports the provider and a live answer", async () => {
   setup();
-  const d = await (await worker.fetch(new Request("https://x.dev/diag?format=json"), E, { waitUntil() {} })).json();
+  const d = await (await worker.fetch(await authedRequest("https://x.dev/diag?format=json"), E, { waitUntil() {} })).json();
   assert.equal(d.checks.telegram.ok, true);
   assert.equal(d.checks.model.ok, true);
   assert.match(d.checks.model.sample, /سلام/);
@@ -403,7 +411,7 @@ await t("/diag reports the provider and a live answer", async () => {
 await t("/diag surfaces a provider failure instead of pretending", async () => {
   setup();
   modelFail = () => json({ error: { message: "nope" } }, 401);
-  const d = await (await worker.fetch(new Request("https://x.dev/diag?format=json"), E, { waitUntil() {} })).json();
+  const d = await (await worker.fetch(await authedRequest("https://x.dev/diag?format=json"), E, { waitUntil() {} })).json();
   assert.equal(d.checks.model.ok, false);
   assert.match(d.checks.model.error, /401/);
 });
@@ -411,6 +419,13 @@ await t("/diag surfaces a provider failure instead of pretending", async () => {
 await t("an unknown path is a clean 404", async () => {
   setup();
   assert.equal((await worker.fetch(new Request("https://x.dev/nope"), E, { waitUntil() {} })).status, 404);
+});
+
+await t("replies in forum supergroups stay inside the topic", async () => {
+  setup();
+  await push(groupMsg({ message_thread_id: 1234, text: "سید در تاپیک" }));
+  assert.equal(sent().length, 1);
+  assert.equal(sent()[0].body.message_thread_id, 1234);
 });
 
 done();

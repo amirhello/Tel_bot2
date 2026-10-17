@@ -1,6 +1,7 @@
 name = "sayyad-bot"
 main = "src/index.js"
 compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
 # The provider, model, thinking level, safety levels and media limits are NOT here:

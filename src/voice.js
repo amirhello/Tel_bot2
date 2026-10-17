@@ -108,12 +108,33 @@ function base64Bytes(b64) {
  * A turn that produced *some* audio but died before `turnComplete` still counts as a
  * success — a slightly short answer beats an error message.
  */
-async function speakOnce(key, model, words, timeoutMs) {
+async function connectLiveSocket(key) {
+  const wsUrl = LIVE_ENDPOINT.replace(/^http/i, "ws") + `?key=${encodeURIComponent(key)}`;
+
+  if (typeof globalThis.WebSocket === "function") {
+    try {
+      const ws = new globalThis.WebSocket(wsUrl);
+      if (ws) return ws;
+    } catch {
+      /* fallback to fetch */
+    }
+  }
+
   const res = await fetch(`${LIVE_ENDPOINT}?key=${encodeURIComponent(key)}`, {
     headers: { Upgrade: "websocket" },
   });
-  const ws = res.webSocket;
+  const ws = res?.webSocket;
   if (!ws) throw new Error("live voice: WebSocket upgrade was refused");
+  return ws;
+}
+
+/**
+ * Say `text` out loud. Resolves with a WAV (Uint8Array), throws on anything unexpected.
+ * A turn that produced *some* audio but died before `turnComplete` still counts as a
+ * success — a slightly short answer beats an error message.
+ */
+async function speakOnce(key, model, words, timeoutMs) {
+  const ws = await connectLiveSocket(key);
 
   return await new Promise((resolve, reject) => {
     const chunks = [];
@@ -201,13 +222,21 @@ async function speakOnce(key, model, words, timeoutMs) {
       /* read-only in some runtimes */
     }
 
-    send({
-      setup: {
-        model: `models/${model}`,
-        generationConfig: { responseModalities: ["AUDIO"] },
-        systemInstruction: { parts: [{ text: SPEAK_PROMPT }] },
-      },
-    });
+    const sendSetup = () => {
+      send({
+        setup: {
+          model: `models/${model}`,
+          generationConfig: { responseModalities: ["AUDIO"] },
+          systemInstruction: { parts: [{ text: SPEAK_PROMPT }] },
+        },
+      });
+    };
+
+    if (ws.readyState === 0) {
+      ws.addEventListener("open", sendSetup, { once: true });
+    } else {
+      sendSetup();
+    }
   });
 }
 

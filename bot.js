@@ -5,10 +5,14 @@ import { createServer } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { processMessage } from "./src/answer.js";
-import { handleAdmin } from "./src/admin.js";
+import { handleAdmin, isAuthed } from "./src/admin.js";
 import { diagnostics, reportPage } from "./src/tools.js";
 import { getKeyPool, getKeyPoolStatus } from "./src/keyPool.js";
 import { FileKV } from "./src/nodeStore.js";
+
+// Global unhandled error handlers
+process.on("unhandledRejection", (reason) => console.error("Unhandled Rejection:", reason));
+process.on("uncaughtException", (err) => console.error("Uncaught Exception:", err));
 
 // 1. Lightweight .env loader (zero external packages)
 function loadEnv() {
@@ -26,9 +30,7 @@ function loadEnv() {
           if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
             val = val.slice(1, -1);
           }
-          if (!(key in process.env)) {
-            process.env[key] = val;
-          }
+          process.env[key] = val;
         }
       }
     } catch (e) {
@@ -56,14 +58,23 @@ const env = {
   CONFIG: new FileKV(join(process.cwd(), "data"), "store.json"),
 };
 
-const port = Number(process.env.PORT || process.env.SERVER_PORT || 10638);
+const primaryPort = Number(process.env.PORT || process.env.SERVER_PORT || 10638);
+const secondaryPort = primaryPort === 10638 ? 8080 : 10638;
+const MAX_BODY_SIZE = 2 * 1024 * 1024; // 2MB
 let running = true;
 
-// 2. Start HTTP server for /admin, /diag and health-checks
-const server = createServer(async (req, res) => {
+// 2. HTTP Request Handler for /admin, /diag and health-checks
+async function requestHandler(req, res) {
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const path = url.pathname.replace(/\/+$/, "") || "/";
+
+    const contentLength = Number(req.headers["content-length"]);
+    if (contentLength && contentLength > MAX_BODY_SIZE) {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Payload Too Large" }));
+      return;
+    }
 
     if (path === "/") {
       const keys = getKeyPool(env);
@@ -73,6 +84,21 @@ const server = createServer(async (req, res) => {
     }
 
     if (path === "/diag") {
+      const headers = new Headers();
+      for (const [k, v] of Object.entries(req.headers)) {
+        if (v) headers.set(k, Array.isArray(v) ? v.join(", ") : v);
+      }
+      const standardReq = new Request(url.toString(), {
+        method: req.method,
+        headers,
+      });
+
+      if (!(await isAuthed(standardReq, env))) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "unauthorised" }));
+        return;
+      }
+
       const report = await diagnostics(env).catch((e) => ({ error: String(e?.message ?? e) }));
       if (url.searchParams.get("format") === "json") {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -85,9 +111,23 @@ const server = createServer(async (req, res) => {
     }
 
     if (path.startsWith("/admin")) {
-      // Build Web Standard Request to reuse existing handleAdmin
+      let totalBytes = 0;
       const bodyChunks = [];
-      for await (const chunk of req) bodyChunks.push(chunk);
+      let tooLarge = false;
+      for await (const chunk of req) {
+        totalBytes += chunk.length;
+        if (totalBytes > MAX_BODY_SIZE) {
+          tooLarge = true;
+          break;
+        }
+        bodyChunks.push(chunk);
+      }
+      if (tooLarge) {
+        req.destroy();
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Payload Too Large" }));
+        return;
+      }
       const body = bodyChunks.length ? Buffer.concat(bodyChunks) : null;
 
       const headers = new Headers();
@@ -119,48 +159,55 @@ const server = createServer(async (req, res) => {
     res.writeHead(500, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: String(err?.message ?? err) }));
   }
-});
+}
 
-async function printStartupBanner(port) {
-  let publicIp = process.env.PUBLIC_IP || process.env.SERVER_IP || "78.154.103.39";
-  if (!publicIp || publicIp === "127.0.0.1") {
-    try {
-      const res = await fetch("https://api.ipify.org", { signal: AbortSignal.timeout(2000) });
-      if (res.ok) {
-        const ip = (await res.text()).trim();
-        if (ip && ip.length >= 7 && ip.length <= 45) publicIp = ip;
-      }
-    } catch {}
-  }
+function isPrivateIp(ip) {
+  if (!ip) return true;
+  return (
+    ip.startsWith("10.") ||
+    ip.startsWith("192.168.") ||
+    ip.startsWith("127.") ||
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(ip) ||
+    ip === "localhost" ||
+    ip === "0.0.0.0"
+  );
+}
 
-  const baseLocal = `http://localhost:${port}`;
-  const basePublic = publicIp ? `http://${publicIp}:${port}` : null;
-  const baseCustom = process.env.PUBLIC_URL ? process.env.PUBLIC_URL.replace(/\/+$/, "") : null;
-  const primaryBase = baseCustom || basePublic || baseLocal;
+function printStartupBanner(currentPort) {
+  const publicBase = (process.env.PUBLIC_URL || `http://localhost:${currentPort}`).replace(/\/+$/, "");
+  const serverIp = process.env.SERVER_IP || process.env.PUBLIC_IP || null;
 
   console.log("\n" + "=".repeat(66));
   console.log("  🤖 SAYYAD TELEGRAM BOT — CONTROL PANEL & DIAGNOSTIC LINKS");
   console.log("=".repeat(66));
-  console.log(`  ⚙️  Admin Dashboard:    ${primaryBase}/admin`);
-  console.log(`  🩺  System Diagnostics:  ${primaryBase}/diag`);
-  console.log(`  📄  Diagnostics (JSON):  ${primaryBase}/diag?format=json`);
-  console.log(`  🔑  Key Pool API Status: ${primaryBase}/admin/api/keys`);
-  console.log(`  📊  Stats & Logs API:    ${primaryBase}/admin/api/stats`);
-  console.log(`  💓  Healthcheck / Root:  ${primaryBase}/`);
-
-  if (basePublic && primaryBase !== basePublic) {
-    console.log("-".repeat(66));
-    console.log(`  🌐  Direct Public Link:  http://${publicIp}:${port}/admin`);
+  console.log(`  ⚙️  Admin Dashboard:    ${publicBase}/admin`);
+  console.log(`  🩺  System Diagnostics:  ${publicBase}/diag`);
+  console.log(`  📄  Diagnostics (JSON):  ${publicBase}/diag?format=json`);
+  console.log(`  🔑  Key Pool API Status: ${publicBase}/admin/api/keys`);
+  console.log(`  📊  Stats & Logs API:    ${publicBase}/admin/api/stats`);
+  console.log(`  💓  Healthcheck / Root:  ${publicBase}/`);
+  console.log("-".repeat(66));
+  if (serverIp && isPrivateIp(serverIp)) {
+    console.log(`  🏠  Internal Docker IP:  http://${serverIp}:${currentPort}/admin`);
   }
-  if (primaryBase !== baseLocal) {
-    console.log(`  🏠  Localhost Link:      ${baseLocal}/admin`);
-  }
+  console.log(`  💻  Localhost Link:      http://localhost:${currentPort}/admin`);
   console.log("=".repeat(66) + "\n");
 }
 
-server.listen(port, "0.0.0.0", () => {
-  printStartupBanner(port).catch(() => {});
+const server = createServer(requestHandler);
+server.listen(primaryPort, "0.0.0.0", () => {
+  printStartupBanner(primaryPort);
 });
+
+// Dual-listen: binds secondary port too so requests always reach the server
+let altServer = null;
+if (primaryPort !== secondaryPort) {
+  try {
+    altServer = createServer(requestHandler);
+    altServer.on("error", () => {});
+    altServer.listen(secondaryPort, "0.0.0.0");
+  } catch {}
+}
 
 // 3. Main Telegram Long Polling Loop
 async function startPolling() {
@@ -233,10 +280,26 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 function shutdown(signal) {
   console.log(`\n🛑 Received ${signal}, shutting down gracefully...`);
   running = false;
-  server.close(() => {
-    console.log("Server closed. Goodbye!");
-    process.exit(0);
-  });
+
+  let closed = 0;
+  let expected = 1;
+  const onClose = () => {
+    closed++;
+    if (closed >= expected) {
+      console.log("Server closed. Goodbye!");
+      process.exit(0);
+    }
+  };
+
+  server.close(onClose);
+  if (altServer) {
+    expected++;
+    try {
+      altServer.close(onClose);
+    } catch {
+      onClose();
+    }
+  }
   setTimeout(() => process.exit(0), 3000);
 }
 

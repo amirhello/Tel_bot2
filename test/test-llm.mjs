@@ -1,6 +1,6 @@
-import { assert, t, done, M, env, json } from "./harness.mjs";
+import { assert, t, done, M, env, json, fakeKV } from "./harness.mjs";
 
-const { toOpenAIPart, completeOpenAI, toGeminiPart, buildGeminiBody, readGeminiText, thinkingConfig, safetySettings, completeGemini, complete, endpointOf, providerFor, ApiError } = M;
+const { toOpenAIPart, completeOpenAI, toGeminiPart, buildGeminiBody, readGeminiText, thinkingConfig, safetySettings, completeGemini, complete, endpointOf, providerFor, ApiError, hasMediaPayload, isMultimodalModel, mapModelForProvider } = M;
 
 const cfg = (over = {}) => ({
   ...M.normalizeConfig({ personas: M.DEFAULT_PERSONAS, ...over }, M.DEFAULT_PERSONAS),
@@ -21,7 +21,7 @@ const AUDIO = { type: "audio", mime: "audio/ogg", data: "QUZJ" };
 await t("neutral parts become OpenAI content parts", () => {
   assert.deepEqual(toOpenAIPart({ type: "text", text: "hi" }), { type: "text", text: "hi" });
   assert.deepEqual(toOpenAIPart(IMAGE), { type: "image_url", image_url: { url: "data:image/jpeg;base64,QUJD" } });
-  assert.deepEqual(toOpenAIPart(VIDEO), { type: "video_url", video_url: { url: "data:video/mp4;base64,REVG" } });
+  assert.deepEqual(toOpenAIPart(VIDEO), { type: "text", text: "[Video attached: not supported by this provider]" });
   assert.deepEqual(toOpenAIPart(AUDIO), { type: "input_audio", input_audio: { data: "QUZJ", format: "ogg" } });
   assert.equal(toOpenAIPart({ type: "sticker" }), null);
 });
@@ -55,10 +55,10 @@ await t("video and audio travel as inlineData on the native path", () => {
   assert.deepEqual(body.contents[0].parts[1], { inlineData: { mimeType: "audio/ogg", data: "QUZJ" } });
 });
 
-await t("thinking maps to thinkingConfig, and 'off' simply omits it", () => {
-  assert.deepEqual(thinkingConfig(cfg({ thinking: "medium" })), { thinkingConfig: { thinkingLevel: "medium", includeThoughts: false } });
-  assert.deepEqual(thinkingConfig(cfg({ thinking: "high" })).thinkingConfig.thinkingLevel, "high");
-  assert.deepEqual(thinkingConfig(cfg({ thinking: "off" })), {}, "Gemini 3 cannot be switched off; omitting is the only safe move");
+await t("thinking maps to thinkingConfig.thinkingBudget", () => {
+  assert.deepEqual(thinkingConfig(cfg({ thinking: "medium" })), { thinkingConfig: { thinkingBudget: 4096 } });
+  assert.deepEqual(thinkingConfig(cfg({ thinking: "high" })), { thinkingConfig: { thinkingBudget: 8192 } });
+  assert.deepEqual(thinkingConfig(cfg({ thinking: "off" })), { thinkingConfig: { thinkingBudget: 0 } });
 });
 
 await t("safety settings cover all four categories with the configured levels", () => {
@@ -240,6 +240,97 @@ await t("a non-JSON body becomes a readable error, not a crash", async () => {
     }),
     /non-JSON \(403\)/,
   );
+});
+
+await t("hasMediaPayload correctly detects media parts", () => {
+  assert.equal(hasMediaPayload({ parts: [{ type: "text", text: "hi" }] }), false);
+  assert.equal(hasMediaPayload({ parts: [{ type: "text", text: "hi" }, IMAGE] }), true);
+  assert.equal(hasMediaPayload({ parts: [VIDEO] }), true);
+  assert.equal(hasMediaPayload({ parts: [AUDIO] }), true);
+  assert.equal(hasMediaPayload({}), false);
+});
+
+await t("isMultimodalModel correctly classifies Gemini vs text-only models", () => {
+  assert.equal(isMultimodalModel("gemini-3.5-flash-lite"), true);
+  assert.equal(isMultimodalModel("gemini-3.8-flash"), true);
+  assert.equal(isMultimodalModel("gemma-4-26b"), false);
+  assert.equal(isMultimodalModel("gemma-4-31b"), false);
+  assert.equal(isMultimodalModel("Antigravity"), false);
+});
+
+await t("mapModelForProvider translates models across providers properly", () => {
+  // Gemini -> OpenAI
+  assert.equal(mapModelForProvider("gemini-3.5-flash-lite", "openai", "https://openrouter.ai/api/v1"), "google/gemini-2.5-flash");
+  assert.equal(mapModelForProvider("gemma-4-26b", "openai", "https://openrouter.ai/api/v1"), "google/gemma-2-27b-it");
+  assert.equal(mapModelForProvider("Antigravity", "openai", "https://openrouter.ai/api/v1"), "openai/gpt-4o-mini");
+  assert.equal(mapModelForProvider("gemini-3.8-flash", "openai", "https://api.openai.com/v1"), "gpt-4o-mini");
+
+  // OpenAI -> Gemini
+  assert.equal(mapModelForProvider("gpt-4o", "gemini"), "gemini-3.5-flash-lite");
+  assert.equal(mapModelForProvider("gpt-x", "gemini"), "gemini-3.5-flash-lite");
+  assert.equal(mapModelForProvider("gemini-3.7-flash", "gemini"), "gemini-3.7-flash");
+});
+
+await t("modality-aware routing filters out text-extended models when media is present", async () => {
+  const calledModels = [];
+  responder = (call) => {
+    const m = String(call.url).match(/\/models\/([^:]+):/)?.[1];
+    if (m) calledModels.push(m);
+    return json({ candidates: [{ content: { parts: [{ text: "ok" }] } }] });
+  };
+
+  const customCfg = cfg({
+    provider: {
+      kind: "gemini",
+      model: "gemma-4-26b",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+      modelPool: ["gemma-4-26b", "Antigravity", "gemini-3.5-flash-lite"],
+    },
+  });
+
+  // Call with image media: gemma-4 and Antigravity must be excluded, only gemini-3.5-flash-lite should be called
+  calledModels.length = 0;
+  const res = await complete(env({ GEMINI_API_KEY: "k" }), customCfg, {
+    system: "S",
+    parts: [IMAGE, { type: "text", text: "what is this?" }],
+    maxTokens: 50,
+  });
+  assert.equal(res.text, "ok");
+  assert.equal(calledModels.length, 1);
+  assert.equal(calledModels[0], "gemini-3.5-flash-lite", "media payload must route to multimodal gemini model");
+  responder = () => json({ choices: [{ message: { content: "ok" } }] });
+});
+
+await t("BUG-01: individual key DailyQuotaError does not immediately park model if second key works", async () => {
+  const calledKeys = [];
+  responder = (call) => {
+    calledKeys.push(call.headers["x-goog-api-key"]);
+    if (call.headers["x-goog-api-key"] === "key1") {
+      return json({ error: { code: 429, message: "Quota exceeded for quota metric: limit 20 per day" } }, 429);
+    }
+    return json({ candidates: [{ content: { parts: [{ text: "from key2" }] } }] });
+  };
+
+  const testEnv = env({
+    GEMINI_API_KEYS: "key1, key2",
+    CONFIG: fakeKV(),
+  });
+
+  const res = await complete(testEnv, cfg.single({ provider: { kind: "gemini", model: "gemini-3.5-flash-lite" } }), {
+    system: "S",
+    parts: [{ type: "text", text: "hello" }],
+    maxTokens: 50,
+  });
+
+  assert.equal(res.text, "from key2");
+  assert.equal(calledKeys.length, 2);
+  assert.equal(calledKeys[0], "key1");
+  assert.equal(calledKeys[1], "key2");
+
+  // Model must NOT be parked in quota store
+  const storedQuota = testEnv.CONFIG.store["quota:v1"] ? JSON.parse(testEnv.CONFIG.store["quota:v1"]) : {};
+  assert.equal("gemini-3.5-flash-lite" in storedQuota, false, "model must not be parked when another key succeeded");
+  responder = () => json({ choices: [{ message: { content: "ok" } }] });
 });
 
 done();

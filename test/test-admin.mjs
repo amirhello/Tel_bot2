@@ -189,4 +189,122 @@ await t("an unknown admin path is left to the router", async () => {
   assert.equal(await handleAdmin(new Request("https://x.dev/admin/nope"), env(), "/admin/nope"), null);
 });
 
+/* ---------------------------------------------------------------- security & endpoints hardening */
+
+await t("/admin/api/keys masks sensitive keys and refuses unauthenticated callers", async () => {
+  const e = env({ GEMINI_API_KEYS: "AIzaSyABCDEF1234567890abcdef1234567890" });
+  const anon = await get("/admin/api/keys");
+  assert.equal(anon.status, 401);
+
+  const cookie = `sayyad_admin=${await signSecret("hunter2")}`;
+  const res = await handleAdmin(new Request("https://x.dev/admin/api/keys", { headers: { cookie } }), e, "/admin/api/keys");
+  const data = await res.json();
+  assert.equal(res.status, 200);
+  assert.ok(data.count >= 1);
+  const first = data.keys[0];
+  assert.equal(first.key, "AIzaSy...7890");
+  assert.ok(!first.key.includes("1234567890abcdef"), "full raw key must never be exposed");
+});
+
+await t("login endpoint blocks brute force attacks after 5 failed attempts with 429", async () => {
+  M.resetLoginRateLimit?.();
+  const testIp = "203.0.113.42";
+  const headers = { "x-forwarded-for": testIp };
+
+  for (let i = 1; i <= 5; i++) {
+    const res = await post("/admin/api/login", { password: `bad_${i}` }, headers);
+    assert.equal(res.status, 401, `attempt ${i} must return 401`);
+  }
+
+  // 6th attempt from the same IP must be rate limited with 429
+  const blocked = await post("/admin/api/login", { password: "hunter2" }, headers);
+  assert.equal(blocked.status, 429, "6th attempt must be blocked with HTTP 429");
+  assert.equal(blocked.headers.get("retry-after"), "300");
+
+  // Different IP should still be allowed
+  const other = await post("/admin/api/login", { password: "hunter2" }, { "x-forwarded-for": "198.51.100.9" });
+  assert.equal(other.status, 303, "different IP should not be blocked");
+  M.resetLoginRateLimit?.();
+});
+
+await t("cookie flags include HttpOnly, SameSite=Strict, and Secure on HTTPS", async () => {
+  // HTTPS request
+  const httpsRes = await post("/admin/api/login", { password: "hunter2" });
+  assert.equal(httpsRes.status, 303);
+  const cookie = httpsRes.headers.get("set-cookie");
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /SameSite=Strict/);
+  assert.match(cookie, /Secure/);
+
+  // Plain HTTP request
+  const httpReq = new Request("http://localhost/admin/api/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ password: "hunter2" }),
+  });
+  const httpRes = await handleAdmin(httpReq, env(), "/admin/api/login");
+  assert.equal(httpRes.status, 303);
+  const httpCookie = httpRes.headers.get("set-cookie");
+  assert.match(httpCookie, /HttpOnly/);
+  assert.match(httpCookie, /SameSite=Strict/);
+  assert.ok(!httpCookie.includes("Secure"), "Secure flag must be omitted on plain HTTP");
+});
+
+await t("webhook strictly requires valid x-telegram-bot-api-secret-token when ADMIN_PASSWORD is set", async () => {
+  const worker = M.default;
+  const e = env({ TELEGRAM_BOT_TOKEN: "123:TEST", ADMIN_PASSWORD: "hunter2" });
+  const want = await M.signWebhookSecret("hunter2");
+
+  // Missing secret header -> 403 Forbidden
+  const noHeader = await worker.fetch(new Request("https://x.dev/", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ update_id: 1, message: { text: "hi" } }),
+  }), e, NOOP);
+  assert.equal(noHeader.status, 403, "missing secret token must return 403");
+
+  // Invalid secret header -> 403 Forbidden
+  const badSecret = await worker.fetch(new Request("https://x.dev/", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-telegram-bot-api-secret-token": "wrong_secret" },
+    body: JSON.stringify({ update_id: 2, message: { text: "hi" } }),
+  }), e, NOOP);
+  assert.equal(badSecret.status, 403, "wrong secret token must return 403");
+
+  // Valid secret header -> 200 OK
+  const good = await worker.fetch(new Request("https://x.dev/", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-telegram-bot-api-secret-token": want },
+    body: JSON.stringify({ update_id: 3 }),
+  }), e, NOOP);
+  assert.equal(good.status, 200, "valid secret token must be accepted");
+});
+
+await t("/setup, /setup/reset, and /diag require admin authentication (401 when unauthorized)", async () => {
+  const worker = M.default;
+  const e = env({ ADMIN_PASSWORD: "hunter2", TELEGRAM_BOT_TOKEN: "123:TEST" });
+  const cookie = `sayyad_admin=${await signSecret("hunter2")}`;
+
+  for (const path of ["/setup", "/setup/reset", "/diag"]) {
+    // Stranger without auth -> 401
+    const unauthed = await worker.fetch(new Request("https://x.dev" + path), e, NOOP);
+    assert.equal(unauthed.status, 401, `${path} must return 401 for strangers`);
+
+    // With valid admin cookie -> not 401
+    const authed = await worker.fetch(new Request("https://x.dev" + path, { headers: { cookie } }), e, NOOP);
+    assert.notEqual(authed.status, 401, `${path} must allow authenticated admin`);
+  }
+});
+
+await t("timingSafeEqual and verifyPassword prevent timing attacks accurately", async () => {
+  assert.equal(M.timingSafeEqual("correct_secret", "correct_secret"), true);
+  assert.equal(M.timingSafeEqual("correct_secret", "wrong_secret"), false);
+  assert.equal(M.timingSafeEqual("short", "longer_string"), false);
+  assert.equal(M.timingSafeEqual(null, "str"), false);
+
+  assert.equal(await M.verifyPassword("hunter2", "hunter2"), true);
+  assert.equal(await M.verifyPassword("wrong", "hunter2"), false);
+  assert.equal(await M.verifyPassword("", "hunter2"), false);
+});
+
 done();
