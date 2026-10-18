@@ -47,17 +47,18 @@ Worker فعلی روی OpenRouter کار می‌کند (پاسخ `403` می‌گ
 | 9 | `providerOpenai.js` | `src/providerOpenai.js` |
 | 10 | `providerGemini.js` | `src/providerGemini.js` |
 | 11 | `llm.js` | `src/llm.js` |
-| 12 | `answer.js` | `src/answer.js` |
-| 13 | `voice.js` | `src/voice.js` |
-| 14 | `admin.js` | `src/admin.js` |
-| 15 | `tools.js` | `src/tools.js` |
+| 12 | `keyPool.js` | `src/keyPool.js` |
+| 13 | `answer.js` | `src/answer.js` |
+| 14 | `voice.js` | `src/voice.js` |
+| 15 | `admin.js` | `src/admin.js` |
+| 16 | `tools.js` | `src/tools.js` |
 
 ### اگر قبلاً نسخه‌ی قبلی را نصب کرده‌ای
 
-این ۳ تا را به‌روزرسانی کن (بقیه دست‌نخورده می‌مانند) و `voice` را **جدید** بساز:
+ماژول‌های `answer.js`, `voice.js`, `llm.js`, `keyPool.js` و `admin.js` را به‌روزرسانی کن و `keyPool.js` را جدید بساز:
 
 ```
-answer.js   telegram.js   +   voice.js (جدید)
+keyPool.js (جدید)   +   voice.js   +   answer.js   +   llm.js
 ```
 
 و بعد **Deploy** و یک بار `/setup` را باز کن.

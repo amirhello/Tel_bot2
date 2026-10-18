@@ -7,7 +7,7 @@ import { DEFAULT_PERSONAS, buildSystemPrompt, buildUserContent, replyContext } f
 import { botId, botUsername, sendAudioFile, sendChatAction, sendLong, sendText } from "./telegram.js";
 import { isCommand, isSupportedChat, shouldAnswer } from "./trigger.js";
 import { bumpStats, loadConfig, loadStats, usedToday } from "./store.js";
-import { speak } from "./voice.js";
+import { shouldVoiceReply, speak } from "./voice.js";
 const ERRORS = [
   "الان یه کم درگیرم. یه بار دیگه بفرست، شاید سر جا شد.",
   "یه چیزی قاطی شد. دوباره بزن، درستش می‌کنم.",
@@ -190,11 +190,14 @@ async function reply(env, msg, cfg) {
     return { text: DAILY_LIMIT, reason: "daily cap reached", tgOut: "daily cap guard" };
   }
 
-  await sendChatAction(token, chatId, "typing", threadId).catch(() => {});
+  const isVoice = await shouldVoiceReply(env, msg, cfg, text);
+  const actionKind = isVoice ? "upload_voice" : "typing";
+
+  await sendChatAction(token, chatId, actionKind, threadId).catch(() => {});
   await bumpStats(env, { requests: 1, lastUsed: new Date().toISOString() });
 
   const typingHeartbeat = setInterval(() => {
-    sendChatAction(token, chatId, "typing", threadId).catch(() => {});
+    sendChatAction(token, chatId, actionKind, threadId).catch(() => {});
   }, 4000);
 
   let answer, usedModel;
@@ -214,10 +217,9 @@ async function reply(env, msg, cfg) {
     clearInterval(typingHeartbeat);
   }
 
-  // A voice note deserves a voice back: the text answer above becomes a Live API turn
-  // and comes back as audio. Anything that goes wrong here is caught by processMessage
-  // and reported with one of the friendly ERRORS — never with a silent gap.
-  if (voiceReply(msg, cfg)) {
+  // A voice note (or text requesting voice) deserves a voice back: the text answer above
+  // becomes a Live API turn and comes back as audio.
+  if (isVoice) {
     const startAt = Date.now();
     const elapsed = () => Date.now() - startAt;
     const keep = setInterval(() => sendChatAction(token, chatId, "upload_voice", threadId).catch(() => {}), 4000);
@@ -249,8 +251,8 @@ async function reply(env, msg, cfg) {
 }
 
 /** Voice notes are answered with voice — unless either switch (input or voice) is off. */
-const voiceReply = (msg, cfg) =>
-  !!msg.voice && cfg.media?.audio?.enabled !== false && cfg.voice?.enabled !== false;
+export const voiceReply = (msg, cfg) =>
+  !!msg?.voice && cfg?.media?.audio?.enabled !== false && cfg?.voice?.enabled !== false;
 
 /** Refuse politely once the daily budget is gone, and never call the model. */
 async function overDailyCap(env, cfg, msg) {

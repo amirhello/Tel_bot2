@@ -2767,6 +2767,8 @@ async function collectMedia(env, msg, cfg) {
 // The session is one-shot — setup, one turn, close — because the webhook answers
 // immediately and only gets one waitUntil window (30 s) to finish the job.
 
+
+
 const LIVE_ENDPOINT =
   "https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
@@ -3037,6 +3039,94 @@ async function speak(env, cfg, text, opts = {}) {
   throw lastErr ?? new Error("live voice: all voice models failed");
 }
 
+/**
+ * Fast regex for detecting explicit negative intent (user definitely does NOT want audio).
+ */
+const VOICE_NEGATIVE_RE =
+  /(?:ویس|صدا|صوتی|voice)\s*(?:نفرست|نده|نگو|نمیخوام|نباشه|نکن|نزن)|(?:متنی|تکست|نوشتاری)\s*(?:بگو|بفرست|بنویس|جواب بده)/iu;
+
+/**
+ * Fast regex for detecting explicit positive voice requests without waiting for LLM.
+ */
+const VOICE_POSITIVE_RE =
+  /(?:ویس|صدا|صوتی|voice).*(?:بفرست|بده|بگو|بخون|توضیح|تعریف|ضبط)|(?:با|به صورت|به شکل)\s*(?:ویس|صدا|صوتی)|(?:برام|برامون)\s*بخون/iu;
+
+/**
+ * Quick hint check: If the message contains none of these words, it's definitely not voice-related.
+ * Saves an LLM call for 99% of normal messages.
+ */
+const VOICE_HINT_RE =
+  /(?:ویس|صدا|صوتی|بخون|بشنو|گوش|تعریف|بلند|رادیو|voice|audio|speak|listen)/iu;
+
+/**
+ * Prompt for Gemma 4 to classify colloquial/indirect voice requests.
+ */
+const INTENT_SYSTEM_PROMPT =
+  "وظیفه شما فقط و فقط تشخیص این است که آیا کاربر در متن پیام، درخواست پاسخ صوتی یا ویس کرده است یا خیر.\n" +
+  "اگر کاربر حتی به صورت غیرمستقیم (مثلاً: «حوصله خوندن ندارم برام تعریف کن»، «تو ماشینم بگو بشنوم»، «بلند بگو») خواسته پاسخ به شکل صدا/ویس باشد، فقط بنویس: YES\n" +
+  "اگر پیام یک متن معمولی است یا کاربر گفته ویس نفرست، فقط بنویس: NO\n" +
+  "هیچ توضیح اضافه‌ای نده. پاسخ فقط یک کلمه باشد: YES یا NO";
+
+/**
+ * Detect if user message is asking for a voice reply.
+ * Uses fast regex for clear cases, and Gemma 4 for colloquial/nuanced Persian requests.
+ */
+async function detectVoiceIntent(env, text, cfg) {
+  if (cfg?.voice?.enabled === false) return false;
+  if (!text || typeof text !== "string") return false;
+  const clean = text.trim();
+  if (!clean) return false;
+
+  // 1. If text has no hint of voice/audio words at all, skip immediately without LLM call
+  if (!VOICE_HINT_RE.test(clean)) return false;
+
+  // 2. Fast negative check
+  if (VOICE_NEGATIVE_RE.test(clean)) return false;
+
+  // 3. Fast positive check
+  if (VOICE_POSITIVE_RE.test(clean)) return true;
+
+  // 4. Nuanced / colloquial check via Gemma 4
+  try {
+    const classifierCfg = {
+      ...cfg,
+      provider: {
+        ...cfg?.provider,
+        kind: "gemini",
+        model: "gemma-4-31b",
+        modelPool: ["gemma-4-31b", "gemma-4-26b"],
+      },
+      maxTokens: 5,
+      thinking: "off",
+    };
+
+    const res = await complete(env, classifierCfg, {
+      system: INTENT_SYSTEM_PROMPT,
+      parts: [{ type: "text", text: clean }],
+    });
+
+    const out = String(res?.text || "").trim().toUpperCase();
+    return out.includes("YES");
+  } catch {
+    // If Gemma or network is unavailable, gracefully default to false (text answer)
+    return false;
+  }
+}
+
+/**
+ * Determines whether a message should be answered with voice:
+ * 1. If incoming message is an audio/voice note.
+ * 2. If incoming text asks for a voice response (intent detected).
+ */
+async function shouldVoiceReply(env, msg, cfg, text) {
+  if (cfg?.voice?.enabled === false) return false;
+  if (msg?.voice && cfg?.media?.audio?.enabled !== false) return true;
+  if (text) {
+    return await detectVoiceIntent(env, text, cfg);
+  }
+  return false;
+}
+
 // ------------------------------ src/answer.js ------------------------------
 // The answering pipeline: webhook update in, Telegram reply out.
 
@@ -3230,11 +3320,14 @@ async function reply(env, msg, cfg) {
     return { text: DAILY_LIMIT, reason: "daily cap reached", tgOut: "daily cap guard" };
   }
 
-  await sendChatAction(token, chatId, "typing", threadId).catch(() => {});
+  const isVoice = await shouldVoiceReply(env, msg, cfg, text);
+  const actionKind = isVoice ? "upload_voice" : "typing";
+
+  await sendChatAction(token, chatId, actionKind, threadId).catch(() => {});
   await bumpStats(env, { requests: 1, lastUsed: new Date().toISOString() });
 
   const typingHeartbeat = setInterval(() => {
-    sendChatAction(token, chatId, "typing", threadId).catch(() => {});
+    sendChatAction(token, chatId, actionKind, threadId).catch(() => {});
   }, 4000);
 
   let answer, usedModel;
@@ -3254,10 +3347,9 @@ async function reply(env, msg, cfg) {
     clearInterval(typingHeartbeat);
   }
 
-  // A voice note deserves a voice back: the text answer above becomes a Live API turn
-  // and comes back as audio. Anything that goes wrong here is caught by processMessage
-  // and reported with one of the friendly ERRORS — never with a silent gap.
-  if (voiceReply(msg, cfg)) {
+  // A voice note (or text requesting voice) deserves a voice back: the text answer above
+  // becomes a Live API turn and comes back as audio.
+  if (isVoice) {
     const startAt = Date.now();
     const elapsed = () => Date.now() - startAt;
     const keep = setInterval(() => sendChatAction(token, chatId, "upload_voice", threadId).catch(() => {}), 4000);
@@ -3290,7 +3382,7 @@ async function reply(env, msg, cfg) {
 
 /** Voice notes are answered with voice — unless either switch (input or voice) is off. */
 const voiceReply = (msg, cfg) =>
-  !!msg.voice && cfg.media?.audio?.enabled !== false && cfg.voice?.enabled !== false;
+  !!msg?.voice && cfg?.media?.audio?.enabled !== false && cfg?.voice?.enabled !== false;
 
 /** Refuse politely once the daily budget is gone, and never call the model. */
 async function overDailyCap(env, cfg, msg) {
@@ -3564,4 +3656,4 @@ class FileKV {
   }
 }
 
-export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, UnknownModelError, acquireKey, acquireKeyWithWait, appendArchive, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, detectMedia, diagnostics, downloadFile, endpointOf, esc, extractKeys, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, hasMediaPayload, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiText, readPatch, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword };
+export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, UnknownModelError, acquireKey, acquireKeyWithWait, appendArchive, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, detectMedia, detectVoiceIntent, diagnostics, downloadFile, endpointOf, esc, extractKeys, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, hasMediaPayload, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiText, readPatch, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };
