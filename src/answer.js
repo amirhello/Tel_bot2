@@ -59,12 +59,13 @@ const exhaustedNotice = (resetAt) =>
     : `امروز از سقف روزانه‌ی همه‌ی مدل‌هام رد شدیم. ساعت ${clockTime(resetAt)} دوباره در خدمتم.`;
 
 /** One answer at a time per chat, bounded so an earlier slow request cannot starve waitUntil. */
-function serialize(key, job) {
+export function serialize(key, job) {
   const prev = jobs.get(key) ?? Promise.resolve();
+  let timerId;
   const waitPrev = Promise.race([
     prev.catch(() => {}),
-    new Promise((r) => setTimeout(r, 12_000)),
-  ]);
+    new Promise((r) => { timerId = setTimeout(r, 12_000); }),
+  ]).finally(() => clearTimeout(timerId));
   const next = waitPrev.then(job);
   const tail = next.catch(() => {});
   jobs.set(key, tail);
@@ -323,6 +324,12 @@ async function overDailyCap(env, cfg, msg) {
   const last = capNotified.get(msg.chat.id) ?? 0;
   if (Date.now() - last < 60_000) return true;
   capNotified.set(msg.chat.id, Date.now());
+  if (capNotified.size > 1000) {
+    const now = Date.now();
+    for (const [k, v] of capNotified) {
+      if (now - v >= 60_000) capNotified.delete(k);
+    }
+  }
   try {
     await sendText(env.TELEGRAM_BOT_TOKEN, msg.chat.id, DAILY_LIMIT, msg.message_id, msg.message_thread_id);
   } catch {

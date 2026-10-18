@@ -193,7 +193,7 @@ function printStartupBanner(currentPort) {
   console.log(`  🩺  System Diagnostics:  ${publicBase}/diag`);
   console.log(`  📄  Diagnostics (JSON):  ${publicBase}/diag?format=json`);
   console.log(`  🔑  Key Pool API Status: ${publicBase}/admin/api/keys`);
-  console.log(`  📊  Stats & Logs API:    ${publicBase}/admin/api/stats`);
+  console.log(`  📊  Stats & Logs API:    ${publicBase}/admin/api/state`);
   console.log(`  💓  Healthcheck / Root:  ${publicBase}/`);
   console.log("-".repeat(66));
   if (serverIp && isPrivateIp(serverIp)) {

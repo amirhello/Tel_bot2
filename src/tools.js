@@ -5,22 +5,27 @@ import { DEFAULT_PERSONAS } from "./prompt.js";
 import { loadConfig } from "./store.js";
 import { deleteWebhook, getMe, getWebhookInfo, setWebhook } from "./telegram.js";
 import { esc } from "./text.js";
+import { extractKeys } from "./keyPool.js";
 
 /** A live probe of both the Telegram side and the configured model. */
-export async function diagnostics(env) {
+export async function diagnostics(env = {}) {
   const out = { provider: null, model: null, checks: {} };
 
-  if (!env.TELEGRAM_BOT_TOKEN) {
+  if (!env?.TELEGRAM_BOT_TOKEN) {
     out.checks.telegram = "TELEGRAM_BOT_TOKEN secret is missing";
   } else {
-    const me = await getMe(env.TELEGRAM_BOT_TOKEN);
-    out.checks.telegram = { ok: !!me?.ok, username: me?.result?.username, error: me?.description };
-    const wh = await getWebhookInfo(env.TELEGRAM_BOT_TOKEN);
-    out.checks.webhook = {
-      url: wh?.result?.url,
-      pending: wh?.result?.pending_update_count,
-      lastError: wh?.result?.last_error_message,
-    };
+    try {
+      const me = await getMe(env.TELEGRAM_BOT_TOKEN);
+      out.checks.telegram = { ok: !!me?.ok, username: me?.result?.username, error: me?.description };
+      const wh = await getWebhookInfo(env.TELEGRAM_BOT_TOKEN);
+      out.checks.webhook = {
+        url: wh?.result?.url,
+        pending: wh?.result?.pending_update_count,
+        lastError: wh?.result?.last_error_message,
+      };
+    } catch (e) {
+      out.checks.telegram = { ok: false, error: String(e?.message ?? e).slice(0, 300) };
+    }
   }
 
   const cfg = (await loadConfig(env, DEFAULT_PERSONAS)).config;
@@ -32,8 +37,8 @@ export async function diagnostics(env) {
       : `${cfg.provider.baseUrl}/chat/completions`;
 
   out.checks.credentials = {
-    gemini: env.GEMINI_API_KEY ? "set" : "missing",
-    openai: env.API_KEY || env.OPENROUTER_API_KEY ? "set" : "missing",
+    gemini: extractKeys(env).length > 0 || env?.GEMINI_API_KEY ? "set" : "missing",
+    openai: env?.API_KEY || env?.OPENROUTER_API_KEY ? "set" : "missing",
   };
 
   try {
@@ -50,7 +55,7 @@ export async function diagnostics(env) {
     out.checks.model = out.checks.text;
   }
 
-  if (env.DIAG_IMAGE) {
+  if (env?.DIAG_IMAGE) {
     try {
       // Brief pause so consecutive subrequests do not trip the tight RPM limit or socket reset
       await new Promise((r) => setTimeout(r, 600));

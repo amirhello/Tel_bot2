@@ -105,26 +105,49 @@ function getClientIp(req) {
 }
 
 function isLoginRateLimited(ip) {
+  const ipKey = String(ip || "127.0.0.1");
   const now = Date.now();
-  const list = failedLoginAttempts.get(ip) || [];
+  const list = failedLoginAttempts.get(ipKey) || [];
   const recent = list.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
   if (recent.length !== list.length) {
-    if (recent.length === 0) failedLoginAttempts.delete(ip);
-    else failedLoginAttempts.set(ip, recent);
+    if (recent.length === 0) failedLoginAttempts.delete(ipKey);
+    else failedLoginAttempts.set(ipKey, recent);
   }
   return recent.length >= MAX_FAILED_ATTEMPTS;
 }
 
-function recordFailedLogin(ip) {
+export function recordFailedLogin(ip) {
+  const ipKey = String(ip || "127.0.0.1");
   const now = Date.now();
-  const list = failedLoginAttempts.get(ip) || [];
+  const list = failedLoginAttempts.get(ipKey) || [];
   const recent = list.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
   recent.push(now);
-  failedLoginAttempts.set(ip, recent);
+  // Refresh insertion order so the most recently failing IP is moved to the tail (LRU)
+  failedLoginAttempts.delete(ipKey);
+  failedLoginAttempts.set(ipKey, recent);
+
+  if (failedLoginAttempts.size > 1000) {
+    for (const [k, times] of failedLoginAttempts.entries()) {
+      const valid = times.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+      if (valid.length === 0) {
+        failedLoginAttempts.delete(k);
+      } else if (valid.length !== times.length) {
+        failedLoginAttempts.set(k, valid);
+      }
+    }
+    while (failedLoginAttempts.size > 1000) {
+      const oldestKey = failedLoginAttempts.keys().next().value;
+      if (oldestKey !== undefined) {
+        failedLoginAttempts.delete(oldestKey);
+      } else {
+        break;
+      }
+    }
+  }
 }
 
 function clearFailedLogin(ip) {
-  failedLoginAttempts.delete(ip);
+  failedLoginAttempts.delete(String(ip || "127.0.0.1"));
 }
 
 function isHttps(req) {
@@ -896,9 +919,13 @@ export async function handleAdmin(req, env, path) {
       const key = item.key;
       const masked =
         typeof key === "string"
-          ? (key.length > 10 ? key.slice(0, 6) + "..." + key.slice(-4) : key.slice(0, 6) + "..." + key.slice(-4))
+          ? (key.length > 10 ? key.slice(0, 6) + "..." + key.slice(-4) : (key.length > 2 ? key.slice(0, 2) + "***" : "***"))
           : key;
-      return { ...item, key: masked };
+      const lastError =
+        typeof item.lastError === "string"
+          ? item.lastError.replace(/key=[^&\s]+/gi, "key=[REDACTED]")
+          : item.lastError;
+      return { ...item, key: masked, lastError };
     });
     return json({ count: keys.length, keys });
   }
@@ -937,4 +964,4 @@ export async function handleAdmin(req, env, path) {
   return null;
 }
 
-export { json, COOKIE };
+export { json, COOKIE, failedLoginAttempts };

@@ -10,6 +10,8 @@
 
 import { complete } from "./llm.js";
 import { NodeWebSocket } from "./nodeWs.js";
+import { acquireKeyWithWait, extractKeys } from "./keyPool.js";
+import { DEFAULT_BASE_URLS } from "./store.js";
 
 const LIVE_ENDPOINT =
   "https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
@@ -198,7 +200,12 @@ async function speakOnce(key, model, words, timeoutMs) {
       }
 
       if (msg.error) {
-        const detail = msg.error.message ?? msg.error.status ?? JSON.stringify(msg.error);
+        const detail =
+          msg.error.message ??
+          (msg.error.status
+            ? `${msg.error.status}${msg.error.code ? ` (${msg.error.code})` : ""}`
+            : msg.error.code) ??
+          JSON.stringify(msg.error);
         return finish(new Error(`live voice: ${detail}`));
       }
 
@@ -225,8 +232,18 @@ async function speakOnce(key, model, words, timeoutMs) {
     }
 
     ws.addEventListener("message", enqueue);
-    ws.addEventListener("close", () => queue.then(() => finish(chunks.length ? null : new Error("live voice: connection closed before any audio"), chunks.length ? pcmToWav(concat(chunks)) : undefined)));
-    ws.addEventListener("error", () => queue.then(() => finish(chunks.length ? null : new Error("live voice: connection error"), chunks.length ? pcmToWav(concat(chunks)) : undefined)));
+    ws.addEventListener("close", (ev) =>
+      queue.then(() => {
+        const closeDetail = ev?.reason ? `connection closed: ${ev.reason}` : "connection closed before any audio";
+        finish(chunks.length ? null : new Error(`live voice: ${closeDetail}`), chunks.length ? pcmToWav(concat(chunks)) : undefined);
+      }),
+    );
+    ws.addEventListener("error", (ev) =>
+      queue.then(() => {
+        const errMsg = ev?.message || ev?.error?.message || (typeof ev === "string" ? ev : "connection error");
+        finish(chunks.length ? null : new Error(`live voice: ${errMsg}`), chunks.length ? pcmToWav(concat(chunks)) : undefined);
+      }),
+    );
 
     if (typeof ws.accept === "function") ws.accept(); // Workers' outbound sockets need this
     try {
@@ -259,8 +276,10 @@ async function speakOnce(key, model, words, timeoutMs) {
  * success — a slightly short answer beats an error message.
  */
 export async function speak(env, cfg, text, opts = {}) {
-  const key = env.GEMINI_API_KEY;
-  if (!key) throw new Error("live voice: GEMINI_API_KEY is not set");
+  const rawKeys = extractKeys(env);
+  if (!rawKeys.length && !env?.GEMINI_API_KEY) {
+    throw new Error("live voice: GEMINI_API_KEY is not set");
+  }
 
   const words = spokenText(text);
   if (!words) throw new Error("live voice: nothing to say");
@@ -278,18 +297,27 @@ export async function speak(env, cfg, text, opts = {}) {
     const remaining = timeoutMs - elapsed;
     if (i > 0 && remaining < 2000) break;
 
+    const keyHandle = await acquireKeyWithWait(env, { model, maxWaitMs: 1200, pollIntervalMs: 300 });
+    const key = keyHandle?.key || env?.GEMINI_API_KEY || rawKeys[0];
+
     const t0 = Date.now();
     try {
       const wav = await speakOnce(key, model, words, Math.max(1, remaining));
+      keyHandle?.release();
       attempts.push({ model, ok: true, ms: Date.now() - t0 });
-      opts.onTrace?.({ attempts, chosenModel: model, status: "ok" });
+      try {
+        opts.onTrace?.({ attempts, chosenModel: model, status: "ok" });
+      } catch {}
       return wav;
     } catch (e) {
       const clean = String(e?.message ?? e).replace(/key=[^&\s]+/gi, "key=[REDACTED]");
       lastErr = new Error(clean);
+      keyHandle?.release(lastErr);
       attempts.push({ model, ok: false, error: clean.slice(0, 150), ms: Date.now() - t0 });
-      opts.onTrace?.({ attempts, lastError: clean.slice(0, 150), status: "failed" });
-      if (!/model|not found|unknown|404|unsupported|unavailable|closed before any audio|backend exploded|connection error|refused|failed|timeout/i.test(clean)) {
+      try {
+        opts.onTrace?.({ attempts, lastError: clean.slice(0, 150), status: "failed" });
+      } catch {}
+      if (!/(?:model|not found|unknown|404|unsupported|unavailable|closed|backend exploded|connection|disconnect|refused|failed|timeout|timedout|hang up|reset|econnreset|etimedout|500|502|503|504|server error|no audio|without audio|429|quota|resource_exhausted|rate.?limit)/i.test(clean)) {
         throw lastErr;
       }
     }
@@ -307,8 +335,8 @@ const VOICE_NEGATIVE_RE =
 /**
  * Fast regex for detecting explicit positive voice requests without waiting for LLM.
  */
-const VOICE_POSITIVE_RE =
-  /(?:ویس|صدا|صوتی|voice).*(?:بفرست|بده|بگو|بخون|توضیح|تعریف|ضبط)|(?:با|به صورت|به شکل)\s*(?:ویس|صدا|صوتی)|(?:برام|برامون)\s*بخون/iu;
+export const VOICE_POSITIVE_RE =
+  /(?:ویس|صدا|صوتی|voice)[^\n.!؟?]{0,35}(?:بفرست|بده|بگو|بخون|توضیح بده|تعریف کن|ضبط کن)|(?:با|به صورت|به شکل)\s*(?:ویس|صدا|صوتی)|(?:برام|برامون)\s*بخون/iu;
 
 /**
  * Quick hint check: If the message contains none of these words, it's definitely not voice-related.
@@ -364,6 +392,7 @@ export async function detectVoiceIntent(env, text, cfg, traceContext = null) {
       provider: {
         ...cfg?.provider,
         kind: "gemini",
+        baseUrl: cfg?.provider?.kind === "gemini" && cfg?.provider?.baseUrl ? cfg.provider.baseUrl : DEFAULT_BASE_URLS.gemini,
         model: "gemma-4-31b",
         modelPool: ["gemma-4-31b", "gemma-4-26b"],
       },

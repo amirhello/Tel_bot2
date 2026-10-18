@@ -1,14 +1,28 @@
 import { assert, t, done, M, env, json, fakeKV } from "./harness.mjs";
+import { complete, PoolExhausted, minuteQuota, clearMinuteQuota } from "../src/llm.js";
+import {
+  completeGemini,
+  DailyQuotaError,
+  MinuteQuotaError,
+  UnknownModelError,
+  buildGeminiBody,
+  thinkingConfig,
+  safetySettings,
+  quotaKind,
+} from "../src/providerGemini.js";
+import { acquireKey, acquireKeyWithWait, clearKeyPoolCache, getKeyPool } from "../src/keyPool.js";
+import {
+  normalizePool,
+  nextPacificMidnight,
+  loadQuota,
+  saveQuota,
+  poolResumeTime,
+  DEFAULT_MODEL_POOL,
+  normalizeConfig,
+} from "../src/store.js";
+import { DEFAULT_PERSONAS } from "../src/prompt.js";
 
-const {
-  quotaKind, DailyQuotaError, MinuteQuotaError, UnknownModelError, completeGemini,
-  buildGeminiBody, thinkingConfig, safetySettings, normalizePool,
-  nextPacificMidnight, loadQuota, saveQuota, poolResumeTime, DEFAULT_MODEL_POOL,
-  minuteQuota, clearMinuteQuota,
-} = M;
-const { complete, PoolExhausted } = M;
-
-const cfg = (over = {}) => M.normalizeConfig({ personas: M.DEFAULT_PERSONAS, ...over }, M.DEFAULT_PERSONAS);
+const cfg = (over = {}) => normalizeConfig({ personas: DEFAULT_PERSONAS, ...over }, DEFAULT_PERSONAS);
 const payload = { system: "S", parts: [{ type: "text", text: "Q" }], maxTokens: 10 };
 
 let calls = [];
@@ -284,6 +298,218 @@ await t("the shipped default pool is ordered strongest-first and de-duplicated",
   assert.equal(DEFAULT_MODEL_POOL[0], "gemini-3.5-flash-lite");
   assert.ok(DEFAULT_MODEL_POOL.includes("gemini-3.8-flash"), "a high-quality fallback must be present");
   assert.ok(DEFAULT_MODEL_POOL.includes("Antigravity"), "last resort included");
+});
+
+await t("shapes preserves safety settings when thinking is off (Gemma support)", async () => {
+  calls = [];
+  responder = (url) => (calls.length < 3 ? json({ error: { message: "unsupported field" } }, 400) : ok("finally"));
+  const r = await completeGemini(env({ GEMINI_API_KEY: "k" }), cfg({ thinking: "off" }), payload);
+  assert.equal(r.text, "finally");
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0].body.generationConfig.thinkingConfig.thinkingBudget, 0, "attempt 1 keeps thinkingBudget: 0");
+  assert.equal(calls[1].body.generationConfig.thinkingConfig, undefined, "attempt 2 drops thinkingConfig");
+  assert.ok(calls[1].body.safetySettings, "attempt 2 preserves safetySettings for Gemma");
+  assert.equal(calls[2].body.safetySettings, undefined, "attempt 3 drops safety too");
+});
+
+await t("concurrent requests wait up to 1.2s for in-use key", async () => {
+  clearMinuteQuota();
+  clearKeyPoolCache();
+  const e = env({ GEMINI_API_KEYS: "concurrent_key" });
+  calls = [];
+  responder = () => ok("concurrent success");
+
+  // Acquire the key directly to simulate an in-flight request
+  const h = acquireKey(e);
+  assert.ok(h);
+
+  // Release the key after 150ms
+  setTimeout(() => {
+    h.release();
+  }, 150);
+
+  const start = Date.now();
+  const r = await complete(e, cfg(), payload);
+  assert.equal(r.text, "concurrent success");
+  assert.ok(Date.now() - start >= 100, "waited for the busy key to be released");
+  clearKeyPoolCache();
+});
+
+await t("PoolExhausted uses fallbackReset (~60s) when keys were temporarily busy or cooling", async () => {
+  clearMinuteQuota();
+  clearKeyPoolCache();
+  const e = env({ GEMINI_API_KEYS: "busy_cooldown_key" });
+
+  // Set the key to rpmCooldownUntil without any daily quota
+  const h = acquireKey(e);
+  const err = new Error("rate limit");
+  err.status = 429;
+  err.name = "MinuteQuotaError";
+  h.release(err);
+
+  await assert.rejects(() => complete(e, cfg(), payload), (err) => {
+    assert.ok(err instanceof PoolExhausted, "got " + err.name);
+    assert.ok(err.resetAt <= Date.now() + 65_000, "resetAt is temporary cooldown (~60s)");
+    assert.ok(err.resetAt > Date.now(), "resetAt is in future");
+    return true;
+  });
+  clearKeyPoolCache();
+});
+
+await t("intelligent MALFORMED_RESPONSE and empty response falls back to next model", async () => {
+  clearMinuteQuota();
+  clearKeyPoolCache();
+  const e = env({ GEMINI_API_KEY: "k" });
+  calls = [];
+  responder = (url) => {
+    if (url.includes("gemini-3.5-flash-lite")) {
+      return json({ candidates: [{ content: { parts: [] } }] }); // "Gemini returned no text"
+    }
+    return ok("from gemini-3.8-flash");
+  };
+
+  const r = await complete(e, cfg(), payload);
+  assert.equal(r.text, "from gemini-3.8-flash");
+  assert.equal(calls.length, 2);
+  assert.ok(calls[0].url.includes("gemini-3.5-flash-lite"));
+  assert.ok(calls[1].url.includes("gemini-3.8-flash"));
+  assert.ok(r.trace.some((t) => t.status === "malformed_response (glitch)"));
+  clearMinuteQuota();
+});
+
+await t("MALFORMED_RESPONSE in error message seamlessly falls back to gemini-3.8-flash", async () => {
+  clearMinuteQuota();
+  clearKeyPoolCache();
+  const e = env({ GEMINI_API_KEY: "k" });
+  calls = [];
+  responder = (url) => {
+    if (url.includes("gemini-3.5-flash-lite")) {
+      return json({ error: { message: "MALFORMED_RESPONSE from model backend" } }, 400);
+    }
+    return ok("recovered from flash");
+  };
+
+  const r = await complete(e, cfg(), payload);
+  assert.equal(r.text, "recovered from flash");
+  assert.ok(calls.length >= 2);
+  assert.ok(calls.at(-1).url.includes("gemini-3.8-flash"));
+  assert.ok(r.trace.some((t) => t.status === "malformed_response (glitch)"));
+  clearMinuteQuota();
+});
+
+await t("completeGemini throws immediately on the last shape error", async () => {
+  calls = [];
+  responder = () => json({ error: { message: "unsupported field" } }, 400);
+  await assert.rejects(
+    () => completeGemini(env({ GEMINI_API_KEY: "k" }), cfg({ thinking: "off" }), payload),
+    (err) => {
+      assert.equal(err.status, 400);
+      assert.ok(err.message.includes("unsupported field"));
+      return true;
+    },
+  );
+  assert.equal(calls.length, 3, "tried all 3 shapes before throwing");
+});
+
+await t("model loop re-evaluates timestamp so an expired minute quota is not skipped", async () => {
+  clearMinuteQuota();
+  clearKeyPoolCache();
+  const e = env({ GEMINI_API_KEY: "k" });
+  calls = [];
+
+  // Simulate model 2 having a minute quota that expires in 50ms
+  minuteQuota.set("gemini-3.8-flash", Date.now() + 50);
+
+  // Model 1 takes 80ms to fail with 429 daily quota
+  responder = (url) => {
+    if (url.includes("gemini-3.5-flash-lite")) {
+      const start = Date.now();
+      while (Date.now() - start < 80) {} // busy wait to let 50ms expire
+      return json({ error: { message: "per day quota reached" } }, 429);
+    }
+    return ok("answered by gemini-3.8-flash");
+  };
+
+  const r = await complete(e, cfg(), payload);
+  assert.equal(r.text, "answered by gemini-3.8-flash");
+  assert.equal(calls.length, 2);
+  assert.ok(calls[0].url.includes("gemini-3.5-flash-lite"));
+  assert.ok(calls[1].url.includes("gemini-3.8-flash"), "gemini-3.8-flash was not skipped because cooldown expired during attempt");
+  clearMinuteQuota();
+});
+
+await t("completeGemini fails fast on MALFORMED_RESPONSE without trying all 3 shapes", async () => {
+  calls = [];
+  responder = () => json({ error: { message: "MALFORMED_RESPONSE from backend" } }, 400);
+  await assert.rejects(
+    () => completeGemini(env({ GEMINI_API_KEY: "k" }), cfg({ thinking: "off" }), payload),
+    (err) => {
+      assert.equal(err.status, 400);
+      assert.ok(err.message.includes("MALFORMED_RESPONSE"));
+      return true;
+    },
+  );
+  assert.equal(calls.length, 1, "failed fast on first shape without wasting subsequent shapes");
+});
+
+await t("runGeminiPool throws 60s cooldown and NOT Pacific Midnight when only one model has daily quota exhausted and another key is busy", async () => {
+  clearMinuteQuota();
+  clearKeyPoolCache();
+  const e = env({ GEMINI_API_KEYS: "k1, k2" });
+  calls = [];
+
+  // Model 1 (flash-lite) fails with daily quota error
+  responder = (url) => {
+    if (url.includes("gemini-3.5-flash-lite")) {
+      return json({ error: { message: "Resource exhausted: per day quota reached" } }, 429);
+    }
+    return ok("recovered");
+  };
+
+  // Lock both keys in keyPool before second model is reached, simulating busy keys
+  const pool = getKeyPool(e);
+  // Let model 1 fail with daily quota on both keys
+  // but for model 2 ("gemini-3.8-flash"), all keys are inUse
+  const origAcquire = await import("../src/keyPool.js");
+  
+  // Custom cfg with two models
+  const twoModelCfg = cfg({
+    provider: {
+      kind: "gemini",
+      model: "gemini-3.5-flash-lite",
+      modelPool: ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
+      baseUrl: "https://x.dev",
+    },
+  });
+
+  // Mark model 1 as daily parked in quota
+  const { loadQuota, saveQuota } = await import("../src/store.js");
+  const q = await loadQuota(e);
+  q["gemini-3.5-flash-lite"] = nextPacificMidnight();
+  await saveQuota(e, q);
+
+  // Now gemini-3.5-flash-lite is daily parked.
+  // Now make keys busy on gemini-3.8-flash
+  const h1 = pool[0];
+  const h2 = pool[1];
+  h1.inUse = true;
+  h2.inUse = true;
+
+  try {
+    await assert.rejects(
+      () => complete(e, twoModelCfg, payload),
+      (err) => {
+        assert.ok(err instanceof PoolExhausted, "got " + err.name);
+        assert.ok(err.resetAt <= Date.now() + 65_000, `resetAt should be ~60s and NOT Pacific Midnight (${new Date(err.resetAt).toISOString()})`);
+        return true;
+      },
+    );
+  } finally {
+    h1.inUse = false;
+    h2.inUse = false;
+    clearMinuteQuota();
+    clearKeyPoolCache();
+  }
 });
 
 done();

@@ -1,7 +1,17 @@
 import { assert, t, done, M, env, json, fakeKV } from "./harness.mjs";
+import {
+  spokenText,
+  pcmToWav,
+  setLiveTimeout,
+  speak,
+  detectVoiceIntent,
+  VOICE_POSITIVE_RE,
+} from "../src/voice.js";
+import { DEFAULT_BASE_URLS } from "../src/store.js";
+import { clearKeyPoolCache } from "../src/keyPool.js";
 
 const worker = M.default;
-const { signWebhookSecret, spokenText, pcmToWav, setLiveTimeout, speak } = M;
+const { signWebhookSecret } = M;
 
 /* ---------------------------------------------------------------- fakes */
 
@@ -351,6 +361,213 @@ await t("falls back to fetch with Upgrade header when globalThis.WebSocket is un
     assert.ok(lastSock.accepted);
   } finally {
     globalThis.WebSocket = origWs;
+  }
+});
+
+await t("detectVoiceIntent isolates baseUrl and does not leak OpenAI/OpenRouter baseUrl to Gemini", async () => {
+  const calledUrls = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calledUrls.push(String(url));
+    return json({
+      candidates: [{ content: { parts: [{ text: "YES" }] } }],
+      usageMetadata: { totalTokenCount: 5 },
+    });
+  };
+
+  try {
+    const openaiCfg = {
+      provider: {
+        kind: "openai",
+        baseUrl: "https://openrouter.ai/api/v1",
+        model: "openai/gpt-4o",
+      },
+    };
+
+    const isVoice = await detectVoiceIntent(
+      env({ GEMINI_API_KEY: "AQ.test" }),
+      "حوصله ندارم برام از اول ماجرا رو تعریف کن",
+      openaiCfg,
+    );
+
+    assert.equal(isVoice, true);
+    assert.equal(calledUrls.length, 1);
+    assert.ok(
+      calledUrls[0].startsWith(DEFAULT_BASE_URLS.gemini),
+      `Request should go to Gemini default baseUrl, got: ${calledUrls[0]}`,
+    );
+    assert.ok(
+      !calledUrls[0].includes("openrouter.ai"),
+      "Should never leak openrouter.ai to Gemini",
+    );
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+await t("detectVoiceIntent preserves custom baseUrl when provider is gemini", async () => {
+  const calledUrls = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calledUrls.push(String(url));
+    return json({
+      candidates: [{ content: { parts: [{ text: "NO" }] } }],
+      usageMetadata: { totalTokenCount: 5 },
+    });
+  };
+
+  try {
+    const geminiProxyCfg = {
+      provider: {
+        kind: "gemini",
+        baseUrl: "https://custom-gemini-proxy.example.com/v1beta",
+        model: "gemini-2.5-flash",
+      },
+    };
+
+    const isVoice = await detectVoiceIntent(
+      env({ GEMINI_API_KEY: "AQ.test" }),
+      "لطفا ماجرا رو به طور کامل تعریف کن",
+      geminiProxyCfg,
+    );
+
+    assert.equal(isVoice, false);
+    assert.equal(calledUrls.length, 1);
+    assert.ok(
+      calledUrls[0].startsWith("https://custom-gemini-proxy.example.com/v1beta"),
+      `Request should use custom gemini baseUrl, got: ${calledUrls[0]}`,
+    );
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+await t("speak integrates with Multi-Key Pool to acquire and rotate keys", async () => {
+  clearKeyPoolCache();
+  const keysUsed = [];
+
+  setup((sock, msg) => {
+    if (msg.setup) {
+      sock.emit("message", JSON.stringify({ setupComplete: {} }));
+    } else if (msg.clientContent) {
+      sock.emit("message", JSON.stringify({ serverContent: { modelTurn: { parts: [{ inlineData: { data: PCM_B64 } }] } } }));
+      sock.emit("message", JSON.stringify({ serverContent: { turnComplete: true } }));
+    }
+  });
+
+  const origWs = globalThis.WebSocket;
+  globalThis.WebSocket = class extends origWs {
+    constructor(url) {
+      super(url);
+      const parsed = new URL(url);
+      keysUsed.push(parsed.searchParams.get("key"));
+    }
+  };
+
+  try {
+    const E = env({
+      GEMINI_API_KEYS: "key-alpha, key-beta, key-gamma",
+    });
+
+    const wav1 = await speak(E, {}, "سلام یک");
+    assert.ok(wav1 instanceof Uint8Array);
+
+    const wav2 = await speak(E, {}, "سلام دو");
+    assert.ok(wav2 instanceof Uint8Array);
+
+    assert.equal(keysUsed.length, 2);
+    assert.equal(keysUsed[0], "key-alpha");
+    assert.equal(keysUsed[1], "key-beta", "Round-robin key acquisition should pick key-beta next");
+  } finally {
+    globalThis.WebSocket = origWs;
+    clearKeyPoolCache();
+  }
+});
+
+await t("speak falls back across models and records key error on quota limit (429)", async () => {
+  clearKeyPoolCache();
+  let attemptCount = 0;
+  const modelsAttempted = [];
+
+  setup((sock, msg) => {
+    if (msg.setup) {
+      attemptCount++;
+      modelsAttempted.push(msg.setup.model);
+      if (attemptCount === 1) {
+        // First model fails with 429 quota error
+        sock.emit("message", JSON.stringify({ error: { message: "Resource has been exhausted (e.g. check quota)", status: 429 } }));
+      } else {
+        // Second model succeeds
+        sock.emit("message", JSON.stringify({ setupComplete: {} }));
+      }
+    } else if (msg.clientContent) {
+      sock.emit("message", JSON.stringify({ serverContent: { modelTurn: { parts: [{ inlineData: { data: PCM_B64 } }] } } }));
+      sock.emit("message", JSON.stringify({ serverContent: { turnComplete: true } }));
+    }
+  });
+
+  try {
+    const E = env({ GEMINI_API_KEY: "AQ.test-quota" });
+    const wav = await speak(E, {}, "سلام تست سهمیه");
+    assert.ok(wav instanceof Uint8Array);
+    assert.equal(attemptCount, 2, "Should attempt fallback model after 429 quota error");
+    assert.equal(modelsAttempted[0], "models/gemini-3.8-live");
+    assert.equal(modelsAttempted[1], "models/gemini-2.5-flash-native-audio-dialog");
+  } finally {
+    clearKeyPoolCache();
+  }
+});
+
+await t("VOICE_POSITIVE_RE matches voice requests and obeys character limit without false-positives across sentences", () => {
+  // Positive matches
+  assert.ok(VOICE_POSITIVE_RE.test("لطفاً برام با ویس بگو"));
+  assert.ok(VOICE_POSITIVE_RE.test("ویس بفرست"));
+  assert.ok(VOICE_POSITIVE_RE.test("صدا بفرست برام"));
+  assert.ok(VOICE_POSITIVE_RE.test("به صورت صوتی بگو"));
+  assert.ok(VOICE_POSITIVE_RE.test("برامون بخون"));
+  assert.ok(VOICE_POSITIVE_RE.test("voice بده"));
+
+  // Negative / punctuation boundaries (should NOT match across sentences)
+  assert.equal(VOICE_POSITIVE_RE.test("این یک ویس بود. حالا متن را بفرست"), false);
+  assert.equal(VOICE_POSITIVE_RE.test("صدای پرنده ها زیباست! یک داستان بگو"), false);
+
+  // Negative / distance > 35 chars
+  const longGap = "ویس " + "این متن بسیار طولانی است و فاصله زیادی بین کلمات ایجاد میکند " + "بفرست";
+  assert.equal(VOICE_POSITIVE_RE.test(longGap), false);
+});
+
+await t("speak falls back across models on connection drops, socket hang ups, and no-audio errors", async () => {
+  clearKeyPoolCache();
+  let attemptCount = 0;
+  const modelsAttempted = [];
+
+  setup((sock, msg) => {
+    if (msg.setup) {
+      attemptCount++;
+      modelsAttempted.push(msg.setup.model);
+      if (attemptCount === 1) {
+        // First model fails with connection drop / socket hang up error
+        sock.emit("error", new Error("socket hang up"));
+        sock.emitClose();
+      } else {
+        // Second model succeeds
+        sock.emit("message", JSON.stringify({ setupComplete: {} }));
+      }
+    } else if (msg.clientContent) {
+      sock.emit("message", JSON.stringify({ serverContent: { modelTurn: { parts: [{ inlineData: { data: PCM_B64 } }] } } }));
+      sock.emit("message", JSON.stringify({ serverContent: { turnComplete: true } }));
+    }
+  });
+
+  try {
+    const E = env({ GEMINI_API_KEY: "AQ.test-conn-drop" });
+    const wav = await speak(E, {}, "سلام تست قطعی ارتباط");
+    assert.ok(wav instanceof Uint8Array);
+    assert.equal(attemptCount, 2, "Should attempt fallback model after connection drop");
+    assert.equal(modelsAttempted[0], "models/gemini-3.8-live");
+    assert.equal(modelsAttempted[1], "models/gemini-2.5-flash-native-audio-dialog");
+  } finally {
+    clearKeyPoolCache();
   }
 });
 

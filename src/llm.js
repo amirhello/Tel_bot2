@@ -94,11 +94,12 @@ async function runGeminiPool(env, cfg, payload) {
   let last;
 
   for (const model of pool) {
-    if ((quota[model] ?? 0) > now) {
+    const modelNow = Date.now();
+    if ((quota[model] ?? 0) > modelNow) {
       trace.push({ model, status: "skipped_quota_parked", error: "model parked until quota reset" });
       continue;
     }
-    if ((minuteQuota.get(model) ?? 0) > now) {
+    if ((minuteQuota.get(model) ?? 0) > modelNow) {
       trace.push({ model, status: "skipped_minute_parked", error: "model temporarily paused" });
       continue;
     }
@@ -114,7 +115,8 @@ async function runGeminiPool(env, cfg, payload) {
 
     while (attemptsOnModel < totalUsableKeys) {
       attemptsOnModel++;
-      const keyHandle = await acquireKeyWithWait(env, { model, maxWaitMs: 0 });
+      const waitBudget = attemptsOnModel === 1 ? 1200 : 0;
+      const keyHandle = await acquireKeyWithWait(env, { model, maxWaitMs: waitBudget, pollIntervalMs: 250 });
       if (!keyHandle) {
         trace.push({ model, status: "no_key_available", error: "all keys in cooldown or busy" });
         break; // No available key for this model
@@ -158,26 +160,32 @@ async function runGeminiPool(env, cfg, payload) {
           modelMinuteFailures++;
           continue;
         }
+        if (/MALFORMED_RESPONSE|returned no text|empty answer/i.test(e?.message)) {
+          trace.push({ model, keyIndex: keyHandle.index, status: "malformed_response (glitch)", error: e?.message, ms });
+          modelMinuteFailures++;
+          break;
+        }
         trace.push({ model, keyIndex: keyHandle.index, status: "error", error: String(e?.message ?? e).slice(0, 200), ms });
         throw e;
       }
     }
 
     // FIX BUG-01: Only park the model globally if ALL keys in the pool fail on that model
+    const afterNow = Date.now();
     const currentPool = getKeyPool(env);
     const currentUsable = currentPool.filter((k) => !k.disabled);
     const allKeysDailyExhausted =
       currentUsable.length > 0 &&
-      currentUsable.every((k) => (k.rpdCooldownUntil > now) || (k.modelRpdCooldown?.[model] > now));
+      currentUsable.every((k) => (k.rpdCooldownUntil > afterNow) || (k.modelRpdCooldown?.[model] > afterNow));
     const allKeysMinuteExhausted =
       currentUsable.length > 0 &&
       currentUsable.every(
         (k) =>
-          (k.rpmCooldownUntil > now) ||
-          (k.modelRpmCooldown?.[model] > now) ||
-          (k.highDemandCooldownUntil > now) ||
-          (k.rpdCooldownUntil > now) ||
-          (k.modelRpdCooldown?.[model] > now),
+          (k.rpmCooldownUntil > afterNow) ||
+          (k.modelRpmCooldown?.[model] > afterNow) ||
+          (k.highDemandCooldownUntil > afterNow) ||
+          (k.rpdCooldownUntil > afterNow) ||
+          (k.modelRpdCooldown?.[model] > afterNow),
       );
 
     if (allKeysDailyExhausted || (currentUsable.length > 0 && modelDailyFailures >= currentUsable.length)) {
@@ -193,15 +201,21 @@ async function runGeminiPool(env, cfg, payload) {
 
   if (dirty.size) await saveQuota(env, quota);
 
-  const anyParked = pool.some((m) => (quota[m] ?? 0) > now || (minuteQuota.get(m) ?? 0) > now);
+  const afterNow = Date.now();
+  const allDailyParked = pool.length > 0 && pool.every((m) => (quota[m] ?? 0) > afterNow);
+  const anyParked = pool.some((m) => (quota[m] ?? 0) > afterNow || (minuteQuota.get(m) ?? 0) > afterNow);
+  const fallbackReset = allDailyParked ? nextPacificMidnight() : Date.now() + 60_000;
+
   if (last instanceof DailyQuotaError || last instanceof MinuteQuotaError || anyParked) {
-    const unparkTimes = pool.map((m) => Math.max(quota[m] ?? 0, minuteQuota.get(m) ?? 0)).filter((t) => t > now);
-    const resumeAt = unparkTimes.length ? Math.min(...unparkTimes) : poolResumeTime(quota, pool);
+    const unparkTimes = pool.map((m) => Math.max(quota[m] ?? 0, minuteQuota.get(m) ?? 0)).filter((t) => t > afterNow);
+    const resumeAt = unparkTimes.length === pool.length
+      ? Math.min(...unparkTimes)
+      : fallbackReset;
     const err = new PoolExhausted(resumeAt, last?.message);
     err.trace = trace;
     throw err;
   }
-  const err = last ?? new PoolExhausted(nextPacificMidnight(), "no model available");
+  const err = last ?? new PoolExhausted(fallbackReset, "no model available");
   err.trace = trace;
   throw err;
 }

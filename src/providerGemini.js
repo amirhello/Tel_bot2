@@ -107,12 +107,13 @@ export function readGeminiText(data) {
  * we want to move on to the next model in the pool immediately.
  */
 const HIGH_DEMAND_RE = /quota|resource_exhausted|high demand|spikes in demand|overloaded|temporarily unavailable/i;
+const NO_RETRY_RE = /quota|resource_exhausted|high demand|spikes in demand|overloaded|temporarily unavailable|malformed_response|returned no text|empty answer/i;
 
 const retryableForGemini = (e) =>
   isTransient(e) &&
   quotaKind(e.message) !== "day" &&
   quotaKind(e.message) !== "minute" &&
-  !HIGH_DEMAND_RE.test(e.message);
+  !NO_RETRY_RE.test(e.message);
 
 /**
  * Models differ in which knobs they accept — Gemma rejects thinkingConfig, some tiers
@@ -121,7 +122,7 @@ const retryableForGemini = (e) =>
  */
 function shapes(cfg) {
   const list = [{}];
-  if (cfg.thinking && cfg.thinking !== "off") list.push({ noThinking: true });
+  if (cfg?.thinking) list.push({ noThinking: true });
   list.push({ noThinking: true, noSafety: true });
   return list;
 }
@@ -134,7 +135,8 @@ export async function completeGemini(env, cfg, { system, parts, maxTokens }) {
   const url = `${cfg.provider.baseUrl}/models/${encodeURIComponent(model)}:generateContent`;
   let last = new ApiError("model returned an empty answer");
 
-  for (const shape of shapes(cfg)) {
+  const shapeList = shapes(cfg);
+  for (const shape of shapeList) {
     let data;
     try {
       data = await callJson(url, {
@@ -154,7 +156,7 @@ export async function completeGemini(env, cfg, { system, parts, maxTokens }) {
         throw new MinuteQuotaError(model, `${model}: ${e.message}`);
       }
       // A rejected knob is worth retrying with fewer of them; anything else must surface.
-      if (!isShapeError(e) || shape === shapes(cfg).at(-1)) throw e;
+      if (!isShapeError(e) || /malformed_response/i.test(e.message) || shape === shapeList.at(-1)) throw e;
       last = e;
       continue;
     }

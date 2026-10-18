@@ -1,7 +1,7 @@
 // ============================================================================
 //  Sayyad — Telegram bot on Cloudflare Workers
 //  GENERATED FILE. Do not edit by hand: edit ./src and run "node build.mjs".
-//  Module order, resolved from the import graph: archive.js, http.js, keyPool.js, store.js, providerGemini.js, providerOpenai.js, llm.js, text.js, trigger.js, prompt.js, admin.js, telegram.js, media.js, nodeWs.js, voice.js, answer.js, tools.js, index.js, nodeStore.js
+//  Module order, resolved from the import graph: archive.js, http.js, store.js, keyPool.js, providerGemini.js, providerOpenai.js, llm.js, text.js, trigger.js, prompt.js, admin.js, telegram.js, media.js, nodeWs.js, voice.js, answer.js, tools.js, index.js, nodeStore.js
 // ============================================================================
 import https from "node:https";
 import http from "node:http";
@@ -170,374 +170,6 @@ const isShapeError = (e) => e instanceof ApiError && (e.status === 400 || e.stat
 
 /** A missing credential is the only reason to try the other provider. */
 const isCredentialError = (e) => e instanceof ApiError && (e.status === 500 && /API key|secret/i.test(e.message));
-
-// ------------------------------ src/keyPool.js ------------------------------
-// Multi-key pool manager for Google Gemini API keys.
-// Provides Round-Robin load balancing, per-key concurrency locking (one in-flight request per key),
-// RPM/RPD cooldown tracking, dead key isolation, and JSON file persistence.
-
-
-
-
-let roundRobinIndex = 0;
-let keyPoolCache = null;
-let stateFilePath = null;
-
-function getStatePath() {
-  return stateFilePath;
-}
-
-function setStateFilePath(path) {
-  stateFilePath = path;
-}
-
-function cleanKey(item) {
-  if (!item || typeof item !== "string") return "";
-  return item.replace(/^[\s\{\}\[\]"'`]+|[\s\{\}\[\]"'`]+$/g, "").trim();
-}
-
-/** Extract list of raw keys from environment or config. */
-function extractKeys(env) {
-  let raw = undefined;
-  if (env && ("GEMINI_API_KEYS" in env || "GEMINI_API_KEY" in env)) {
-    raw = env.GEMINI_API_KEYS || env.GEMINI_API_KEY;
-  } else if (typeof process !== "undefined") {
-    raw = process.env?.GEMINI_API_KEYS || process.env?.GEMINI_API_KEY;
-  }
-
-  if (!raw) return [];
-
-  if (Array.isArray(raw)) {
-    return raw.map(cleanKey).filter((k) => k.length >= 1 && !k.startsWith("#"));
-  }
-
-  const str = String(raw).trim();
-
-  // Try parsing JSON array or object if strictly valid JSON
-  if ((str.startsWith("[") && str.endsWith("]")) || (str.startsWith("{") && str.endsWith("}"))) {
-    try {
-      const parsed = JSON.parse(str);
-      if (Array.isArray(parsed)) {
-        return parsed.map(cleanKey).filter((k) => k.length >= 1 && !k.startsWith("#"));
-      }
-      if (parsed && typeof parsed === "object") {
-        return Object.values(parsed).map(cleanKey).filter((k) => k.length >= 1 && !k.startsWith("#"));
-      }
-    } catch {
-      // If not strict JSON (e.g. unquoted {apikey1, apikey2}), fall through to delimiter splitting
-    }
-  }
-
-  return str
-    .split(/[\r\n,;]+/)
-    .map(cleanKey)
-    .filter((k) => k.length >= 1 && !k.startsWith("#"));
-}
-
-/** Load or initialize the persistent state of all keys. */
-function loadState(keys) {
-  let saved = {};
-  const filePath = getStatePath();
-  try {
-    if (filePath && typeof existsSync === "function" && existsSync(filePath)) {
-      if (typeof readFileSync === "function") {
-        saved = JSON.parse(readFileSync(filePath, "utf-8")) || {};
-      }
-    }
-  } catch {
-    /* fallback to clean memory state if file read fails */
-  }
-
-  const now = Date.now();
-  return keys.map((key, idx) => {
-    const s = saved[key] || {};
-    return {
-      key,
-      id: idx + 1,
-      inUse: false, // In-flight lock resets on restart
-      lastUsed: s.lastUsed || 0,
-      requestsToday: s.requestsToday || 0,
-      lastResetDay: s.lastResetDay || new Date().toISOString().slice(0, 10),
-      rpmCooldownUntil: s.rpmCooldownUntil && s.rpmCooldownUntil > now ? s.rpmCooldownUntil : 0,
-      rpdCooldownUntil: s.rpdCooldownUntil && s.rpdCooldownUntil > now ? s.rpdCooldownUntil : 0,
-      modelRpdCooldown: s.modelRpdCooldown && typeof s.modelRpdCooldown === "object" ? s.modelRpdCooldown : {},
-      modelRpmCooldown: s.modelRpmCooldown && typeof s.modelRpmCooldown === "object" ? s.modelRpmCooldown : {},
-      highDemandCooldownUntil: s.highDemandCooldownUntil && s.highDemandCooldownUntil > now ? s.highDemandCooldownUntil : 0,
-      disabled: Boolean(s.disabled),
-      lastError: s.lastError || null,
-    };
-  });
-}
-
-/** Persist state to local JSON file safely. */
-function saveState(pool) {
-  const filePath = getStatePath();
-  if (!filePath) return;
-  try {
-    if (typeof dirname !== "function" || typeof existsSync !== "function" || typeof writeFileSync !== "function") return;
-    const dir = dirname(filePath);
-    if (!existsSync(dir) && typeof mkdirSync === "function") mkdirSync(dir, { recursive: true });
-
-    const obj = {};
-    for (const item of pool) {
-      obj[item.key] = {
-        lastUsed: item.lastUsed,
-        requestsToday: item.requestsToday,
-        lastResetDay: item.lastResetDay,
-        rpmCooldownUntil: item.rpmCooldownUntil,
-        rpdCooldownUntil: item.rpdCooldownUntil,
-        modelRpdCooldown: item.modelRpdCooldown || {},
-        modelRpmCooldown: item.modelRpmCooldown || {},
-        highDemandCooldownUntil: item.highDemandCooldownUntil,
-        disabled: item.disabled,
-        lastError: item.lastError,
-      };
-    }
-    writeFileSync(filePath, JSON.stringify(obj, null, 2), "utf-8");
-  } catch {
-    /* file persistence is non-blocking and safe */
-  }
-}
-
-/** Get or initialize the active key pool. */
-function getKeyPool(env) {
-  const keys = extractKeys(env);
-  if (!keys.length) return [];
-
-  if (
-    !keyPoolCache ||
-    keyPoolCache.length !== keys.length ||
-    !keys.every((k, i) => keyPoolCache[i]?.key === k)
-  ) {
-    keyPoolCache = loadState(keys);
-  }
-  return keyPoolCache;
-}
-
-/** Reset in-memory key pool cache (useful for tests or hot-reload). */
-function clearKeyPoolCache() {
-  keyPoolCache = null;
-  roundRobinIndex = 0;
-}
-
-/**
- * Acquire the next available key using Round-Robin, enforcing concurrency lock (inUse)
- * and skipping cooling/disabled keys.
- */
-function acquireKey(env, opts = {}) {
-  const pool = getKeyPool(env);
-  if (!pool.length) return null;
-
-  const now = Date.now();
-  const todayStr = new Date().toISOString().slice(0, 10);
-
-  // Check rollover for today counters
-  for (const item of pool) {
-    if (item.lastResetDay !== todayStr) {
-      item.requestsToday = 0;
-      item.lastResetDay = todayStr;
-      if (item.rpdCooldownUntil && item.rpdCooldownUntil <= now) {
-        item.rpdCooldownUntil = 0;
-      }
-      item.modelRpdCooldown = {};
-      item.modelRpmCooldown = {};
-    }
-  }
-
-  const count = pool.length;
-  for (let step = 0; step < count; step++) {
-    const idx = (roundRobinIndex + step) % count;
-    const item = pool[idx];
-
-    if (item.disabled) continue;
-    if (item.inUse) continue; // One concurrent request per key rule
-    if (item.rpmCooldownUntil > now) continue;
-    if (opts?.model && item.modelRpmCooldown?.[opts.model] > now) continue;
-    if (item.rpdCooldownUntil > now) continue;
-    if (opts?.model && item.modelRpdCooldown?.[opts.model] > now) continue;
-    if (item.highDemandCooldownUntil > now) continue;
-
-    // Found available key! Lock it and advance round-robin index
-    item.inUse = true;
-    item.lastUsed = now;
-    item.requestsToday++;
-    roundRobinIndex = (idx + 1) % count;
-
-    let released = false;
-    const release = (err) => {
-      if (released) return;
-      released = true;
-      item.inUse = false;
-      if (err) recordKeyError(item, err, opts?.model);
-      saveState(pool);
-    };
-
-    return {
-      key: item.key,
-      id: item.id,
-      index: idx,
-      release,
-    };
-  }
-
-  return null; // All keys are currently busy or in cooldown
-}
-
-/**
- * Acquire next available key, waiting up to maxWaitMs (default 1500ms) if all keys are busy or cooling down.
- */
-async function acquireKeyWithWait(env, opts = {}) {
-  const maxWaitMs = typeof opts?.maxWaitMs === "number" ? opts.maxWaitMs : 1500;
-  const pollIntervalMs = typeof opts?.pollIntervalMs === "number" ? opts.pollIntervalMs : 1500;
-  const start = Date.now();
-
-  while (true) {
-    const handle = acquireKey(env, opts);
-    if (handle) return handle;
-
-    const pool = getKeyPool(env);
-    if (!pool.length) return null;
-
-    const usableKeys = pool.filter((k) => !k.disabled);
-    if (!usableKeys.length) return null;
-
-    const now = Date.now();
-    const elapsed = now - start;
-    if (elapsed >= maxWaitMs) return null;
-
-    // Find earliest time when any usable key might be available
-    let earliestAvailable = Infinity;
-    for (const item of usableKeys) {
-      if (item.inUse) {
-        earliestAvailable = Math.min(earliestAvailable, now + 500);
-      } else {
-        const modelRpd = opts?.model ? (item.modelRpdCooldown?.[opts.model] || 0) : 0;
-        const modelRpm = opts?.model ? (item.modelRpmCooldown?.[opts.model] || 0) : 0;
-        const itemCooldown = Math.max(
-          item.rpmCooldownUntil || 0,
-          item.highDemandCooldownUntil || 0,
-          modelRpd,
-          modelRpm,
-          item.rpdCooldownUntil || 0,
-        );
-        if (itemCooldown <= now) {
-          earliestAvailable = now;
-        } else {
-          earliestAvailable = Math.min(earliestAvailable, itemCooldown);
-        }
-      }
-    }
-
-    if (earliestAvailable > now + (maxWaitMs - elapsed)) {
-      return null;
-    }
-
-    const waitMs = Math.min(pollIntervalMs, Math.max(100, earliestAvailable - now), maxWaitMs - elapsed);
-    if (waitMs <= 0) return null;
-
-    await new Promise((resolve) => setTimeout(resolve, waitMs));
-  }
-}
-
-/** Classify error and apply proper cooldown or quarantine. */
-function recordKeyError(item, err, reqModel) {
-  const now = Date.now();
-  const msg = String(err?.message ?? err);
-  const status = Number(err?.status ?? 0);
-  item.lastError = msg.slice(0, 300);
-
-  // 1. Invalid or revoked API key -> permanently quarantine immediately
-  if (
-    (status === 400 || status === 403 || !status) &&
-    (/API_KEY_INVALID|key.*invalid|unregistered callers|API key not valid|forbidden|not authorized|permission/i.test(msg))
-  ) {
-    item.disabled = true;
-    return;
-  }
-
-  // 2. Safety filter block -> Key is healthy! Do NOT penalize key
-  if (/blocked.*safety|prompt_blocked|finishReason.*safety/i.test(msg)) {
-    return;
-  }
-
-  // 3. Daily quota exhaustion -> 24 hours cooldown for model or key
-  if (
-    (status === 429 || status === 503) &&
-    (/per.?day|daily|requests_per_day/i.test(msg) || err?.name === "DailyQuotaError")
-  ) {
-    const model = err?.model || reqModel;
-    if (model) {
-      if (!item.modelRpdCooldown) item.modelRpdCooldown = {};
-      item.modelRpdCooldown[model] = now + 24 * 3600_000;
-    } else {
-      item.rpdCooldownUntil = now + 24 * 3600_000;
-    }
-    return;
-  }
-
-  // 4. Minute RPM rate limit -> 60 seconds cooldown (do not disable)
-  if (
-    status === 429 ||
-    err?.name === "MinuteQuotaError" ||
-    /resource_exhausted|quota exceeded|too many requests|rate.?limit/i.test(msg)
-  ) {
-    const model = err?.model || reqModel;
-    if (model) {
-      if (!item.modelRpmCooldown) item.modelRpmCooldown = {};
-      item.modelRpmCooldown[model] = now + 60_000;
-    } else {
-      item.rpmCooldownUntil = now + 60_000;
-    }
-    return;
-  }
-
-  // 5. Server high demand / overload -> 30 seconds cooldown
-  if (status === 503 || /high demand|spikes in demand|overloaded/i.test(msg)) {
-    item.highDemandCooldownUntil = now + 30_000;
-  }
-}
-
-/** Diagnostic overview of all keys in pool for admin dashboard. */
-function getKeyPoolStatus(env) {
-  const pool = getKeyPool(env);
-  const now = Date.now();
-
-  return pool.map((item) => {
-    let status = "active";
-    let detail = "Ready";
-
-    if (item.disabled) {
-      status = "invalid";
-      detail = "Disabled / Invalid";
-    } else if (item.rpdCooldownUntil > now || Object.values(item.modelRpdCooldown || {}).some((t) => t > now)) {
-      status = "daily_quota";
-      const maxCooldown = Math.max(item.rpdCooldownUntil || 0, ...Object.values(item.modelRpdCooldown || {}));
-      const hoursLeft = Math.ceil((maxCooldown - now) / 3600_000);
-      detail = `Daily quota reached (~${hoursLeft}h left)`;
-    } else if (item.rpmCooldownUntil > now) {
-      status = "rpm_cooldown";
-      const secsLeft = Math.ceil((item.rpmCooldownUntil - now) / 1000);
-      detail = `Minute limit cooldown (${secsLeft}s left)`;
-    } else if (item.highDemandCooldownUntil > now) {
-      status = "busy_cooldown";
-      const secsLeft = Math.ceil((item.highDemandCooldownUntil - now) / 1000);
-      detail = `High demand cooldown (${secsLeft}s left)`;
-    } else if (item.inUse) {
-      status = "in_use";
-      detail = "Processing request";
-    }
-
-    return {
-      id: item.id,
-      key: item.key, // Unmasked as requested in poll A10
-      status,
-      detail,
-      requestsToday: item.requestsToday,
-      lastError: item.lastError,
-      lastUsed: item.lastUsed ? new Date(item.lastUsed).toISOString() : null,
-    };
-  });
-}
 
 // ------------------------------ src/store.js ------------------------------
 // Everything that touches the KV namespace: config, stats and migration.
@@ -847,6 +479,389 @@ async function bumpStats(env, patch) {
   return next;
 }
 
+// ------------------------------ src/keyPool.js ------------------------------
+// Multi-key pool manager for Google Gemini API keys.
+// Provides Round-Robin load balancing, per-key concurrency locking (one in-flight request per key),
+// RPM/RPD cooldown tracking, dead key isolation, and JSON file persistence.
+
+
+
+
+
+let roundRobinIndex = 0;
+let keyPoolCache = null;
+let stateFilePath = null;
+
+function getStatePath() {
+  return stateFilePath;
+}
+
+function setStateFilePath(path) {
+  stateFilePath = path;
+}
+
+function cleanKey(item) {
+  if (!item || typeof item !== "string") return "";
+  return item.replace(/^[\s\{\}\[\]"'`]+|[\s\{\}\[\]"'`]+$/g, "").trim();
+}
+
+/** Extract list of raw keys from environment or config. */
+function extractKeys(env) {
+  let raw = undefined;
+  if (env && ("GEMINI_API_KEYS" in env || "GEMINI_API_KEY" in env)) {
+    raw = env.GEMINI_API_KEYS || env.GEMINI_API_KEY;
+  } else if (typeof process !== "undefined") {
+    raw = process.env?.GEMINI_API_KEYS || process.env?.GEMINI_API_KEY;
+  }
+
+  if (!raw) return [];
+
+  if (Array.isArray(raw)) {
+    return raw.map(cleanKey).filter((k) => k.length >= 1 && !k.startsWith("#"));
+  }
+
+  const str = String(raw).trim();
+
+  // Try parsing JSON array or object if strictly valid JSON
+  if ((str.startsWith("[") && str.endsWith("]")) || (str.startsWith("{") && str.endsWith("}"))) {
+    try {
+      const parsed = JSON.parse(str);
+      if (Array.isArray(parsed)) {
+        return parsed.map(cleanKey).filter((k) => k.length >= 1 && !k.startsWith("#"));
+      }
+      if (parsed && typeof parsed === "object") {
+        return Object.values(parsed).map(cleanKey).filter((k) => k.length >= 1 && !k.startsWith("#"));
+      }
+    } catch {
+      // If not strict JSON (e.g. unquoted {apikey1, apikey2}), fall through to delimiter splitting
+    }
+  }
+
+  return str
+    .split(/[\r\n,;]+/)
+    .map(cleanKey)
+    .filter((k) => k.length >= 1 && !k.startsWith("#"));
+}
+
+/** Load or initialize the persistent state of all keys. */
+function loadState(keys) {
+  let saved = {};
+  const filePath = getStatePath();
+  try {
+    if (filePath && typeof existsSync === "function" && existsSync(filePath)) {
+      if (typeof readFileSync === "function") {
+        saved = JSON.parse(readFileSync(filePath, "utf-8")) || {};
+      }
+    }
+  } catch {
+    /* fallback to clean memory state if file read fails */
+  }
+
+  const now = Date.now();
+  return keys.map((key, idx) => {
+    const s = saved[key] || {};
+    return {
+      key,
+      id: idx + 1,
+      inUse: false, // In-flight lock resets on restart
+      lastUsed: s.lastUsed || 0,
+      requestsToday: s.requestsToday || 0,
+      lastResetDay: s.lastResetDay || new Date().toISOString().slice(0, 10),
+      rpmCooldownUntil: s.rpmCooldownUntil && s.rpmCooldownUntil > now ? s.rpmCooldownUntil : 0,
+      rpdCooldownUntil: s.rpdCooldownUntil && s.rpdCooldownUntil > now ? s.rpdCooldownUntil : 0,
+      modelRpdCooldown: s.modelRpdCooldown && typeof s.modelRpdCooldown === "object" ? s.modelRpdCooldown : {},
+      modelRpmCooldown: s.modelRpmCooldown && typeof s.modelRpmCooldown === "object" ? s.modelRpmCooldown : {},
+      highDemandCooldownUntil: s.highDemandCooldownUntil && s.highDemandCooldownUntil > now ? s.highDemandCooldownUntil : 0,
+      disabled: Boolean(s.disabled),
+      lastError: s.lastError || null,
+    };
+  });
+}
+
+/** Persist state to local JSON file safely. */
+function saveState(pool) {
+  const filePath = getStatePath();
+  if (!filePath) return;
+  try {
+    if (typeof dirname !== "function" || typeof existsSync !== "function" || typeof writeFileSync !== "function") return;
+    const dir = dirname(filePath);
+    if (!existsSync(dir) && typeof mkdirSync === "function") mkdirSync(dir, { recursive: true });
+
+    const obj = {};
+    for (const item of pool) {
+      obj[item.key] = {
+        lastUsed: item.lastUsed,
+        requestsToday: item.requestsToday,
+        lastResetDay: item.lastResetDay,
+        rpmCooldownUntil: item.rpmCooldownUntil,
+        rpdCooldownUntil: item.rpdCooldownUntil,
+        modelRpdCooldown: item.modelRpdCooldown || {},
+        modelRpmCooldown: item.modelRpmCooldown || {},
+        highDemandCooldownUntil: item.highDemandCooldownUntil,
+        disabled: item.disabled,
+        lastError: item.lastError,
+      };
+    }
+    writeFileSync(filePath, JSON.stringify(obj, null, 2), "utf-8");
+  } catch {
+    /* file persistence is non-blocking and safe */
+  }
+}
+
+/** Get or initialize the active key pool. */
+function getKeyPool(env) {
+  const keys = extractKeys(env);
+  if (!keys.length) return [];
+
+  if (
+    !keyPoolCache ||
+    keyPoolCache.length !== keys.length ||
+    !keys.every((k, i) => keyPoolCache[i]?.key === k)
+  ) {
+    keyPoolCache = loadState(keys);
+  }
+  return keyPoolCache;
+}
+
+/** Reset in-memory key pool cache (useful for tests or hot-reload). */
+function clearKeyPoolCache() {
+  keyPoolCache = null;
+  roundRobinIndex = 0;
+}
+
+/**
+ * Acquire the next available key using Round-Robin, enforcing concurrency lock (inUse)
+ * and skipping cooling/disabled keys.
+ */
+function acquireKey(env, opts = {}) {
+  const pool = getKeyPool(env);
+  if (!pool.length) return null;
+
+  const now = Date.now();
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  // Check rollover for today counters
+  for (const item of pool) {
+    if (item.lastResetDay !== todayStr) {
+      item.requestsToday = 0;
+      item.lastResetDay = todayStr;
+      if (item.rpdCooldownUntil && item.rpdCooldownUntil <= now) {
+        item.rpdCooldownUntil = 0;
+      }
+      if (item.modelRpdCooldown) {
+        for (const [m, t] of Object.entries(item.modelRpdCooldown)) {
+          if (t <= now) delete item.modelRpdCooldown[m];
+        }
+      }
+      if (item.modelRpmCooldown) {
+        for (const [m, t] of Object.entries(item.modelRpmCooldown)) {
+          if (t <= now) delete item.modelRpmCooldown[m];
+        }
+      }
+    }
+  }
+
+  const count = pool.length;
+  for (let step = 0; step < count; step++) {
+    const idx = (roundRobinIndex + step) % count;
+    const item = pool[idx];
+
+    if (item.disabled) continue;
+    if (item.inUse) continue; // One concurrent request per key rule
+    if (item.rpmCooldownUntil > now) continue;
+    if (opts?.model && item.modelRpmCooldown?.[opts.model] > now) continue;
+    if (item.rpdCooldownUntil > now) continue;
+    if (opts?.model && item.modelRpdCooldown?.[opts.model] > now) continue;
+    if (item.highDemandCooldownUntil > now) continue;
+
+    // Found available key! Lock it and advance round-robin index
+    item.inUse = true;
+    item.lastUsed = now;
+    item.requestsToday++;
+    roundRobinIndex = (idx + 1) % count;
+
+    let released = false;
+    const release = (err) => {
+      if (released) return;
+      released = true;
+      item.inUse = false;
+      if (err) recordKeyError(item, err, opts?.model);
+      saveState(pool);
+    };
+
+    return {
+      key: item.key,
+      id: item.id,
+      index: idx,
+      release,
+    };
+  }
+
+  return null; // All keys are currently busy or in cooldown
+}
+
+/**
+ * Acquire next available key, waiting up to maxWaitMs (default 1500ms) if all keys are busy or cooling down.
+ */
+async function acquireKeyWithWait(env, opts = {}) {
+  const maxWaitMs = typeof opts?.maxWaitMs === "number" ? opts.maxWaitMs : 1500;
+  const pollIntervalMs = typeof opts?.pollIntervalMs === "number" ? opts.pollIntervalMs : 1500;
+  const start = Date.now();
+
+  while (true) {
+    const handle = acquireKey(env, opts);
+    if (handle) return handle;
+
+    const pool = getKeyPool(env);
+    if (!pool.length) return null;
+
+    const usableKeys = pool.filter((k) => !k.disabled);
+    if (!usableKeys.length) return null;
+
+    const now = Date.now();
+    const elapsed = now - start;
+    if (elapsed >= maxWaitMs) return null;
+
+    // Find earliest time when any usable key might be available
+    let earliestAvailable = Infinity;
+    for (const item of usableKeys) {
+      if (item.inUse) {
+        earliestAvailable = Math.min(earliestAvailable, now + Math.min(pollIntervalMs, 100));
+      } else {
+        const modelRpd = opts?.model ? (item.modelRpdCooldown?.[opts.model] || 0) : 0;
+        const modelRpm = opts?.model ? (item.modelRpmCooldown?.[opts.model] || 0) : 0;
+        const itemCooldown = Math.max(
+          item.rpmCooldownUntil || 0,
+          item.highDemandCooldownUntil || 0,
+          modelRpd,
+          modelRpm,
+          item.rpdCooldownUntil || 0,
+        );
+        if (itemCooldown <= now) {
+          earliestAvailable = now;
+        } else {
+          earliestAvailable = Math.min(earliestAvailable, itemCooldown);
+        }
+      }
+    }
+
+    if (earliestAvailable > now + (maxWaitMs - elapsed)) {
+      return null;
+    }
+
+    const waitMs = Math.min(pollIntervalMs, Math.max(100, earliestAvailable - now), maxWaitMs - elapsed);
+    if (waitMs <= 0) return null;
+
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+}
+
+/** Classify error and apply proper cooldown or quarantine. */
+function recordKeyError(item, err, reqModel) {
+  const now = Date.now();
+  const rawMsg = String(err?.message ?? err);
+  let msg = rawMsg.replace(/key=[^&\s]+/gi, "key=[REDACTED]");
+  if (item?.key) {
+    msg = msg.split(item.key).join("[REDACTED]");
+  }
+  const status = Number(err?.status ?? 0);
+  item.lastError = msg.slice(0, 300);
+
+  // 1. Invalid or revoked API key -> permanently quarantine immediately
+  if (
+    (status === 400 || status === 403 || !status) &&
+    (/API_KEY_INVALID|key.*invalid|unregistered callers|API key not valid|forbidden|not authorized|permission/i.test(msg))
+  ) {
+    item.disabled = true;
+    return;
+  }
+
+  // 2. Safety filter block -> Key is healthy! Do NOT penalize key
+  if (/blocked.*safety|prompt_blocked|finishReason.*safety/i.test(msg)) {
+    return;
+  }
+
+  // 3. Daily quota exhaustion -> reset at Pacific midnight
+  if (
+    (status === 429 || status === 503) &&
+    (/(?:^|[^a-z])(day|daily|rpd|24\s*h|requests_per_day)(?:[^a-z]|$)/i.test(msg) || /per.?day/i.test(msg) || err?.name === "DailyQuotaError")
+  ) {
+    const resetAt = err?.resetAt || nextPacificMidnight(now);
+    const model = err?.model || reqModel;
+    if (model) {
+      if (!item.modelRpdCooldown) item.modelRpdCooldown = {};
+      item.modelRpdCooldown[model] = resetAt;
+    } else {
+      item.rpdCooldownUntil = resetAt;
+    }
+    return;
+  }
+
+  // 4. Minute RPM rate limit -> 60 seconds cooldown (do not disable)
+  if (
+    status === 429 ||
+    err?.name === "MinuteQuotaError" ||
+    /resource_exhausted|quota exceeded|too many requests|rate.?limit/i.test(msg)
+  ) {
+    const model = err?.model || reqModel;
+    if (model) {
+      if (!item.modelRpmCooldown) item.modelRpmCooldown = {};
+      item.modelRpmCooldown[model] = now + 60_000;
+    } else {
+      item.rpmCooldownUntil = now + 60_000;
+    }
+    return;
+  }
+
+  // 5. Server high demand / overload -> 30 seconds cooldown
+  if (status === 503 || /high demand|spikes in demand|overloaded/i.test(msg)) {
+    item.highDemandCooldownUntil = now + 30_000;
+  }
+}
+
+/** Diagnostic overview of all keys in pool for admin dashboard. */
+function getKeyPoolStatus(env) {
+  const pool = getKeyPool(env);
+  const now = Date.now();
+
+  return pool.map((item) => {
+    let status = "active";
+    let detail = "Ready";
+
+    if (item.disabled) {
+      status = "invalid";
+      detail = "Disabled / Invalid";
+    } else if (item.rpdCooldownUntil > now || Object.values(item.modelRpdCooldown || {}).some((t) => t > now)) {
+      status = "daily_quota";
+      const maxCooldown = Math.max(item.rpdCooldownUntil || 0, ...Object.values(item.modelRpdCooldown || {}));
+      const hoursLeft = Math.ceil((maxCooldown - now) / 3600_000);
+      detail = `Daily quota reached (~${hoursLeft}h left)`;
+    } else if (item.rpmCooldownUntil > now || Object.values(item.modelRpmCooldown || {}).some((t) => t > now)) {
+      status = "rpm_cooldown";
+      const maxRpm = Math.max(item.rpmCooldownUntil || 0, ...Object.values(item.modelRpmCooldown || {}));
+      const secsLeft = Math.ceil((maxRpm - now) / 1000);
+      detail = `Minute limit cooldown (${secsLeft}s left)`;
+    } else if (item.highDemandCooldownUntil > now) {
+      status = "busy_cooldown";
+      const secsLeft = Math.ceil((item.highDemandCooldownUntil - now) / 1000);
+      detail = `High demand cooldown (${secsLeft}s left)`;
+    } else if (item.inUse) {
+      status = "in_use";
+      detail = "Processing request";
+    }
+
+    return {
+      id: item.id,
+      key: item.key, // Unmasked as requested in poll A10
+      status,
+      detail,
+      requestsToday: item.requestsToday,
+      lastError: item.lastError,
+      lastUsed: item.lastUsed ? new Date(item.lastUsed).toISOString() : null,
+    };
+  });
+}
+
 // ------------------------------ src/providerGemini.js ------------------------------
 // Gemini's native API — the only path that accepts video and audio.
 //
@@ -957,12 +972,13 @@ function readGeminiText(data) {
  * we want to move on to the next model in the pool immediately.
  */
 const HIGH_DEMAND_RE = /quota|resource_exhausted|high demand|spikes in demand|overloaded|temporarily unavailable/i;
+const NO_RETRY_RE = /quota|resource_exhausted|high demand|spikes in demand|overloaded|temporarily unavailable|malformed_response|returned no text|empty answer/i;
 
 const retryableForGemini = (e) =>
   isTransient(e) &&
   quotaKind(e.message) !== "day" &&
   quotaKind(e.message) !== "minute" &&
-  !HIGH_DEMAND_RE.test(e.message);
+  !NO_RETRY_RE.test(e.message);
 
 /**
  * Models differ in which knobs they accept — Gemma rejects thinkingConfig, some tiers
@@ -971,7 +987,7 @@ const retryableForGemini = (e) =>
  */
 function shapes(cfg) {
   const list = [{}];
-  if (cfg.thinking && cfg.thinking !== "off") list.push({ noThinking: true });
+  if (cfg?.thinking) list.push({ noThinking: true });
   list.push({ noThinking: true, noSafety: true });
   return list;
 }
@@ -984,7 +1000,8 @@ async function completeGemini(env, cfg, { system, parts, maxTokens }) {
   const url = `${cfg.provider.baseUrl}/models/${encodeURIComponent(model)}:generateContent`;
   let last = new ApiError("model returned an empty answer");
 
-  for (const shape of shapes(cfg)) {
+  const shapeList = shapes(cfg);
+  for (const shape of shapeList) {
     let data;
     try {
       data = await callJson(url, {
@@ -1004,7 +1021,7 @@ async function completeGemini(env, cfg, { system, parts, maxTokens }) {
         throw new MinuteQuotaError(model, `${model}: ${e.message}`);
       }
       // A rejected knob is worth retrying with fewer of them; anything else must surface.
-      if (!isShapeError(e) || shape === shapes(cfg).at(-1)) throw e;
+      if (!isShapeError(e) || /malformed_response/i.test(e.message) || shape === shapeList.at(-1)) throw e;
       last = e;
       continue;
     }
@@ -1189,11 +1206,12 @@ async function runGeminiPool(env, cfg, payload) {
   let last;
 
   for (const model of pool) {
-    if ((quota[model] ?? 0) > now) {
+    const modelNow = Date.now();
+    if ((quota[model] ?? 0) > modelNow) {
       trace.push({ model, status: "skipped_quota_parked", error: "model parked until quota reset" });
       continue;
     }
-    if ((minuteQuota.get(model) ?? 0) > now) {
+    if ((minuteQuota.get(model) ?? 0) > modelNow) {
       trace.push({ model, status: "skipped_minute_parked", error: "model temporarily paused" });
       continue;
     }
@@ -1209,7 +1227,8 @@ async function runGeminiPool(env, cfg, payload) {
 
     while (attemptsOnModel < totalUsableKeys) {
       attemptsOnModel++;
-      const keyHandle = await acquireKeyWithWait(env, { model, maxWaitMs: 0 });
+      const waitBudget = attemptsOnModel === 1 ? 1200 : 0;
+      const keyHandle = await acquireKeyWithWait(env, { model, maxWaitMs: waitBudget, pollIntervalMs: 250 });
       if (!keyHandle) {
         trace.push({ model, status: "no_key_available", error: "all keys in cooldown or busy" });
         break; // No available key for this model
@@ -1253,26 +1272,32 @@ async function runGeminiPool(env, cfg, payload) {
           modelMinuteFailures++;
           continue;
         }
+        if (/MALFORMED_RESPONSE|returned no text|empty answer/i.test(e?.message)) {
+          trace.push({ model, keyIndex: keyHandle.index, status: "malformed_response (glitch)", error: e?.message, ms });
+          modelMinuteFailures++;
+          break;
+        }
         trace.push({ model, keyIndex: keyHandle.index, status: "error", error: String(e?.message ?? e).slice(0, 200), ms });
         throw e;
       }
     }
 
     // FIX BUG-01: Only park the model globally if ALL keys in the pool fail on that model
+    const afterNow = Date.now();
     const currentPool = getKeyPool(env);
     const currentUsable = currentPool.filter((k) => !k.disabled);
     const allKeysDailyExhausted =
       currentUsable.length > 0 &&
-      currentUsable.every((k) => (k.rpdCooldownUntil > now) || (k.modelRpdCooldown?.[model] > now));
+      currentUsable.every((k) => (k.rpdCooldownUntil > afterNow) || (k.modelRpdCooldown?.[model] > afterNow));
     const allKeysMinuteExhausted =
       currentUsable.length > 0 &&
       currentUsable.every(
         (k) =>
-          (k.rpmCooldownUntil > now) ||
-          (k.modelRpmCooldown?.[model] > now) ||
-          (k.highDemandCooldownUntil > now) ||
-          (k.rpdCooldownUntil > now) ||
-          (k.modelRpdCooldown?.[model] > now),
+          (k.rpmCooldownUntil > afterNow) ||
+          (k.modelRpmCooldown?.[model] > afterNow) ||
+          (k.highDemandCooldownUntil > afterNow) ||
+          (k.rpdCooldownUntil > afterNow) ||
+          (k.modelRpdCooldown?.[model] > afterNow),
       );
 
     if (allKeysDailyExhausted || (currentUsable.length > 0 && modelDailyFailures >= currentUsable.length)) {
@@ -1288,15 +1313,21 @@ async function runGeminiPool(env, cfg, payload) {
 
   if (dirty.size) await saveQuota(env, quota);
 
-  const anyParked = pool.some((m) => (quota[m] ?? 0) > now || (minuteQuota.get(m) ?? 0) > now);
+  const afterNow = Date.now();
+  const allDailyParked = pool.length > 0 && pool.every((m) => (quota[m] ?? 0) > afterNow);
+  const anyParked = pool.some((m) => (quota[m] ?? 0) > afterNow || (minuteQuota.get(m) ?? 0) > afterNow);
+  const fallbackReset = allDailyParked ? nextPacificMidnight() : Date.now() + 60_000;
+
   if (last instanceof DailyQuotaError || last instanceof MinuteQuotaError || anyParked) {
-    const unparkTimes = pool.map((m) => Math.max(quota[m] ?? 0, minuteQuota.get(m) ?? 0)).filter((t) => t > now);
-    const resumeAt = unparkTimes.length ? Math.min(...unparkTimes) : poolResumeTime(quota, pool);
+    const unparkTimes = pool.map((m) => Math.max(quota[m] ?? 0, minuteQuota.get(m) ?? 0)).filter((t) => t > afterNow);
+    const resumeAt = unparkTimes.length === pool.length
+      ? Math.min(...unparkTimes)
+      : fallbackReset;
     const err = new PoolExhausted(resumeAt, last?.message);
     err.trace = trace;
     throw err;
   }
-  const err = last ?? new PoolExhausted(nextPacificMidnight(), "no model available");
+  const err = last ?? new PoolExhausted(fallbackReset, "no model available");
   err.trace = trace;
   throw err;
 }
@@ -1809,26 +1840,49 @@ function getClientIp(req) {
 }
 
 function isLoginRateLimited(ip) {
+  const ipKey = String(ip || "127.0.0.1");
   const now = Date.now();
-  const list = failedLoginAttempts.get(ip) || [];
+  const list = failedLoginAttempts.get(ipKey) || [];
   const recent = list.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
   if (recent.length !== list.length) {
-    if (recent.length === 0) failedLoginAttempts.delete(ip);
-    else failedLoginAttempts.set(ip, recent);
+    if (recent.length === 0) failedLoginAttempts.delete(ipKey);
+    else failedLoginAttempts.set(ipKey, recent);
   }
   return recent.length >= MAX_FAILED_ATTEMPTS;
 }
 
 function recordFailedLogin(ip) {
+  const ipKey = String(ip || "127.0.0.1");
   const now = Date.now();
-  const list = failedLoginAttempts.get(ip) || [];
+  const list = failedLoginAttempts.get(ipKey) || [];
   const recent = list.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
   recent.push(now);
-  failedLoginAttempts.set(ip, recent);
+  // Refresh insertion order so the most recently failing IP is moved to the tail (LRU)
+  failedLoginAttempts.delete(ipKey);
+  failedLoginAttempts.set(ipKey, recent);
+
+  if (failedLoginAttempts.size > 1000) {
+    for (const [k, times] of failedLoginAttempts.entries()) {
+      const valid = times.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+      if (valid.length === 0) {
+        failedLoginAttempts.delete(k);
+      } else if (valid.length !== times.length) {
+        failedLoginAttempts.set(k, valid);
+      }
+    }
+    while (failedLoginAttempts.size > 1000) {
+      const oldestKey = failedLoginAttempts.keys().next().value;
+      if (oldestKey !== undefined) {
+        failedLoginAttempts.delete(oldestKey);
+      } else {
+        break;
+      }
+    }
+  }
 }
 
 function clearFailedLogin(ip) {
-  failedLoginAttempts.delete(ip);
+  failedLoginAttempts.delete(String(ip || "127.0.0.1"));
 }
 
 function isHttps(req) {
@@ -2600,9 +2654,13 @@ async function handleAdmin(req, env, path) {
       const key = item.key;
       const masked =
         typeof key === "string"
-          ? (key.length > 10 ? key.slice(0, 6) + "..." + key.slice(-4) : key.slice(0, 6) + "..." + key.slice(-4))
+          ? (key.length > 10 ? key.slice(0, 6) + "..." + key.slice(-4) : (key.length > 2 ? key.slice(0, 2) + "***" : "***"))
           : key;
-      return { ...item, key: masked };
+      const lastError =
+        typeof item.lastError === "string"
+          ? item.lastError.replace(/key=[^&\s]+/gi, "key=[REDACTED]")
+          : item.lastError;
+      return { ...item, key: masked, lastError };
     });
     return json({ count: keys.length, keys });
   }
@@ -2913,18 +2971,31 @@ class NodeWebSocket {
     this.binaryType = "arraybuffer";
     this._listeners = { message: [], open: [], close: [], error: [] };
     this._socket = null;
+    this.fragments = [];
+    this.fragOpcode = 0;
+    this._closedEmitted = false;
     this._connect();
   }
 
-  addEventListener(type, fn) {
-    if (this._listeners[type]) {
+  addEventListener(type, fn, options) {
+    if (!this._listeners[type] || typeof fn !== "function") return;
+    if (options && options.once) {
+      const onceWrapper = (event) => {
+        this.removeEventListener(type, onceWrapper);
+        fn(event);
+      };
+      onceWrapper._original = fn;
+      this._listeners[type].push(onceWrapper);
+    } else {
       this._listeners[type].push(fn);
     }
   }
 
   removeEventListener(type, fn) {
     if (this._listeners[type]) {
-      this._listeners[type] = this._listeners[type].filter((cb) => cb !== fn);
+      this._listeners[type] = this._listeners[type].filter(
+        (cb) => cb !== fn && cb._original !== fn,
+      );
     }
   }
 
@@ -2937,6 +3008,27 @@ class NodeWebSocket {
         console.error(`NodeWebSocket listener error (${type}):`, err);
       }
     }
+    const propHandler = this[`on${type}`];
+    if (typeof propHandler === "function") {
+      try {
+        propHandler(event);
+      } catch (err) {
+        console.error(`NodeWebSocket property handler error (on${type}):`, err);
+      }
+    }
+  }
+
+  _emitClose(event = {}) {
+    if (this._closedEmitted) return;
+    this._closedEmitted = true;
+    this.readyState = 3;
+    this.fragments = [];
+    this.fragOpcode = 0;
+    this._emit("close", {
+      code: event.code ?? 1000,
+      reason: event.reason ?? "",
+      wasClean: event.wasClean ?? (event.code === 1000),
+    });
   }
 
   _connect() {
@@ -2958,19 +3050,48 @@ class NodeWebSocket {
       },
     });
 
+    this._req = req;
+
+    // Handle non-101 responses (e.g. HTTP 403 Forbidden, 429 Too Many Requests, 404, 500)
+    req.on("response", (res) => {
+      res.resume(); // Drain and discard
+      res.on("end", () => {
+        try { req.destroy(); } catch {}
+      });
+      const msg = `Unexpected server response: ${res.statusCode} ${res.statusMessage || ""}`.trim();
+      const err = new Error(msg);
+      this._emit("error", err);
+      this._emitClose({ code: 1006, reason: msg, wasClean: false });
+    });
+
     req.on("upgrade", (res, socket, head) => {
+      const expectedAccept = crypto
+        .createHash("sha1")
+        .update(secKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+        .digest("base64");
+      const actualAccept = res.headers["sec-websocket-accept"];
+      if (actualAccept !== expectedAccept) {
+        const err = new Error("Sec-WebSocket-Accept header mismatch or missing");
+        this._emit("error", err);
+        this._emitClose({ code: 1002, reason: err.message, wasClean: false });
+        socket.destroy();
+        return;
+      }
+
+      if (this.readyState === 2 || this.readyState === 3) {
+        socket.destroy();
+        return;
+      }
+
       this._socket = socket;
-      this.readyState = 1; // OPEN
-      this._emit("open", {});
 
       let buffer = head && head.length ? Buffer.from(head) : Buffer.alloc(0);
 
-      socket.on("data", (chunk) => {
-        buffer = Buffer.concat([buffer, chunk]);
-
+      const processFrames = () => {
         while (buffer.length >= 2) {
           const byte1 = buffer[0];
           const byte2 = buffer[1];
+          const fin = (byte1 & 0x80) !== 0;
           const opcode = byte1 & 0x0f;
           let payloadLen = byte2 & 0x7f;
           let offset = 2;
@@ -2981,87 +3102,230 @@ class NodeWebSocket {
             offset += 2;
           } else if (payloadLen === 127) {
             if (buffer.length < offset + 8) break;
-            payloadLen = Number(buffer.readBigUInt64BE(offset));
+            const bigLen = buffer.readBigUInt64BE(offset);
+            if (bigLen > BigInt(Number.MAX_SAFE_INTEGER)) {
+              this._emit("error", new Error("Payload length exceeds safe integer limit"));
+              socket.destroy();
+              return;
+            }
+            payloadLen = Number(bigLen);
             offset += 8;
+          }
+
+          // RFC 6455 Section 5.1: A server MUST NOT mask any frames that it sends to the client.
+          const isMasked = (byte2 & 0x80) !== 0;
+          if (isMasked) {
+            const err = new Error("Protocol error: server frame MUST NOT be masked (RFC 6455 Section 5.1)");
+            this._emit("error", err);
+            this.close(1002, "Protocol error: masked frame from server");
+            return;
+          }
+
+          if (payloadLen > 32 * 1024 * 1024) {
+            const err = new Error("Message too big: payload exceeds 32MB limit");
+            this._emit("error", err);
+            this.close(1009, "Message too big");
+            return;
           }
 
           if (buffer.length < offset + payloadLen) break;
 
           const payload = buffer.subarray(offset, offset + payloadLen);
           buffer = buffer.subarray(offset + payloadLen);
+          if (buffer.length === 0) buffer = Buffer.alloc(0);
+
+          // Control frames validation (RFC 6455 5.5: must not be fragmented and payload <= 125)
+          if (opcode >= 8 && (!fin || payloadLen > 125)) {
+            const err = new Error("Protocol error: fragmented or oversized control frame");
+            this._emit("error", err);
+            this.close(1002, "Protocol error");
+            return;
+          }
 
           if (opcode === 8) {
-            // CLOSE
-            this.readyState = 3;
-            this._emit("close", { code: 1000, reason: "server closed" });
+            // CLOSE frame from server (RFC 6455 Section 5.5.1)
+            if (payloadLen === 1) {
+              const err = new Error("Protocol error: close frame with 1-byte payload");
+              this._emit("error", err);
+              this.close(1002, "Protocol error");
+              return;
+            }
+            let code = 1000;
+            let reason = "server closed";
+            if (payload.length >= 2) {
+              code = payload.readUInt16BE(0);
+              if (code < 1000 || (code >= 1004 && code <= 1006) || code === 1015 || (code >= 1016 && code <= 2999) || code >= 5000) {
+                const err = new Error(`Protocol error: invalid close code ${code}`);
+                this._emit("error", err);
+                this.close(1002, "Protocol error");
+                return;
+              }
+              if (payload.length > 2) {
+                try {
+                  reason = new TextDecoder("utf-8", { fatal: true }).decode(payload.subarray(2));
+                } catch {
+                  const err = new Error("Protocol error: close reason is not valid UTF-8");
+                  this._emit("error", err);
+                  this.close(1002, "Protocol error");
+                  return;
+                }
+              } else {
+                reason = "";
+              }
+            }
+            // Reply with close frame if not already closing
+            if (this.readyState === 1) {
+              this.readyState = 2;
+              try {
+                const echoBuf = Buffer.alloc(2);
+                echoBuf.writeUInt16BE(code, 0);
+                this._sendFrame(0x08, echoBuf);
+              } catch {}
+            }
             socket.end();
+            this._emitClose({ code, reason, wasClean: true });
             return;
           } else if (opcode === 9) {
-            // PING -> reply PONG
-            const pong = Buffer.from([0x8a, 0x00]);
-            socket.write(pong);
-          } else if (opcode === 1) {
-            // TEXT
-            this._emit("message", { data: payload.toString("utf8") });
-          } else if (opcode === 2) {
-            // BINARY
-            const arr = new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength);
-            this._emit("message", { data: arr });
+            // PING -> reply masked PONG containing exact incoming payload (RFC 6455 5.5.3)
+            try {
+              this._sendFrame(0x0a, payload);
+            } catch {}
+          } else if (opcode === 10) {
+            // PONG -> keepalive response, ignore
+          } else if (opcode === 1 || opcode === 2 || opcode === 0) {
+            // Fragmentation support (RFC 6455 Section 5.4)
+            if (opcode !== 0) {
+              if (this.fragOpcode !== 0) {
+                const err = new Error("Protocol error: new message started before previous fragment finished");
+                this._emit("error", err);
+                this.close(1002, "Protocol error");
+                return;
+              }
+              this.fragOpcode = opcode;
+              this.fragments = [Buffer.from(payload)];
+            } else {
+              if (!this.fragOpcode) {
+                // Continuation frame without prior initiating frame
+                const err = new Error("Protocol error: unexpected continuation frame");
+                this._emit("error", err);
+                this.close(1002, "Protocol error");
+                return;
+              }
+              this.fragments.push(Buffer.from(payload));
+            }
+
+            const totalAccum = this.fragments.reduce((sum, f) => sum + f.length, 0);
+            if (totalAccum > 32 * 1024 * 1024) {
+              const err = new Error("Message too big: fragmented message exceeds 32MB limit");
+              this._emit("error", err);
+              this.close(1009, "Message too big");
+              return;
+            }
+
+            if (fin) {
+              const fullPayload = Buffer.concat(this.fragments);
+              const finalOpcode = this.fragOpcode;
+              this.fragments = [];
+              this.fragOpcode = 0;
+
+              if (finalOpcode === 1) {
+                // TEXT (RFC 6455 Section 5.6)
+                let text;
+                try {
+                  text = new TextDecoder("utf-8", { fatal: true }).decode(fullPayload);
+                } catch {
+                  const err = new Error("Protocol error: invalid UTF-8 in text frame");
+                  this._emit("error", err);
+                  this.close(1007, "Invalid UTF-8");
+                  return;
+                }
+                this._emit("message", { data: text });
+              } else if (finalOpcode === 2) {
+                // BINARY
+                const arr = new Uint8Array(fullPayload);
+                this._emit("message", { data: arr });
+              }
+            }
+          } else {
+            // Reserved / unknown opcode (RFC 6455 Section 5.2)
+            const err = new Error(`Protocol error: unknown opcode ${opcode}`);
+            this._emit("error", err);
+            this.close(1002, "Protocol error");
+            return;
           }
         }
+      };
+
+      // Attach socket listeners BEFORE emitting open to avoid unhandled error crash
+      socket.on("data", (chunk) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        processFrames();
       });
 
       socket.on("close", () => {
-        this.readyState = 3;
-        this._emit("close", {});
+        const wasClosing = this.readyState === 2;
+        this._emitClose({
+          code: wasClosing ? (this._closeCode ?? 1000) : 1006,
+          reason: wasClosing ? (this._closeReason ?? "") : "socket closed",
+          wasClean: wasClosing,
+        });
       });
 
       socket.on("error", (err) => {
-        this.readyState = 3;
         this._emit("error", err);
+        this._emitClose({ code: 1006, reason: err.message, wasClean: false });
       });
+
+      this.readyState = 1; // OPEN
+      this._emit("open", {});
+
+      if (buffer.length >= 2) {
+        processFrames();
+      }
     });
 
     req.on("error", (err) => {
-      this.readyState = 3;
       this._emit("error", err);
+      this._emitClose({ code: 1006, reason: err.message, wasClean: false });
     });
 
     req.end();
   }
 
-  send(data) {
-    if (this.readyState !== 1 || !this._socket) {
+  _sendFrame(opcode, payloadBuffer) {
+    if ((this.readyState !== 1 && (opcode !== 0x08 || this.readyState !== 2)) || !this._socket || !this._socket.writable) {
       throw new Error("WebSocket is not open");
     }
 
-    const payload = Buffer.isBuffer(data)
-      ? data
-      : typeof data === "string"
-      ? Buffer.from(data, "utf8")
-      : Buffer.from(data);
+    const payload = Buffer.isBuffer(payloadBuffer)
+      ? payloadBuffer
+      : typeof payloadBuffer === "string"
+      ? Buffer.from(payloadBuffer, "utf8")
+      : payloadBuffer instanceof Uint8Array || payloadBuffer instanceof ArrayBuffer
+      ? Buffer.from(payloadBuffer)
+      : payloadBuffer
+      ? Buffer.from(payloadBuffer)
+      : Buffer.alloc(0);
 
     const len = payload.length;
     let header;
     let offset = 0;
-
-    const isBinary = Buffer.isBuffer(data) || data instanceof Uint8Array;
-    const opcode = isBinary ? 0x82 : 0x81;
+    const firstByte = 0x80 | (opcode & 0x0f);
 
     if (len < 126) {
       header = Buffer.alloc(6);
-      header[0] = opcode;
+      header[0] = firstByte;
       header[1] = 0x80 | len; // Mask bit = 1
       offset = 2;
     } else if (len <= 65535) {
       header = Buffer.alloc(8);
-      header[0] = opcode;
+      header[0] = firstByte;
       header[1] = 0x80 | 126;
       header.writeUInt16BE(len, 2);
       offset = 4;
     } else {
       header = Buffer.alloc(14);
-      header[0] = opcode;
+      header[0] = firstByte;
       header[1] = 0x80 | 127;
       header.writeBigUInt64BE(BigInt(len), 2);
       offset = 10;
@@ -3078,16 +3342,50 @@ class NodeWebSocket {
     this._socket.write(Buffer.concat([header, maskedPayload]));
   }
 
-  close(code = 1000, reason = "") {
-    this.readyState = 2;
-    if (this._socket) {
-      const closeFrame = Buffer.from([0x88, 0x80, 0, 0, 0, 0]);
-      try {
-        this._socket.write(closeFrame);
-      } catch {}
-      this._socket.end();
+  send(data) {
+    if (this.readyState !== 1 || !this._socket) {
+      throw new Error("WebSocket is not open");
     }
-    this.readyState = 3;
+
+    const isBinary = Buffer.isBuffer(data) || data instanceof Uint8Array || data instanceof ArrayBuffer;
+    const payload = Buffer.isBuffer(data)
+      ? data
+      : typeof data === "string"
+      ? Buffer.from(data, "utf8")
+      : isBinary
+      ? Buffer.from(data)
+      : Buffer.from(String(data ?? ""), "utf8");
+
+    this._sendFrame(isBinary ? 0x02 : 0x01, payload);
+  }
+
+  close(code = 1000, reason = "") {
+    if (this.readyState === 2 || this.readyState === 3) return;
+    const wasConnecting = this.readyState === 0;
+    this.readyState = 2;
+    this._closeCode = code;
+    this._closeReason = reason;
+    if (this._req && wasConnecting) {
+      try {
+        this._req.destroy();
+      } catch {}
+    }
+    if (this._socket) {
+      try {
+        const reasonBuf = reason ? Buffer.from(reason, "utf8") : Buffer.alloc(0);
+        const payload = Buffer.alloc(2 + reasonBuf.length);
+        payload.writeUInt16BE(code, 0);
+        if (reasonBuf.length > 0) {
+          reasonBuf.copy(payload, 2);
+        }
+        this._sendFrame(0x08, payload);
+      } catch {}
+      try {
+        this._socket.end();
+      } catch {}
+    } else {
+      this._emitClose({ code, reason, wasClean: true });
+    }
   }
 }
 
@@ -3101,6 +3399,8 @@ class NodeWebSocket {
 //
 // The session is one-shot — setup, one turn, close — because the webhook answers
 // immediately and only gets one waitUntil window (30 s) to finish the job.
+
+
 
 
 
@@ -3292,7 +3592,12 @@ async function speakOnce(key, model, words, timeoutMs) {
       }
 
       if (msg.error) {
-        const detail = msg.error.message ?? msg.error.status ?? JSON.stringify(msg.error);
+        const detail =
+          msg.error.message ??
+          (msg.error.status
+            ? `${msg.error.status}${msg.error.code ? ` (${msg.error.code})` : ""}`
+            : msg.error.code) ??
+          JSON.stringify(msg.error);
         return finish(new Error(`live voice: ${detail}`));
       }
 
@@ -3319,8 +3624,18 @@ async function speakOnce(key, model, words, timeoutMs) {
     }
 
     ws.addEventListener("message", enqueue);
-    ws.addEventListener("close", () => queue.then(() => finish(chunks.length ? null : new Error("live voice: connection closed before any audio"), chunks.length ? pcmToWav(concat(chunks)) : undefined)));
-    ws.addEventListener("error", () => queue.then(() => finish(chunks.length ? null : new Error("live voice: connection error"), chunks.length ? pcmToWav(concat(chunks)) : undefined)));
+    ws.addEventListener("close", (ev) =>
+      queue.then(() => {
+        const closeDetail = ev?.reason ? `connection closed: ${ev.reason}` : "connection closed before any audio";
+        finish(chunks.length ? null : new Error(`live voice: ${closeDetail}`), chunks.length ? pcmToWav(concat(chunks)) : undefined);
+      }),
+    );
+    ws.addEventListener("error", (ev) =>
+      queue.then(() => {
+        const errMsg = ev?.message || ev?.error?.message || (typeof ev === "string" ? ev : "connection error");
+        finish(chunks.length ? null : new Error(`live voice: ${errMsg}`), chunks.length ? pcmToWav(concat(chunks)) : undefined);
+      }),
+    );
 
     if (typeof ws.accept === "function") ws.accept(); // Workers' outbound sockets need this
     try {
@@ -3353,8 +3668,10 @@ async function speakOnce(key, model, words, timeoutMs) {
  * success — a slightly short answer beats an error message.
  */
 async function speak(env, cfg, text, opts = {}) {
-  const key = env.GEMINI_API_KEY;
-  if (!key) throw new Error("live voice: GEMINI_API_KEY is not set");
+  const rawKeys = extractKeys(env);
+  if (!rawKeys.length && !env?.GEMINI_API_KEY) {
+    throw new Error("live voice: GEMINI_API_KEY is not set");
+  }
 
   const words = spokenText(text);
   if (!words) throw new Error("live voice: nothing to say");
@@ -3372,18 +3689,27 @@ async function speak(env, cfg, text, opts = {}) {
     const remaining = timeoutMs - elapsed;
     if (i > 0 && remaining < 2000) break;
 
+    const keyHandle = await acquireKeyWithWait(env, { model, maxWaitMs: 1200, pollIntervalMs: 300 });
+    const key = keyHandle?.key || env?.GEMINI_API_KEY || rawKeys[0];
+
     const t0 = Date.now();
     try {
       const wav = await speakOnce(key, model, words, Math.max(1, remaining));
+      keyHandle?.release();
       attempts.push({ model, ok: true, ms: Date.now() - t0 });
-      opts.onTrace?.({ attempts, chosenModel: model, status: "ok" });
+      try {
+        opts.onTrace?.({ attempts, chosenModel: model, status: "ok" });
+      } catch {}
       return wav;
     } catch (e) {
       const clean = String(e?.message ?? e).replace(/key=[^&\s]+/gi, "key=[REDACTED]");
       lastErr = new Error(clean);
+      keyHandle?.release(lastErr);
       attempts.push({ model, ok: false, error: clean.slice(0, 150), ms: Date.now() - t0 });
-      opts.onTrace?.({ attempts, lastError: clean.slice(0, 150), status: "failed" });
-      if (!/model|not found|unknown|404|unsupported|unavailable|closed before any audio|backend exploded|connection error|refused|failed|timeout/i.test(clean)) {
+      try {
+        opts.onTrace?.({ attempts, lastError: clean.slice(0, 150), status: "failed" });
+      } catch {}
+      if (!/(?:model|not found|unknown|404|unsupported|unavailable|closed|backend exploded|connection|disconnect|refused|failed|timeout|timedout|hang up|reset|econnreset|etimedout|500|502|503|504|server error|no audio|without audio|429|quota|resource_exhausted|rate.?limit)/i.test(clean)) {
         throw lastErr;
       }
     }
@@ -3402,7 +3728,7 @@ const VOICE_NEGATIVE_RE =
  * Fast regex for detecting explicit positive voice requests without waiting for LLM.
  */
 const VOICE_POSITIVE_RE =
-  /(?:ویس|صدا|صوتی|voice).*(?:بفرست|بده|بگو|بخون|توضیح|تعریف|ضبط)|(?:با|به صورت|به شکل)\s*(?:ویس|صدا|صوتی)|(?:برام|برامون)\s*بخون/iu;
+  /(?:ویس|صدا|صوتی|voice)[^\n.!؟?]{0,35}(?:بفرست|بده|بگو|بخون|توضیح بده|تعریف کن|ضبط کن)|(?:با|به صورت|به شکل)\s*(?:ویس|صدا|صوتی)|(?:برام|برامون)\s*بخون/iu;
 
 /**
  * Quick hint check: If the message contains none of these words, it's definitely not voice-related.
@@ -3458,6 +3784,7 @@ async function detectVoiceIntent(env, text, cfg, traceContext = null) {
       provider: {
         ...cfg?.provider,
         kind: "gemini",
+        baseUrl: cfg?.provider?.kind === "gemini" && cfg?.provider?.baseUrl ? cfg.provider.baseUrl : DEFAULT_BASE_URLS.gemini,
         model: "gemma-4-31b",
         modelPool: ["gemma-4-31b", "gemma-4-26b"],
       },
@@ -3577,10 +3904,11 @@ const exhaustedNotice = (resetAt) =>
 /** One answer at a time per chat, bounded so an earlier slow request cannot starve waitUntil. */
 function serialize(key, job) {
   const prev = jobs.get(key) ?? Promise.resolve();
+  let timerId;
   const waitPrev = Promise.race([
     prev.catch(() => {}),
-    new Promise((r) => setTimeout(r, 12_000)),
-  ]);
+    new Promise((r) => { timerId = setTimeout(r, 12_000); }),
+  ]).finally(() => clearTimeout(timerId));
   const next = waitPrev.then(job);
   const tail = next.catch(() => {});
   jobs.set(key, tail);
@@ -3839,6 +4167,12 @@ async function overDailyCap(env, cfg, msg) {
   const last = capNotified.get(msg.chat.id) ?? 0;
   if (Date.now() - last < 60_000) return true;
   capNotified.set(msg.chat.id, Date.now());
+  if (capNotified.size > 1000) {
+    const now = Date.now();
+    for (const [k, v] of capNotified) {
+      if (now - v >= 60_000) capNotified.delete(k);
+    }
+  }
   try {
     await sendText(env.TELEGRAM_BOT_TOKEN, msg.chat.id, DAILY_LIMIT, msg.message_id, msg.message_thread_id);
   } catch {
@@ -3856,21 +4190,26 @@ async function overDailyCap(env, cfg, msg) {
 
 
 
+
 /** A live probe of both the Telegram side and the configured model. */
-async function diagnostics(env) {
+async function diagnostics(env = {}) {
   const out = { provider: null, model: null, checks: {} };
 
-  if (!env.TELEGRAM_BOT_TOKEN) {
+  if (!env?.TELEGRAM_BOT_TOKEN) {
     out.checks.telegram = "TELEGRAM_BOT_TOKEN secret is missing";
   } else {
-    const me = await getMe(env.TELEGRAM_BOT_TOKEN);
-    out.checks.telegram = { ok: !!me?.ok, username: me?.result?.username, error: me?.description };
-    const wh = await getWebhookInfo(env.TELEGRAM_BOT_TOKEN);
-    out.checks.webhook = {
-      url: wh?.result?.url,
-      pending: wh?.result?.pending_update_count,
-      lastError: wh?.result?.last_error_message,
-    };
+    try {
+      const me = await getMe(env.TELEGRAM_BOT_TOKEN);
+      out.checks.telegram = { ok: !!me?.ok, username: me?.result?.username, error: me?.description };
+      const wh = await getWebhookInfo(env.TELEGRAM_BOT_TOKEN);
+      out.checks.webhook = {
+        url: wh?.result?.url,
+        pending: wh?.result?.pending_update_count,
+        lastError: wh?.result?.last_error_message,
+      };
+    } catch (e) {
+      out.checks.telegram = { ok: false, error: String(e?.message ?? e).slice(0, 300) };
+    }
   }
 
   const cfg = (await loadConfig(env, DEFAULT_PERSONAS)).config;
@@ -3882,8 +4221,8 @@ async function diagnostics(env) {
       : `${cfg.provider.baseUrl}/chat/completions`;
 
   out.checks.credentials = {
-    gemini: env.GEMINI_API_KEY ? "set" : "missing",
-    openai: env.API_KEY || env.OPENROUTER_API_KEY ? "set" : "missing",
+    gemini: extractKeys(env).length > 0 || env?.GEMINI_API_KEY ? "set" : "missing",
+    openai: env?.API_KEY || env?.OPENROUTER_API_KEY ? "set" : "missing",
   };
 
   try {
@@ -3900,7 +4239,7 @@ async function diagnostics(env) {
     out.checks.model = out.checks.text;
   }
 
-  if (env.DIAG_IMAGE) {
+  if (env?.DIAG_IMAGE) {
     try {
       // Brief pause so consecutive subrequests do not trip the tight RPM limit or socket reset
       await new Promise((r) => setTimeout(r, 600));
@@ -4103,4 +4442,4 @@ class FileKV {
   }
 }
 
-export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, NodeWebSocket, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, UnknownModelError, acquireKey, acquireKeyWithWait, appendArchive, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, detectMedia, detectVoiceIntent, diagnostics, downloadFile, endpointOf, esc, extractKeys, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, hasMediaPayload, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiText, readPatch, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };
+export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, NodeWebSocket, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, UnknownModelError, VOICE_POSITIVE_RE, acquireKey, acquireKeyWithWait, appendArchive, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, detectMedia, detectVoiceIntent, diagnostics, downloadFile, endpointOf, esc, extractKeys, failedLoginAttempts, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, hasMediaPayload, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiText, readPatch, recordFailedLogin, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText, serialize, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };

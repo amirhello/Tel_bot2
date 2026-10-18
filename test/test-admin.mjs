@@ -1,6 +1,23 @@
 import { assert, t, done, M, env, json, fakeKV } from "./harness.mjs";
+import * as Admin from "../src/admin.js";
+import * as Tools from "../src/tools.js";
+import * as Answer from "../src/answer.js";
+import { clearKeyPoolCache } from "../src/keyPool.js";
+import worker from "../src/index.js";
 
-const { renderDashboard, renderLogin, readPatch, isAuthed, signSecret, handleAdmin } = M;
+const {
+  renderDashboard,
+  renderLogin,
+  readPatch,
+  isAuthed,
+  signSecret,
+  handleAdmin,
+  resetLoginRateLimit,
+  recordFailedLogin,
+  failedLoginAttempts,
+  timingSafeEqual,
+  verifyPassword,
+} = Admin;
 
 const NOOP = { waitUntil() {} };
 
@@ -251,9 +268,8 @@ await t("cookie flags include HttpOnly, SameSite=Strict, and Secure on HTTPS", a
 });
 
 await t("webhook strictly requires valid x-telegram-bot-api-secret-token when ADMIN_PASSWORD is set", async () => {
-  const worker = M.default;
   const e = env({ TELEGRAM_BOT_TOKEN: "123:TEST", ADMIN_PASSWORD: "hunter2" });
-  const want = await M.signWebhookSecret("hunter2");
+  const want = await Tools.signWebhookSecret("hunter2");
 
   // Missing secret header -> 403 Forbidden
   const noHeader = await worker.fetch(new Request("https://x.dev/", {
@@ -281,7 +297,6 @@ await t("webhook strictly requires valid x-telegram-bot-api-secret-token when AD
 });
 
 await t("/setup, /setup/reset, and /diag require admin authentication (401 when unauthorized)", async () => {
-  const worker = M.default;
   const e = env({ ADMIN_PASSWORD: "hunter2", TELEGRAM_BOT_TOKEN: "123:TEST" });
   const cookie = `sayyad_admin=${await signSecret("hunter2")}`;
 
@@ -297,14 +312,176 @@ await t("/setup, /setup/reset, and /diag require admin authentication (401 when 
 });
 
 await t("timingSafeEqual and verifyPassword prevent timing attacks accurately", async () => {
-  assert.equal(M.timingSafeEqual("correct_secret", "correct_secret"), true);
-  assert.equal(M.timingSafeEqual("correct_secret", "wrong_secret"), false);
-  assert.equal(M.timingSafeEqual("short", "longer_string"), false);
-  assert.equal(M.timingSafeEqual(null, "str"), false);
+  assert.equal(timingSafeEqual("correct_secret", "correct_secret"), true);
+  assert.equal(timingSafeEqual("correct_secret", "wrong_secret"), false);
+  assert.equal(timingSafeEqual("short", "longer_string"), false);
+  assert.equal(timingSafeEqual(null, "str"), false);
 
-  assert.equal(await M.verifyPassword("hunter2", "hunter2"), true);
-  assert.equal(await M.verifyPassword("wrong", "hunter2"), false);
-  assert.equal(await M.verifyPassword("", "hunter2"), false);
+  assert.equal(await verifyPassword("hunter2", "hunter2"), true);
+  assert.equal(await verifyPassword("wrong", "hunter2"), false);
+  assert.equal(await verifyPassword("", "hunter2"), false);
+});
+
+await t("/admin/api/keys masks short keys properly with prefix and asterisks", async () => {
+  clearKeyPoolCache();
+  const e = env({ GEMINI_API_KEYS: "shortkey, 1234567890abcdef" });
+  const cookie = `sayyad_admin=${await signSecret("hunter2")}`;
+  const res = await handleAdmin(new Request("https://x.dev/admin/api/keys", { headers: { cookie } }), e, "/admin/api/keys");
+  const data = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(data.count, 2);
+  // Short key (8 chars <= 10) must be masked with first 2 chars + "***"
+  assert.equal(data.keys[0].key, "sh***");
+  assert.ok(!data.keys[0].key.includes("rtkey"), "short key tail must not be exposed");
+  // Long key (> 10 chars) must be masked with first 6 + "..." + last 4
+  assert.equal(data.keys[1].key, "123456...cdef");
+
+  // Also verify that lastError redacts key parameters if present
+  const { getKeyPool } = await import("../src/keyPool.js");
+  const pool = getKeyPool(e);
+  pool[0].lastError = "Failed: https://endpoint?key=leakMeSecret12345";
+  const res2 = await handleAdmin(new Request("https://x.dev/admin/api/keys", { headers: { cookie } }), e, "/admin/api/keys");
+  const data2 = await res2.json();
+  assert.ok(!data2.keys[0].lastError.includes("leakMeSecret12345"), "lastError in /admin/api/keys must redact key");
+  assert.ok(data2.keys[0].lastError.includes("key=[REDACTED]"), "lastError must contain key=[REDACTED]");
+
+  // Very short key (<= 2 chars) must be masked completely with "***" without exposing characters
+  const eShort = env({ GEMINI_API_KEYS: "k, ab" });
+  clearKeyPoolCache();
+  const res3 = await handleAdmin(new Request("https://x.dev/admin/api/keys", { headers: { cookie } }), eShort, "/admin/api/keys");
+  const data3 = await res3.json();
+  assert.equal(data3.keys[0].key, "***");
+  assert.equal(data3.keys[1].key, "***");
+
+  clearKeyPoolCache();
+});
+
+await t("failedLoginAttempts periodic cleanup and size cap at 1000", async () => {
+  resetLoginRateLimit();
+  assert.equal(failedLoginAttempts.size, 0);
+
+  // Seed 1005 entries: 50 expired (> RATE_LIMIT_WINDOW_MS ago) and 955 recent
+  const now = Date.now();
+  const oldTime = now - 6 * 60 * 1000; // 6 minutes ago (> 5m window)
+
+  for (let i = 1; i <= 50; i++) {
+    failedLoginAttempts.set(`10.0.0.${i}`, [oldTime]);
+  }
+  for (let i = 51; i <= 1005; i++) {
+    failedLoginAttempts.set(`10.0.1.${i}`, [now]);
+  }
+  assert.equal(failedLoginAttempts.size, 1005);
+
+  // Calling recordFailedLogin should trigger cleanup because size > 1000
+  // Expired entries (50) should be removed, bringing size down to 955 + 1 = 956 <= 1000
+  recordFailedLogin("10.0.2.1");
+  assert.ok(failedLoginAttempts.size <= 1000, `size should be <= 1000, got ${failedLoginAttempts.size}`);
+  assert.equal(failedLoginAttempts.has("10.0.0.1"), false, "expired entry should be cleaned");
+  assert.equal(failedLoginAttempts.has("10.0.2.1"), true, "new entry should be recorded");
+
+  // Now test hard cap when all entries are fresh (cannot be pruned by expiration)
+  resetLoginRateLimit();
+  for (let i = 1; i <= 1002; i++) {
+    failedLoginAttempts.set(`192.168.1.${i}`, [now]);
+  }
+  assert.equal(failedLoginAttempts.size, 1002);
+
+  recordFailedLogin("192.168.2.1");
+  assert.equal(failedLoginAttempts.size, 1000, `size must be strictly capped at 1000, got ${failedLoginAttempts.size}`);
+  // The oldest keys should have been evicted
+  assert.equal(failedLoginAttempts.has("192.168.1.1"), false, "oldest key should be evicted");
+  assert.equal(failedLoginAttempts.has("192.168.2.1"), true, "newest key should be present");
+
+  // Test LRU recency refresh: when an older IP fails again, its recency is refreshed to tail,
+  // preventing an active attacker from being evicted over older inactive IPs when size > 1000.
+  resetLoginRateLimit();
+  recordFailedLogin("target-attacker"); // inserted at step 0
+  for (let i = 1; i <= 999; i++) {
+    failedLoginAttempts.set(`192.168.0.${i}`, [now]);
+  }
+  assert.equal(failedLoginAttempts.size, 1000);
+
+  // Attacker fails again: this MUST refresh attacker's position to tail
+  recordFailedLogin("target-attacker");
+  // Now map size is still 1000 (not > 1000). Add one more IP to trigger cap cleanup:
+  recordFailedLogin("192.168.99.1");
+  assert.equal(failedLoginAttempts.size, 1000);
+  // target-attacker must NOT have been evicted! The least-recently-active 192.168.0.1 must be evicted.
+  assert.equal(failedLoginAttempts.has("target-attacker"), true, "active attacker must be preserved by LRU order");
+  assert.equal(failedLoginAttempts.has("192.168.0.1"), false, "least recently used entry should be evicted first");
+
+  resetLoginRateLimit();
+});
+
+await t("serialize executes jobs in order and clears timeout timer", async () => {
+  let clearedTimers = 0;
+  const origClearTimeout = globalThis.clearTimeout;
+  globalThis.clearTimeout = (id) => {
+    clearedTimers++;
+    return origClearTimeout(id);
+  };
+
+  try {
+    const order = [];
+    const p1 = Answer.serialize("chat1", async () => {
+      await new Promise((r) => setTimeout(r, 20));
+      order.push("job1");
+      return 1;
+    });
+    const p2 = Answer.serialize("chat1", async () => {
+      order.push("job2");
+      return 2;
+    });
+    const p3 = Answer.serialize("chat2", async () => {
+      order.push("chat2_job");
+      return 3;
+    });
+
+    const results = await Promise.all([p1, p2, p3]);
+    assert.deepEqual(results, [1, 2, 3]);
+    assert.equal(order[0], "chat2_job"); // chat2 not blocked by chat1's 20ms delay
+    assert.equal(order[1], "job1");
+    assert.equal(order[2], "job2"); // job2 waited for job1
+    assert.ok(clearedTimers >= 3, `clearTimeout should be called for each job, got ${clearedTimers}`);
+  } finally {
+    globalThis.clearTimeout = origClearTimeout;
+  }
+});
+
+await t("diagnostics accurately detects gemini credentials from GEMINI_API_KEYS pool or GEMINI_API_KEY", async () => {
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ ok: false, error: "mock" }), { status: 200 });
+  try {
+    // Case 1: multi-key pool GEMINI_API_KEYS set
+    const diagMulti = await Tools.diagnostics({
+      GEMINI_API_KEYS: "AIzaSyTest1, AIzaSyTest2",
+    });
+    assert.equal(diagMulti.checks.credentials.gemini, "set");
+    assert.equal(diagMulti.checks.credentials.openai, "missing");
+
+    // Case 2: single key GEMINI_API_KEY set
+    const diagSingle = await Tools.diagnostics({
+      GEMINI_API_KEY: "AIzaSySingle",
+    });
+    assert.equal(diagSingle.checks.credentials.gemini, "set");
+
+    // Case 3: neither set
+    const diagNone = await Tools.diagnostics({});
+    assert.equal(diagNone.checks.credentials.gemini, "missing");
+
+    // Case 4: undefined env argument (defaults to {})
+    const diagDefault = await Tools.diagnostics();
+    assert.equal(diagDefault.checks.telegram, "TELEGRAM_BOT_TOKEN secret is missing");
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+await t("bot.js startup banner references /admin/api/state and not /admin/api/stats", async () => {
+  const { readFileSync } = await import("node:fs");
+  const code = readFileSync("bot.js", "utf8");
+  assert.ok(code.includes("/admin/api/state"), "must link to /admin/api/state");
+  assert.ok(!code.includes("/admin/api/stats"), "must not link to obsolete /admin/api/stats");
 });
 
 done();

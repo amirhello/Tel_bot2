@@ -4,6 +4,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { nextPacificMidnight } from "./store.js";
 
 let roundRobinIndex = 0;
 let keyPoolCache = null;
@@ -165,8 +166,16 @@ export function acquireKey(env, opts = {}) {
       if (item.rpdCooldownUntil && item.rpdCooldownUntil <= now) {
         item.rpdCooldownUntil = 0;
       }
-      item.modelRpdCooldown = {};
-      item.modelRpmCooldown = {};
+      if (item.modelRpdCooldown) {
+        for (const [m, t] of Object.entries(item.modelRpdCooldown)) {
+          if (t <= now) delete item.modelRpdCooldown[m];
+        }
+      }
+      if (item.modelRpmCooldown) {
+        for (const [m, t] of Object.entries(item.modelRpmCooldown)) {
+          if (t <= now) delete item.modelRpmCooldown[m];
+        }
+      }
     }
   }
 
@@ -235,7 +244,7 @@ export async function acquireKeyWithWait(env, opts = {}) {
     let earliestAvailable = Infinity;
     for (const item of usableKeys) {
       if (item.inUse) {
-        earliestAvailable = Math.min(earliestAvailable, now + 500);
+        earliestAvailable = Math.min(earliestAvailable, now + Math.min(pollIntervalMs, 100));
       } else {
         const modelRpd = opts?.model ? (item.modelRpdCooldown?.[opts.model] || 0) : 0;
         const modelRpm = opts?.model ? (item.modelRpmCooldown?.[opts.model] || 0) : 0;
@@ -268,7 +277,11 @@ export async function acquireKeyWithWait(env, opts = {}) {
 /** Classify error and apply proper cooldown or quarantine. */
 function recordKeyError(item, err, reqModel) {
   const now = Date.now();
-  const msg = String(err?.message ?? err);
+  const rawMsg = String(err?.message ?? err);
+  let msg = rawMsg.replace(/key=[^&\s]+/gi, "key=[REDACTED]");
+  if (item?.key) {
+    msg = msg.split(item.key).join("[REDACTED]");
+  }
   const status = Number(err?.status ?? 0);
   item.lastError = msg.slice(0, 300);
 
@@ -286,17 +299,18 @@ function recordKeyError(item, err, reqModel) {
     return;
   }
 
-  // 3. Daily quota exhaustion -> 24 hours cooldown for model or key
+  // 3. Daily quota exhaustion -> reset at Pacific midnight
   if (
     (status === 429 || status === 503) &&
-    (/per.?day|daily|requests_per_day/i.test(msg) || err?.name === "DailyQuotaError")
+    (/(?:^|[^a-z])(day|daily|rpd|24\s*h|requests_per_day)(?:[^a-z]|$)/i.test(msg) || /per.?day/i.test(msg) || err?.name === "DailyQuotaError")
   ) {
+    const resetAt = err?.resetAt || nextPacificMidnight(now);
     const model = err?.model || reqModel;
     if (model) {
       if (!item.modelRpdCooldown) item.modelRpdCooldown = {};
-      item.modelRpdCooldown[model] = now + 24 * 3600_000;
+      item.modelRpdCooldown[model] = resetAt;
     } else {
-      item.rpdCooldownUntil = now + 24 * 3600_000;
+      item.rpdCooldownUntil = resetAt;
     }
     return;
   }
@@ -340,9 +354,10 @@ export function getKeyPoolStatus(env) {
       const maxCooldown = Math.max(item.rpdCooldownUntil || 0, ...Object.values(item.modelRpdCooldown || {}));
       const hoursLeft = Math.ceil((maxCooldown - now) / 3600_000);
       detail = `Daily quota reached (~${hoursLeft}h left)`;
-    } else if (item.rpmCooldownUntil > now) {
+    } else if (item.rpmCooldownUntil > now || Object.values(item.modelRpmCooldown || {}).some((t) => t > now)) {
       status = "rpm_cooldown";
-      const secsLeft = Math.ceil((item.rpmCooldownUntil - now) / 1000);
+      const maxRpm = Math.max(item.rpmCooldownUntil || 0, ...Object.values(item.modelRpmCooldown || {}));
+      const secsLeft = Math.ceil((maxRpm - now) / 1000);
       detail = `Minute limit cooldown (${secsLeft}s left)`;
     } else if (item.highDemandCooldownUntil > now) {
       status = "busy_cooldown";

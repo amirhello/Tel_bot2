@@ -1,6 +1,23 @@
 import { assert, t, done, M, env, json, fakeKV } from "./harness.mjs";
 
-const { toOpenAIPart, completeOpenAI, toGeminiPart, buildGeminiBody, readGeminiText, thinkingConfig, safetySettings, completeGemini, complete, endpointOf, providerFor, ApiError, hasMediaPayload, isMultimodalModel, mapModelForProvider } = M;
+import {
+  complete,
+  endpointOf,
+  providerFor,
+  hasMediaPayload,
+  isMultimodalModel,
+  mapModelForProvider,
+} from "../src/llm.js";
+import {
+  toGeminiPart,
+  buildGeminiBody,
+  readGeminiText,
+  thinkingConfig,
+  safetySettings,
+  completeGemini,
+} from "../src/providerGemini.js";
+import { toOpenAIPart, completeOpenAI } from "../src/providerOpenai.js";
+import { ApiError } from "../src/http.js";
 
 const cfg = (over = {}) => ({
   ...M.normalizeConfig({ personas: M.DEFAULT_PERSONAS, ...over }, M.DEFAULT_PERSONAS),
