@@ -259,6 +259,7 @@ function defaultConfig(personas) {
     voice: {
       enabled: true,
       model: "gemini-3.8-live",
+      voiceName: "Aoede",
     },
     personas: { ...personas },
   };
@@ -294,6 +295,7 @@ function normalizeConfig(saved, personas) {
   c.voice = {
     enabled: saved?.voice?.enabled !== false,
     model: String(saved?.voice?.model || base.voice.model).trim(),
+    voiceName: String(saved?.voice?.voiceName || base.voice.voiceName || "Aoede").trim(),
   };
 
   c.thinking = THINKING_LEVELS.includes(c.thinking) ? c.thinking : "medium";
@@ -1692,7 +1694,7 @@ function buildSystemPrompt(cfg, opts = {}) {
   const persona = cfg.personas?.[cfg.mode] ?? DEFAULT_PERSONAS.smart;
   const extra = String(cfg.extra ?? "").trim();
   const voiceNote = opts?.isVoice
-    ? "دستور ارسال صوت: این پاسخ قرار است به صورت ویس و فایل صوتی برای کاربر خوانده شود. پاسخی طبیعی، با لحن گفتاری، روان و شنیداری تولید کن و هرگز نگو ویس نمی‌فرستی."
+    ? "دستور ارسال صوت: این پاسخ قرار است مستقیماً به صورت ویس صوتی برای کاربر خوانده شود. کلمات را کاملاً محاوره‌ای، با لحن تهرانی، صمیمی، شکسته و دوستانه بنویس و از عبارات خشک، رسمی و کتابی اصلاً استفاده نکن."
     : "";
   return [BASE_RULES, persona, extra ? `دستورهای اضافه‌ی مدیر:\n${extra}` : "", voiceNote].filter(Boolean).join("\n\n");
 }
@@ -3418,10 +3420,10 @@ const WAV_RATE = 24000; // Live API audio output: PCM 16-bit little-endian, 24 k
 const SPOKEN_MAX = 1500; // ~1.5 min of speech; longer answers would blow the 30 s window
 const STALL_MS = 2500; // no new audio for this long ⇒ the turn is over (turnComplete can be very late)
 
-/** The bot speaks as Sayyad; it must add nothing to the text it was handed. */
+/** The bot speaks with a natural conversational female voice (Aoede). */
 const SPEAK_PROMPT =
-  "تو «سید» هستی. این متن، جواب خودت است؛ فقط و فقط همان را با صدای فارسی روان، گفتاری و صمیمی بخوان. " +
-  "مثل آدم حرف بزن، نه مثل خواندن متن. چیزی اضافه یا کم نکن.";
+  "این متن را با صدای زنانه، لحن گرم، مکث‌های تنفسی طبیعی و شبیه به صحبت کردن با یک دوست صمیمی بخوان، نه مثل روخوانی از روی کتاب. " +
+  "کلمات را با لهجه گفتاری تهرانی، روان و بدون تکلف بیان کن. مثل یک انسان واقعی حرف بزن و چیزی اضافه یا کم نکن.";
 
 let liveTimeoutMs = 25_000; // whole session, comfortably inside the 30 s waitUntil budget
 
@@ -3540,7 +3542,7 @@ async function connectLiveSocket(key) {
  * A turn that produced *some* audio but died before `turnComplete` still counts as a
  * success — a slightly short answer beats an error message.
  */
-async function speakOnce(key, model, words, timeoutMs) {
+async function speakOnce(key, model, words, timeoutMs, voiceName = "Aoede") {
   const ws = await connectLiveSocket(key);
 
   return await new Promise((resolve, reject) => {
@@ -3648,7 +3650,16 @@ async function speakOnce(key, model, words, timeoutMs) {
       send({
         setup: {
           model: `models/${model}`,
-          generationConfig: { responseModalities: ["AUDIO"] },
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: voiceName || "Aoede",
+                },
+              },
+            },
+          },
           systemInstruction: { parts: [{ text: SPEAK_PROMPT }] },
         },
       });
@@ -3679,6 +3690,7 @@ async function speak(env, cfg, text, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? liveTimeoutMs;
   const startAt = Date.now();
   const primary = cfg?.voice?.model || DEFAULT_MODEL;
+  const voiceName = cfg?.voice?.voiceName || "Aoede";
   const pool = [primary, ...FALLBACK_VOICE_MODELS.filter((m) => m !== primary)];
 
   let lastErr;
@@ -3694,7 +3706,7 @@ async function speak(env, cfg, text, opts = {}) {
 
     const t0 = Date.now();
     try {
-      const wav = await speakOnce(key, model, words, Math.max(1, remaining));
+      const wav = await speakOnce(key, model, words, Math.max(1, remaining), voiceName);
       keyHandle?.release();
       attempts.push({ model, ok: true, ms: Date.now() - t0 });
       try {

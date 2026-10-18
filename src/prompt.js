@@ -58,7 +58,7 @@ export function buildSystemPrompt(cfg, opts = {}) {
   const persona = cfg.personas?.[cfg.mode] ?? DEFAULT_PERSONAS.smart;
   const extra = String(cfg.extra ?? "").trim();
   const voiceNote = opts?.isVoice
-    ? "دستور ارسال صوت: این پاسخ قرار است به صورت ویس و فایل صوتی برای کاربر خوانده شود. پاسخی طبیعی، با لحن گفتاری، روان و شنیداری تولید کن و هرگز نگو ویس نمی‌فرستی."
+    ? "دستور ارسال صوت: این پاسخ قرار است مستقیماً به صورت ویس صوتی برای کاربر خوانده شود. کلمات را کاملاً محاوره‌ای، با لحن تهرانی، صمیمی، شکسته و دوستانه بنویس و از عبارات خشک، رسمی و کتابی اصلاً استفاده نکن."
     : "";
   return [BASE_RULES, persona, extra ? `دستورهای اضافه‌ی مدیر:\n${extra}` : "", voiceNote].filter(Boolean).join("\n\n");
 }

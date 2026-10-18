@@ -85,6 +85,7 @@ export function defaultConfig(personas) {
     voice: {
       enabled: true,
       model: "gemini-3.8-live",
+      voiceName: "Aoede",
     },
     personas: { ...personas },
   };
@@ -120,6 +121,7 @@ export function normalizeConfig(saved, personas) {
   c.voice = {
     enabled: saved?.voice?.enabled !== false,
     model: String(saved?.voice?.model || base.voice.model).trim(),
+    voiceName: String(saved?.voice?.voiceName || base.voice.voiceName || "Aoede").trim(),
   };
 
   c.thinking = THINKING_LEVELS.includes(c.thinking) ? c.thinking : "medium";

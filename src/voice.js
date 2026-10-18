@@ -26,10 +26,10 @@ const WAV_RATE = 24000; // Live API audio output: PCM 16-bit little-endian, 24 k
 const SPOKEN_MAX = 1500; // ~1.5 min of speech; longer answers would blow the 30 s window
 const STALL_MS = 2500; // no new audio for this long ⇒ the turn is over (turnComplete can be very late)
 
-/** The bot speaks as Sayyad; it must add nothing to the text it was handed. */
+/** The bot speaks with a natural conversational female voice (Aoede). */
 const SPEAK_PROMPT =
-  "تو «سید» هستی. این متن، جواب خودت است؛ فقط و فقط همان را با صدای فارسی روان، گفتاری و صمیمی بخوان. " +
-  "مثل آدم حرف بزن، نه مثل خواندن متن. چیزی اضافه یا کم نکن.";
+  "این متن را با صدای زنانه، لحن گرم، مکث‌های تنفسی طبیعی و شبیه به صحبت کردن با یک دوست صمیمی بخوان، نه مثل روخوانی از روی کتاب. " +
+  "کلمات را با لهجه گفتاری تهرانی، روان و بدون تکلف بیان کن. مثل یک انسان واقعی حرف بزن و چیزی اضافه یا کم نکن.";
 
 let liveTimeoutMs = 25_000; // whole session, comfortably inside the 30 s waitUntil budget
 
@@ -148,7 +148,7 @@ async function connectLiveSocket(key) {
  * A turn that produced *some* audio but died before `turnComplete` still counts as a
  * success — a slightly short answer beats an error message.
  */
-async function speakOnce(key, model, words, timeoutMs) {
+async function speakOnce(key, model, words, timeoutMs, voiceName = "Aoede") {
   const ws = await connectLiveSocket(key);
 
   return await new Promise((resolve, reject) => {
@@ -256,7 +256,16 @@ async function speakOnce(key, model, words, timeoutMs) {
       send({
         setup: {
           model: `models/${model}`,
-          generationConfig: { responseModalities: ["AUDIO"] },
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: voiceName || "Aoede",
+                },
+              },
+            },
+          },
           systemInstruction: { parts: [{ text: SPEAK_PROMPT }] },
         },
       });
@@ -287,6 +296,7 @@ export async function speak(env, cfg, text, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? liveTimeoutMs;
   const startAt = Date.now();
   const primary = cfg?.voice?.model || DEFAULT_MODEL;
+  const voiceName = cfg?.voice?.voiceName || "Aoede";
   const pool = [primary, ...FALLBACK_VOICE_MODELS.filter((m) => m !== primary)];
 
   let lastErr;
@@ -302,7 +312,7 @@ export async function speak(env, cfg, text, opts = {}) {
 
     const t0 = Date.now();
     try {
-      const wav = await speakOnce(key, model, words, Math.max(1, remaining));
+      const wav = await speakOnce(key, model, words, Math.max(1, remaining), voiceName);
       keyHandle?.release();
       attempts.push({ model, ok: true, ms: Date.now() - t0 });
       try {
