@@ -7,8 +7,17 @@ import { join } from "node:path";
 import { processMessage } from "./src/answer.js";
 import { handleAdmin, isAuthed } from "./src/admin.js";
 import { diagnostics, reportPage } from "./src/tools.js";
-import { getKeyPool, getKeyPoolStatus } from "./src/keyPool.js";
+import { getKeyPool, getKeyPoolStatus, setStateFilePath } from "./src/keyPool.js";
 import { FileKV } from "./src/nodeStore.js";
+import { NodeWebSocket } from "./src/nodeWs.js";
+
+// Persist key pool state across restarts in Node.js daemon
+setStateFilePath(join(process.cwd(), "data", "keys-state.json"));
+
+// Native WebSocket polyfill for Node.js < 21
+if (typeof globalThis.WebSocket !== "function") {
+  globalThis.WebSocket = NodeWebSocket;
+}
 
 // Global unhandled error handlers
 process.on("unhandledRejection", (reason) => console.error("Unhandled Rejection:", reason));

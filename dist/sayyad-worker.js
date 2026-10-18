@@ -1,8 +1,14 @@
 // ============================================================================
 //  Sayyad — Telegram bot on Cloudflare Workers
 //  GENERATED FILE. Do not edit by hand: edit ./src and run "node build.mjs".
-//  Module order, resolved from the import graph: archive.js, http.js, keyPool.js, store.js, providerGemini.js, providerOpenai.js, llm.js, text.js, trigger.js, prompt.js, admin.js, telegram.js, media.js, voice.js, answer.js, tools.js, index.js, nodeStore.js
+//  Module order, resolved from the import graph: archive.js, http.js, keyPool.js, store.js, providerGemini.js, providerOpenai.js, llm.js, text.js, trigger.js, prompt.js, admin.js, telegram.js, media.js, nodeWs.js, voice.js, answer.js, tools.js, index.js, nodeStore.js
 // ============================================================================
+import https from "node:https";
+import http from "node:http";
+import crypto from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+
 
 // ------------------------------ src/archive.js ------------------------------
 // The admin's own copy of everything Telegram delivered. Never sent to the model.
@@ -178,14 +184,7 @@ let keyPoolCache = null;
 let stateFilePath = null;
 
 function getStatePath() {
-  if (stateFilePath) return stateFilePath;
-  try {
-    const cwd = typeof process !== "undefined" && process.cwd ? process.cwd() : ".";
-    if (typeof join === "function") return join(cwd, "data", "keys-state.json");
-    return "keys-state.json";
-  } catch {
-    return "keys-state.json";
-  }
+  return stateFilePath;
 }
 
 function setStateFilePath(path) {
@@ -240,7 +239,7 @@ function loadState(keys) {
   let saved = {};
   const filePath = getStatePath();
   try {
-    if (typeof existsSync === "function" && existsSync(filePath)) {
+    if (filePath && typeof existsSync === "function" && existsSync(filePath)) {
       if (typeof readFileSync === "function") {
         saved = JSON.parse(readFileSync(filePath, "utf-8")) || {};
       }
@@ -273,6 +272,7 @@ function loadState(keys) {
 /** Persist state to local JSON file safely. */
 function saveState(pool) {
   const filePath = getStatePath();
+  if (!filePath) return;
   try {
     if (typeof dirname !== "function" || typeof existsSync !== "function" || typeof writeFileSync !== "function") return;
     const dir = dirname(filePath);
@@ -2898,6 +2898,199 @@ async function collectMedia(env, msg, cfg) {
   return { media: parts, note: notes.length ? `[${notes.join(" | ")}]` : "" };
 }
 
+// ------------------------------ src/nodeWs.js ------------------------------
+// Native zero-dependency WebSocket client for Node.js (RFC 6455 over node:https).
+// Enables high-performance WebSocket connections in Node.js 18+ without external packages.
+
+
+
+
+
+class NodeWebSocket {
+  constructor(urlStr) {
+    this.url = new URL(urlStr);
+    this.readyState = 0; // 0: CONNECTING, 1: OPEN, 2: CLOSING, 3: CLOSED
+    this.binaryType = "arraybuffer";
+    this._listeners = { message: [], open: [], close: [], error: [] };
+    this._socket = null;
+    this._connect();
+  }
+
+  addEventListener(type, fn) {
+    if (this._listeners[type]) {
+      this._listeners[type].push(fn);
+    }
+  }
+
+  removeEventListener(type, fn) {
+    if (this._listeners[type]) {
+      this._listeners[type] = this._listeners[type].filter((cb) => cb !== fn);
+    }
+  }
+
+  _emit(type, event) {
+    const list = this._listeners[type] || [];
+    for (const fn of [...list]) {
+      try {
+        fn(event);
+      } catch (err) {
+        console.error(`NodeWebSocket listener error (${type}):`, err);
+      }
+    }
+  }
+
+  _connect() {
+    const isWss = this.url.protocol === "wss:" || this.url.protocol === "https:";
+    const transport = isWss ? https : http;
+    const defaultPort = isWss ? 443 : 80;
+    const port = this.url.port ? parseInt(this.url.port, 10) : defaultPort;
+    const secKey = crypto.randomBytes(16).toString("base64");
+
+    const req = transport.request({
+      hostname: this.url.hostname,
+      port,
+      path: this.url.pathname + this.url.search,
+      headers: {
+        Connection: "Upgrade",
+        Upgrade: "websocket",
+        "Sec-WebSocket-Key": secKey,
+        "Sec-WebSocket-Version": "13",
+      },
+    });
+
+    req.on("upgrade", (res, socket, head) => {
+      this._socket = socket;
+      this.readyState = 1; // OPEN
+      this._emit("open", {});
+
+      let buffer = head && head.length ? Buffer.from(head) : Buffer.alloc(0);
+
+      socket.on("data", (chunk) => {
+        buffer = Buffer.concat([buffer, chunk]);
+
+        while (buffer.length >= 2) {
+          const byte1 = buffer[0];
+          const byte2 = buffer[1];
+          const opcode = byte1 & 0x0f;
+          let payloadLen = byte2 & 0x7f;
+          let offset = 2;
+
+          if (payloadLen === 126) {
+            if (buffer.length < offset + 2) break;
+            payloadLen = buffer.readUInt16BE(offset);
+            offset += 2;
+          } else if (payloadLen === 127) {
+            if (buffer.length < offset + 8) break;
+            payloadLen = Number(buffer.readBigUInt64BE(offset));
+            offset += 8;
+          }
+
+          if (buffer.length < offset + payloadLen) break;
+
+          const payload = buffer.subarray(offset, offset + payloadLen);
+          buffer = buffer.subarray(offset + payloadLen);
+
+          if (opcode === 8) {
+            // CLOSE
+            this.readyState = 3;
+            this._emit("close", { code: 1000, reason: "server closed" });
+            socket.end();
+            return;
+          } else if (opcode === 9) {
+            // PING -> reply PONG
+            const pong = Buffer.from([0x8a, 0x00]);
+            socket.write(pong);
+          } else if (opcode === 1) {
+            // TEXT
+            this._emit("message", { data: payload.toString("utf8") });
+          } else if (opcode === 2) {
+            // BINARY
+            const arr = new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength);
+            this._emit("message", { data: arr });
+          }
+        }
+      });
+
+      socket.on("close", () => {
+        this.readyState = 3;
+        this._emit("close", {});
+      });
+
+      socket.on("error", (err) => {
+        this.readyState = 3;
+        this._emit("error", err);
+      });
+    });
+
+    req.on("error", (err) => {
+      this.readyState = 3;
+      this._emit("error", err);
+    });
+
+    req.end();
+  }
+
+  send(data) {
+    if (this.readyState !== 1 || !this._socket) {
+      throw new Error("WebSocket is not open");
+    }
+
+    const payload = Buffer.isBuffer(data)
+      ? data
+      : typeof data === "string"
+      ? Buffer.from(data, "utf8")
+      : Buffer.from(data);
+
+    const len = payload.length;
+    let header;
+    let offset = 0;
+
+    const isBinary = Buffer.isBuffer(data) || data instanceof Uint8Array;
+    const opcode = isBinary ? 0x82 : 0x81;
+
+    if (len < 126) {
+      header = Buffer.alloc(6);
+      header[0] = opcode;
+      header[1] = 0x80 | len; // Mask bit = 1
+      offset = 2;
+    } else if (len <= 65535) {
+      header = Buffer.alloc(8);
+      header[0] = opcode;
+      header[1] = 0x80 | 126;
+      header.writeUInt16BE(len, 2);
+      offset = 4;
+    } else {
+      header = Buffer.alloc(14);
+      header[0] = opcode;
+      header[1] = 0x80 | 127;
+      header.writeBigUInt64BE(BigInt(len), 2);
+      offset = 10;
+    }
+
+    const mask = crypto.randomBytes(4);
+    mask.copy(header, offset, 0, 4);
+
+    const maskedPayload = Buffer.alloc(len);
+    for (let i = 0; i < len; i++) {
+      maskedPayload[i] = payload[i] ^ mask[i % 4];
+    }
+
+    this._socket.write(Buffer.concat([header, maskedPayload]));
+  }
+
+  close(code = 1000, reason = "") {
+    this.readyState = 2;
+    if (this._socket) {
+      const closeFrame = Buffer.from([0x88, 0x80, 0, 0, 0, 0]);
+      try {
+        this._socket.write(closeFrame);
+      } catch {}
+      this._socket.end();
+    }
+    this.readyState = 3;
+  }
+}
+
 // ------------------------------ src/voice.js ------------------------------
 // Voice replies through the Gemini Live API — one short-lived session per answer.
 //
@@ -2908,6 +3101,7 @@ async function collectMedia(env, msg, cfg) {
 //
 // The session is one-shot — setup, one turn, close — because the webhook answers
 // immediately and only gets one waitUntil window (30 s) to finish the job.
+
 
 
 
@@ -3019,16 +3213,26 @@ async function connectLiveSocket(key) {
       const ws = new globalThis.WebSocket(wsUrl);
       if (ws) return ws;
     } catch {
-      /* fallback to fetch */
+      /* fallback */
     }
   }
 
-  const res = await fetch(`${LIVE_ENDPOINT}?key=${encodeURIComponent(key)}`, {
-    headers: { Upgrade: "websocket" },
-  });
-  const ws = res?.webSocket;
-  if (!ws) throw new Error("live voice: WebSocket upgrade was refused");
-  return ws;
+  // Cloudflare Workers outbound WebSocket (fetch with Upgrade header)
+  try {
+    const res = await fetch(`${LIVE_ENDPOINT}?key=${encodeURIComponent(key)}`, {
+      headers: { Upgrade: "websocket" },
+    });
+    if (res?.webSocket) return res.webSocket;
+  } catch {
+    /* fetch() throws in Node.js on Upgrade header */
+  }
+
+  // Node.js fallback: pure built-in https WebSocket client
+  if (typeof process !== "undefined" && process?.versions?.node) {
+    return new NodeWebSocket(wsUrl);
+  }
+
+  throw new Error("live voice: WebSocket upgrade was refused");
 }
 
 /**
@@ -3179,7 +3383,7 @@ async function speak(env, cfg, text, opts = {}) {
       lastErr = new Error(clean);
       attempts.push({ model, ok: false, error: clean.slice(0, 150), ms: Date.now() - t0 });
       opts.onTrace?.({ attempts, lastError: clean.slice(0, 150), status: "failed" });
-      if (!/model|not found|unknown|404|unsupported|unavailable|closed before any audio/i.test(clean)) {
+      if (!/model|not found|unknown|404|unsupported|unavailable|closed before any audio|backend exploded|connection error|refused|failed|timeout/i.test(clean)) {
         throw lastErr;
       }
     }
@@ -3899,4 +4103,4 @@ class FileKV {
   }
 }
 
-export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, UnknownModelError, acquireKey, acquireKeyWithWait, appendArchive, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, detectMedia, detectVoiceIntent, diagnostics, downloadFile, endpointOf, esc, extractKeys, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, hasMediaPayload, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiText, readPatch, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };
+export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, NodeWebSocket, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, UnknownModelError, acquireKey, acquireKeyWithWait, appendArchive, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, detectMedia, detectVoiceIntent, diagnostics, downloadFile, endpointOf, esc, extractKeys, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, hasMediaPayload, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiText, readPatch, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };

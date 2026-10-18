@@ -10,14 +10,7 @@ let keyPoolCache = null;
 let stateFilePath = null;
 
 function getStatePath() {
-  if (stateFilePath) return stateFilePath;
-  try {
-    const cwd = typeof process !== "undefined" && process.cwd ? process.cwd() : ".";
-    if (typeof join === "function") return join(cwd, "data", "keys-state.json");
-    return "keys-state.json";
-  } catch {
-    return "keys-state.json";
-  }
+  return stateFilePath;
 }
 
 export function setStateFilePath(path) {
@@ -72,7 +65,7 @@ function loadState(keys) {
   let saved = {};
   const filePath = getStatePath();
   try {
-    if (typeof existsSync === "function" && existsSync(filePath)) {
+    if (filePath && typeof existsSync === "function" && existsSync(filePath)) {
       if (typeof readFileSync === "function") {
         saved = JSON.parse(readFileSync(filePath, "utf-8")) || {};
       }
@@ -105,6 +98,7 @@ function loadState(keys) {
 /** Persist state to local JSON file safely. */
 export function saveState(pool) {
   const filePath = getStatePath();
+  if (!filePath) return;
   try {
     if (typeof dirname !== "function" || typeof existsSync !== "function" || typeof writeFileSync !== "function") return;
     const dir = dirname(filePath);

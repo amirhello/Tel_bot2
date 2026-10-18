@@ -182,5 +182,6 @@ await t("per-model daily quota only cools down that specific model", () => {
 
 import { unlinkSync } from "node:fs";
 try { unlinkSync("./test-keys-state.json"); } catch {}
+setStateFilePath(null);
 
 done("keypool");

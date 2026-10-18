@@ -9,6 +9,7 @@
 // immediately and only gets one waitUntil window (30 s) to finish the job.
 
 import { complete } from "./llm.js";
+import { NodeWebSocket } from "./nodeWs.js";
 
 const LIVE_ENDPOINT =
   "https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
@@ -118,16 +119,26 @@ async function connectLiveSocket(key) {
       const ws = new globalThis.WebSocket(wsUrl);
       if (ws) return ws;
     } catch {
-      /* fallback to fetch */
+      /* fallback */
     }
   }
 
-  const res = await fetch(`${LIVE_ENDPOINT}?key=${encodeURIComponent(key)}`, {
-    headers: { Upgrade: "websocket" },
-  });
-  const ws = res?.webSocket;
-  if (!ws) throw new Error("live voice: WebSocket upgrade was refused");
-  return ws;
+  // Cloudflare Workers outbound WebSocket (fetch with Upgrade header)
+  try {
+    const res = await fetch(`${LIVE_ENDPOINT}?key=${encodeURIComponent(key)}`, {
+      headers: { Upgrade: "websocket" },
+    });
+    if (res?.webSocket) return res.webSocket;
+  } catch {
+    /* fetch() throws in Node.js on Upgrade header */
+  }
+
+  // Node.js fallback: pure built-in https WebSocket client
+  if (typeof process !== "undefined" && process?.versions?.node) {
+    return new NodeWebSocket(wsUrl);
+  }
+
+  throw new Error("live voice: WebSocket upgrade was refused");
 }
 
 /**
@@ -278,7 +289,7 @@ export async function speak(env, cfg, text, opts = {}) {
       lastErr = new Error(clean);
       attempts.push({ model, ok: false, error: clean.slice(0, 150), ms: Date.now() - t0 });
       opts.onTrace?.({ attempts, lastError: clean.slice(0, 150), status: "failed" });
-      if (!/model|not found|unknown|404|unsupported|unavailable|closed before any audio/i.test(clean)) {
+      if (!/model|not found|unknown|404|unsupported|unavailable|closed before any audio|backend exploded|connection error|refused|failed|timeout/i.test(clean)) {
         throw lastErr;
       }
     }

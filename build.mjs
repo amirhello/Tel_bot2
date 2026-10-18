@@ -27,6 +27,7 @@ function resolveModule(file, spec) {
 const files = readdirSync(SRC).filter((f) => f.endsWith(".js")).sort();
 const sources = new Map();
 const edges = new Map();
+const nodeImports = new Set();
 
 for (const file of files) {
   const raw = readFileSync(join(SRC, file), "utf8");
@@ -34,7 +35,10 @@ for (const file of files) {
 
   const deps = new Set();
   for (const m of raw.matchAll(IMPORT_RE)) {
-    if (m[2].startsWith("node:")) continue;
+    if (m[2].startsWith("node:")) {
+      nodeImports.add(m[0].trim());
+      continue;
+    }
     deps.add(resolveModule(file, m[2]));
   }
   edges.set(file, deps);
@@ -83,11 +87,38 @@ for (const file of ordered) {
   }
 }
 
+const nodeNamedImports = new Map();
+const nodeDefaultImports = new Map();
+for (const rawImport of nodeImports) {
+  const m = rawImport.match(/^import\s+([\s\S]*?)\s+from\s+["'](node:[^"']+)["']/);
+  if (!m) continue;
+  const mod = m[2];
+  const clause = m[1].trim();
+  if (clause.startsWith("{") && clause.endsWith("}")) {
+    const names = clause.slice(1, -1).split(",").map((s) => s.trim()).filter(Boolean);
+    if (!nodeNamedImports.has(mod)) nodeNamedImports.set(mod, new Set());
+    for (const n of names) nodeNamedImports.get(mod).add(n);
+  } else {
+    if (!nodeDefaultImports.has(mod)) nodeDefaultImports.set(mod, new Set());
+    nodeDefaultImports.get(mod).add(clause);
+  }
+}
+
+const nodeStatements = [];
+for (const [mod, defaults] of nodeDefaultImports) {
+  for (const d of defaults) nodeStatements.push(`import ${d} from "${mod}";`);
+}
+for (const [mod, names] of nodeNamedImports) {
+  nodeStatements.push(`import { ${Array.from(names).sort().join(", ")} } from "${mod}";`);
+}
+
 const banner = `// ============================================================================
 //  Sayyad — Telegram bot on Cloudflare Workers
 //  GENERATED FILE. Do not edit by hand: edit ./src and run "node build.mjs".
 //  Module order, resolved from the import graph: ${ordered.join(", ")}
-// ============================================================================`;
+// ============================================================================
+${nodeStatements.join("\n")}
+`;
 
 const body = ordered
   .map((f) => `\n// ------------------------------ src/${f} ------------------------------\n${strip(sources.get(f), f)}\n`)
