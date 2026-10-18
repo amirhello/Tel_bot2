@@ -36,6 +36,7 @@ function archiveRecord(msg, outcome) {
     if (outcome.voice !== undefined) r.voice = outcome.voice;
     if (outcome.voiceError) r.verr = String(outcome.voiceError).slice(0, 500);
     if (outcome.tgOut) r.tgOut = String(outcome.tgOut).slice(0, 300);
+    if (outcome.trace) r.trace = outcome.trace;
   }
   return r;
 }
@@ -1184,11 +1185,18 @@ async function runGeminiPool(env, cfg, payload) {
   const quota = await loadQuota(env);
   const now = Date.now();
   const dirty = new Set();
+  const trace = [];
   let last;
 
   for (const model of pool) {
-    if ((quota[model] ?? 0) > now) continue;
-    if ((minuteQuota.get(model) ?? 0) > now) continue;
+    if ((quota[model] ?? 0) > now) {
+      trace.push({ model, status: "skipped_quota_parked", error: "model parked until quota reset" });
+      continue;
+    }
+    if ((minuteQuota.get(model) ?? 0) > now) {
+      trace.push({ model, status: "skipped_minute_parked", error: "model temporarily paused" });
+      continue;
+    }
 
     const poolKeys = getKeyPool(env);
     const usableKeys = poolKeys.filter((k) => !k.disabled);
@@ -1203,39 +1211,49 @@ async function runGeminiPool(env, cfg, payload) {
       attemptsOnModel++;
       const keyHandle = await acquireKeyWithWait(env, { model, maxWaitMs: 0 });
       if (!keyHandle) {
+        trace.push({ model, status: "no_key_available", error: "all keys in cooldown or busy" });
         break; // No available key for this model
       }
 
       const apiKey = keyHandle.key;
+      const attemptStart = Date.now();
 
       try {
         const use = { ...cfg, apiKey, provider: { ...cfg.provider, model } };
         const r = await completeGemini(env, use, payload);
+        const ms = Date.now() - attemptStart;
+        trace.push({ model, keyIndex: keyHandle.index, status: "ok", ms });
         keyHandle.release();
         if (dirty.size) await saveQuota(env, quota);
-        return { ...r, model };
+        return { ...r, model, trace };
       } catch (e) {
+        const ms = Date.now() - attemptStart;
         last = e;
         lastModelQuotaError = e;
         keyHandle.release(e);
 
         if (e instanceof DailyQuotaError) {
+          trace.push({ model, keyIndex: keyHandle.index, status: "daily_quota (429)", error: e.message, ms });
           modelDailyFailures++;
           continue; // Try next key for this model
         }
         if (e instanceof MinuteQuotaError) {
+          trace.push({ model, keyIndex: keyHandle.index, status: "minute_quota (429)", error: e.message, ms });
           modelMinuteFailures++;
           continue; // Try next key for this model
         }
         if (e instanceof UnknownModelError) {
+          trace.push({ model, keyIndex: keyHandle.index, status: "model_not_found (404)", error: e.message, ms });
           quota[e.model] = nextPacificMidnight();
           dirty.add(e.model);
           break; // A 404 model name cannot succeed with any key
         }
         if (/quota|resource_exhausted|high demand|spikes in demand|overloaded|temporarily unavailable/i.test(e?.message)) {
+          trace.push({ model, keyIndex: keyHandle.index, status: "high_demand (429)", error: e?.message, ms });
           modelMinuteFailures++;
           continue;
         }
+        trace.push({ model, keyIndex: keyHandle.index, status: "error", error: String(e?.message ?? e).slice(0, 200), ms });
         throw e;
       }
     }
@@ -1274,9 +1292,13 @@ async function runGeminiPool(env, cfg, payload) {
   if (last instanceof DailyQuotaError || last instanceof MinuteQuotaError || anyParked) {
     const unparkTimes = pool.map((m) => Math.max(quota[m] ?? 0, minuteQuota.get(m) ?? 0)).filter((t) => t > now);
     const resumeAt = unparkTimes.length ? Math.min(...unparkTimes) : poolResumeTime(quota, pool);
-    throw new PoolExhausted(resumeAt, last?.message);
+    const err = new PoolExhausted(resumeAt, last?.message);
+    err.trace = trace;
+    throw err;
   }
-  throw last ?? new PoolExhausted(nextPacificMidnight(), "no model available");
+  const err = last ?? new PoolExhausted(nextPacificMidnight(), "no model available");
+  err.trace = trace;
+  throw err;
 }
 
 /** Every model in the pool is spent until `resetAt`. Carries the exact hour it frees up. */
@@ -1297,7 +1319,10 @@ async function complete(env, cfg, payload) {
       if (!isCredentialError(e)) throw e;
       const baseUrl = DEFAULT_BASE_URLS.openai;
       const model = mapModelForProvider(cfg.provider?.model, "openai", baseUrl);
-      return completeOpenAI(env, { ...cfg, provider: { ...cfg.provider, kind: "openai", model, baseUrl } }, payload);
+      const t0 = Date.now();
+      const r = await completeOpenAI(env, { ...cfg, provider: { ...cfg.provider, kind: "openai", model, baseUrl } }, payload);
+      const openAiTrace = [...(e.trace || []), { provider: "openai", model, status: "ok", ms: Date.now() - t0 }];
+      return { ...r, model, trace: openAiTrace };
     }
   }
 
@@ -1316,7 +1341,9 @@ async function complete(env, cfg, payload) {
       },
     };
     try {
-      return await providerFor(use)(env, use, payload);
+      const t0 = Date.now();
+      const r = await providerFor(use)(env, use, payload);
+      return { ...r, model, trace: [{ provider: kind, model, status: "ok", ms: Date.now() - t0 }] };
     } catch (e) {
       last = e;
       if (!isCredentialError(e)) throw e;
@@ -1601,6 +1628,7 @@ const BASE_RULES = `تو «سید» هستی، یک ربات تلگرام. اس�
 - هرگز پیام خودت را تکرار نکن و هرگز نقش کاربر را بازی نکن.
 - اگر چیزی را نمی‌دانی یا مطمئن نیستی، صادقانه بگو و حدس الکی نزن.
 - حافظه‌ای از پیام‌های قبلی نداری؛ فقط چیزی را می‌بینی که در همین درخواست برایت فرستاده شده.
+- تو قابلیت ارسال ویس و پیام صوتی (Voice Message) داری. اگر کاربر خواست با صدا، ویس یا پادکست پاسخ دهی، یک متن روان، گفتاری و صمیمی برای خوانده‌شدن تولید کن و هرگز نگو ویس نمی‌فرستم یا توانایی ارسال صدا ندارم.
 - اگر کاربر فقط کلمه «سید» یا یک سلام بی‌حرف و معنی نوشته و درخواست مشخصی ندارد، یک جمله‌ی باحال، کوتاه و پرانرژی بگو که بپرسد چه می‌خواهد — یک سوال جالب، یا یک تیکه‌ی کوتاه. این جمله هرگز نباید تکراری و خشک باشد.`;
 
 const DEFAULT_PERSONAS = {
@@ -1629,10 +1657,13 @@ const DEFAULT_PERSONAS = {
 };
 
 /** Base rules + the selected persona + the admin's extra instructions. */
-function buildSystemPrompt(cfg) {
+function buildSystemPrompt(cfg, opts = {}) {
   const persona = cfg.personas?.[cfg.mode] ?? DEFAULT_PERSONAS.smart;
   const extra = String(cfg.extra ?? "").trim();
-  return [BASE_RULES, persona, extra ? `دستورهای اضافه‌ی مدیر:\n${extra}` : ""].filter(Boolean).join("\n\n");
+  const voiceNote = opts?.isVoice
+    ? "دستور ارسال صوت: این پاسخ قرار است به صورت ویس و فایل صوتی برای کاربر خوانده شود. پاسخی طبیعی، با لحن گفتاری، روان و شنیداری تولید کن و هرگز نگو ویس نمی‌فرستی."
+    : "";
+  return [BASE_RULES, persona, extra ? `دستورهای اضافه‌ی مدیر:\n${extra}` : "", voiceNote].filter(Boolean).join("\n\n");
 }
 
 /** The text of the message being replied to, if any. */
@@ -1912,6 +1943,12 @@ label.check input{width:auto}
 .msg{white-space:pre-wrap;word-break:break-word;background:#111722;border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:8px;direction:rtl;text-align:right}
 .replybox{white-space:pre-wrap;word-break:break-word;background:#0d1e16;border:1px solid #1a4427;border-radius:8px;padding:10px;margin-top:8px;direction:rtl;text-align:right}
 .errbox{white-space:pre-wrap;word-break:break-word;background:#241113;border:1px solid #5a1e22;border-radius:8px;padding:10px;margin-top:8px;color:#fca5a5;direction:ltr;text-align:left;font-family:ui-monospace,monospace;font-size:13px}
+.tracebox{background:#080c14;border:1px solid #1f293d;border-radius:8px;padding:12px;margin-top:10px;font-family:ui-monospace,monospace;font-size:12px;color:#94a3b8;direction:ltr;text-align:left}
+.tracetitle{font-weight:700;color:#38bdf8;margin-bottom:8px;font-size:13px}
+.traceline{margin:5px 0}
+.traceul{margin:4px 0 8px 18px;padding:0;list-style:disc}
+.traceul li{margin:3px 0}
+.tracebox code{background:#172033;padding:2px 5px;border-radius:4px;color:#e2e8f0;font-size:11px}
 `;
 
 const LOGIN = `<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -2206,7 +2243,15 @@ function logCard(it){
   sum.appendChild(el("span", tagCls, tagText));
   if (it.model) sum.appendChild(el("span", "tag", it.model));
   if (it.ms !== undefined) sum.appendChild(el("span", "tag", it.ms + " ms"));
-  if (it.verr) sum.appendChild(el("span", "tag err", "voice err"));
+  if (it.voice !== undefined) {
+    if (it.voice) {
+      sum.appendChild(el("span", "tag on", "🎙️ voice"));
+    } else if (it.verr) {
+      sum.appendChild(el("span", "tag err", "voice fallback"));
+    }
+  } else if (it.verr) {
+    sum.appendChild(el("span", "tag err", "voice err"));
+  }
   sum.appendChild(el("span", "where", (it.c && it.c.t) || ""));
   sum.appendChild(el("span", "prev", (it.k || "") + " · " + (it.x || "").replace(/\\s+/g, " ").slice(0, 70)));
   det.appendChild(sum);
@@ -2242,6 +2287,103 @@ function logCard(it){
     er.appendChild(el("b", null, "Error: "));
     er.appendChild(document.createTextNode(it.err));
     body.appendChild(er);
+  }
+  if (it.trace) {
+    var trBox = el("div", "tracebox");
+    trBox.appendChild(el("div", "tracetitle", "⚙️ Execution Pipeline Trace:"));
+
+    if (it.trace.intent) {
+      var intLine = el("div", "traceline");
+      intLine.appendChild(el("b", null, "• Intent: "));
+      var isReq = it.trace.intent.requested;
+      intLine.appendChild(el("span", "tag" + (isReq ? " on" : ""), isReq ? "🎙️ Voice Requested" : "💬 Text Only"));
+      intLine.appendChild(document.createTextNode(" via "));
+      intLine.appendChild(el("code", null, it.trace.intent.method || "default"));
+      if (it.trace.intent.reason) {
+        intLine.appendChild(document.createTextNode(" (" + it.trace.intent.reason + ")"));
+      }
+      trBox.appendChild(intLine);
+    }
+
+    if (it.trace.llm) {
+      var llmLine = el("div", "traceline");
+      llmLine.appendChild(el("b", null, "• LLM Routing: "));
+      if (it.trace.llm.chosenModel) {
+        llmLine.appendChild(document.createTextNode("Selected "));
+        llmLine.appendChild(el("code", null, it.trace.llm.chosenModel));
+      }
+      trBox.appendChild(llmLine);
+
+      if (Array.isArray(it.trace.llm.attempts) && it.trace.llm.attempts.length) {
+        var attUl = el("ul", "traceul");
+        it.trace.llm.attempts.forEach(function(att) {
+          var li = el("li", null);
+          var icon = att.status === "ok" ? "✅ " : "⚠️ ";
+          li.appendChild(document.createTextNode(icon));
+          li.appendChild(el("code", null, att.model));
+          if (att.keyIndex !== undefined) {
+            li.appendChild(document.createTextNode(" (Key #" + (att.keyIndex + 1) + ")"));
+          }
+          li.appendChild(document.createTextNode(": "));
+          li.appendChild(el("b", null, att.status));
+          if (att.ms !== undefined) {
+            li.appendChild(document.createTextNode(" [" + att.ms + "ms]"));
+          }
+          if (att.error) {
+            li.appendChild(document.createTextNode(" — " + att.error));
+          }
+          attUl.appendChild(li);
+        });
+        trBox.appendChild(attUl);
+      }
+    }
+
+    if (it.trace.voice) {
+      var vLine = el("div", "traceline");
+      var isVOk = it.trace.voice.status === "delivered";
+      vLine.appendChild(el("b", null, "• Voice Synthesis: "));
+      vLine.appendChild(document.createTextNode((isVOk ? "✅ " : "❌ ") + "Status: "));
+      vLine.appendChild(el("b", null, it.trace.voice.status));
+      if (it.trace.voice.chosenModel) {
+        vLine.appendChild(document.createTextNode(" (Model: "));
+        vLine.appendChild(el("code", null, it.trace.voice.chosenModel));
+        vLine.appendChild(document.createTextNode(")"));
+      }
+      trBox.appendChild(vLine);
+
+      if (Array.isArray(it.trace.voice.attempts) && it.trace.voice.attempts.length) {
+        var vUl = el("ul", "traceul");
+        it.trace.voice.attempts.forEach(function(vAtt) {
+          var li = el("li", null);
+          li.appendChild(document.createTextNode(vAtt.ok ? "✅ " : "❌ "));
+          li.appendChild(el("code", null, vAtt.model));
+          li.appendChild(document.createTextNode(": " + (vAtt.ok ? "Success" : "Failed")));
+          if (vAtt.ms !== undefined) {
+            li.appendChild(document.createTextNode(" [" + vAtt.ms + "ms]"));
+          }
+          if (vAtt.error) {
+            li.appendChild(document.createTextNode(" — " + vAtt.error));
+          }
+          vUl.appendChild(li);
+        });
+        trBox.appendChild(vUl);
+      }
+    }
+
+    if (it.trace.delivery) {
+      var dLine = el("div", "traceline");
+      dLine.appendChild(el("b", null, "• Telegram Delivery: "));
+      var dKind = it.trace.delivery.kind === "voice" ? "🎙️ Voice Audio File (WAV)"
+                : it.trace.delivery.kind === "text_fallback" ? "⚠️ Text Fallback (Voice failed)"
+                : "💬 Standard Text";
+      dLine.appendChild(el("span", "tag" + (it.trace.delivery.kind === "voice" ? " on" : ""), dKind));
+      if (it.trace.delivery.reason) {
+        dLine.appendChild(document.createTextNode(" (" + it.trace.delivery.reason + ")"));
+      }
+      trBox.appendChild(dLine);
+    }
+
+    body.appendChild(trBox);
   }
   det.appendChild(body);
   return det;
@@ -3019,17 +3161,24 @@ async function speak(env, cfg, text, opts = {}) {
   const pool = [primary, ...FALLBACK_VOICE_MODELS.filter((m) => m !== primary)];
 
   let lastErr;
+  const attempts = [];
   for (let i = 0; i < pool.length; i++) {
     const model = pool[i];
     const elapsed = Date.now() - startAt;
     const remaining = timeoutMs - elapsed;
     if (i > 0 && remaining < 2000) break;
 
+    const t0 = Date.now();
     try {
-      return await speakOnce(key, model, words, Math.max(1, remaining));
+      const wav = await speakOnce(key, model, words, Math.max(1, remaining));
+      attempts.push({ model, ok: true, ms: Date.now() - t0 });
+      opts.onTrace?.({ attempts, chosenModel: model, status: "ok" });
+      return wav;
     } catch (e) {
       const clean = String(e?.message ?? e).replace(/key=[^&\s]+/gi, "key=[REDACTED]");
       lastErr = new Error(clean);
+      attempts.push({ model, ok: false, error: clean.slice(0, 150), ms: Date.now() - t0 });
+      opts.onTrace?.({ attempts, lastError: clean.slice(0, 150), status: "failed" });
       if (!/model|not found|unknown|404|unsupported|unavailable|closed before any audio/i.test(clean)) {
         throw lastErr;
       }
@@ -3071,20 +3220,32 @@ const INTENT_SYSTEM_PROMPT =
  * Detect if user message is asking for a voice reply.
  * Uses fast regex for clear cases, and Gemma 4 for colloquial/nuanced Persian requests.
  */
-async function detectVoiceIntent(env, text, cfg) {
-  if (cfg?.voice?.enabled === false) return false;
+async function detectVoiceIntent(env, text, cfg, traceContext = null) {
+  if (cfg?.voice?.enabled === false) {
+    if (traceContext) traceContext.intent = { requested: false, reason: "voice disabled in config" };
+    return false;
+  }
   if (!text || typeof text !== "string") return false;
   const clean = text.trim();
   if (!clean) return false;
 
   // 1. If text has no hint of voice/audio words at all, skip immediately without LLM call
-  if (!VOICE_HINT_RE.test(clean)) return false;
+  if (!VOICE_HINT_RE.test(clean)) {
+    if (traceContext) traceContext.intent = { requested: false, method: "fast_hint_filter", reason: "no voice keywords in text" };
+    return false;
+  }
 
   // 2. Fast negative check
-  if (VOICE_NEGATIVE_RE.test(clean)) return false;
+  if (VOICE_NEGATIVE_RE.test(clean)) {
+    if (traceContext) traceContext.intent = { requested: false, method: "fast_regex_negative", reason: "explicit negative request" };
+    return false;
+  }
 
   // 3. Fast positive check
-  if (VOICE_POSITIVE_RE.test(clean)) return true;
+  if (VOICE_POSITIVE_RE.test(clean)) {
+    if (traceContext) traceContext.intent = { requested: true, method: "fast_regex_positive", reason: "keyword matched: " + clean.slice(0, 40) };
+    return true;
+  }
 
   // 4. Nuanced / colloquial check via Gemma 4
   try {
@@ -3106,9 +3267,24 @@ async function detectVoiceIntent(env, text, cfg) {
     });
 
     const out = String(res?.text || "").trim().toUpperCase();
-    return out.includes("YES");
-  } catch {
-    // If Gemma or network is unavailable, gracefully default to false (text answer)
+    const isYes = out.includes("YES");
+    if (traceContext) {
+      traceContext.intent = {
+        requested: isYes,
+        method: "gemma_classifier",
+        model: res?.model || "gemma-4-31b",
+        output: out.slice(0, 30),
+      };
+    }
+    return isYes;
+  } catch (err) {
+    if (traceContext) {
+      traceContext.intent = {
+        requested: false,
+        method: "gemma_classifier_error",
+        error: String(err?.message ?? err).slice(0, 100),
+      };
+    }
     return false;
   }
 }
@@ -3118,11 +3294,17 @@ async function detectVoiceIntent(env, text, cfg) {
  * 1. If incoming message is an audio/voice note.
  * 2. If incoming text asks for a voice response (intent detected).
  */
-async function shouldVoiceReply(env, msg, cfg, text) {
-  if (cfg?.voice?.enabled === false) return false;
-  if (msg?.voice && cfg?.media?.audio?.enabled !== false) return true;
+async function shouldVoiceReply(env, msg, cfg, text, traceContext = null) {
+  if (cfg?.voice?.enabled === false) {
+    if (traceContext) traceContext.intent = { requested: false, reason: "voice disabled in config" };
+    return false;
+  }
+  if (msg?.voice && cfg?.media?.audio?.enabled !== false) {
+    if (traceContext) traceContext.intent = { requested: true, method: "incoming_voice", reason: "user sent voice note" };
+    return true;
+  }
   if (text) {
-    return await detectVoiceIntent(env, text, cfg);
+    return await detectVoiceIntent(env, text, cfg, traceContext);
   }
   return false;
 }
@@ -3252,11 +3434,15 @@ async function processMessage(env, msg) {
       let outcome = null;
       let replyError = null;
       let tgOut = null;
+      const trace = { intent: null, llm: null, voice: null, delivery: null };
       try {
-        outcome = await reply(env, msg, cfg);
+        outcome = await reply(env, msg, cfg, trace);
         tgOut = outcome?.tgOut ?? "delivered";
       } catch (e) {
         replyError = e;
+        if (e.trace && trace.llm) {
+          trace.llm.attempts = e.trace;
+        }
         const reason = String(e?.message ?? e);
         await bumpStats(env, { errors: 1, lastError: reason.slice(0, 300) });
         const text =
@@ -3272,6 +3458,9 @@ async function processMessage(env, msg) {
           tgOut = `failed to send error notice: ${String(sendErr?.message ?? sendErr).slice(0, 120)}`;
         }
       } finally {
+        const fullTrace = outcome?.trace || trace;
+        logPipelineTrace(msg, outcome, replyError, fullTrace);
+
         await appendArchive(
           env,
           archiveRecord(msg, {
@@ -3285,6 +3474,7 @@ async function processMessage(env, msg) {
             voice: outcome?.voice,
             voiceError: outcome?.voiceError,
             tgOut,
+            trace: fullTrace,
           }),
         ).catch(() => {});
       }
@@ -3294,9 +3484,46 @@ async function processMessage(env, msg) {
   }
 }
 
+function logPipelineTrace(msg, outcome, replyError, trace) {
+  const user = msg.from?.first_name || msg.from?.username || msg.from?.id || "user";
+  const textSnippet = (msg.text || msg.caption || "").replace(/\s+/g, " ").slice(0, 50);
+  console.log(`\n[Trace] 📨 Message from ${user} (Chat ${msg.chat?.id}): "${textSnippet}"`);
+  if (trace?.intent) {
+    const isV = trace.intent.requested ? "🎙️ Voice YES" : "💬 Voice NO";
+    console.log(`  ├─ Intent: ${isV} [${trace.intent.method || "default"}] ${trace.intent.reason || ""}`);
+  }
+  if (trace?.llm?.attempts?.length) {
+    console.log(`  ├─ LLM Routing:`);
+    for (const a of trace.llm.attempts) {
+      const icon = a.status === "ok" ? "✅" : "⚠️";
+      const keyStr = a.keyIndex !== undefined ? ` Key #${a.keyIndex + 1}` : "";
+      const msStr = a.ms !== undefined ? ` in ${a.ms}ms` : "";
+      const errStr = a.error ? ` (${a.error.slice(0, 60)})` : "";
+      console.log(`  │   ${icon} ${a.model}${keyStr} -> ${a.status}${msStr}${errStr}`);
+    }
+  }
+  if (outcome?.model) {
+    console.log(`  ├─ Selected Model: ${outcome.model}`);
+  }
+  if (trace?.voice) {
+    const vIcon = trace.voice.status === "delivered" ? "✅" : "❌";
+    console.log(`  ├─ Voice TTS: ${vIcon} ${trace.voice.status} ${trace.voice.chosenModel ? `[${trace.voice.chosenModel}]` : ""}`);
+    if (trace.voice.attempts?.length) {
+      for (const va of trace.voice.attempts) {
+        console.log(`  │   ${va.ok ? "✅" : "❌"} ${va.model} -> ${va.ok ? "OK" : va.error} (${va.ms}ms)`);
+      }
+    }
+  }
+  if (replyError) {
+    console.log(`  └─ ❌ Error: ${replyError.message || replyError}`);
+  } else {
+    console.log(`  └─ 📤 Telegram Out: ${outcome?.tgOut || "delivered"}`);
+  }
+}
+
 const config_enabled = (cfg) => cfg.enabled !== false;
 
-async function reply(env, msg, cfg) {
+async function reply(env, msg, cfg, trace = {}) {
   const token = env.TELEGRAM_BOT_TOKEN;
   const chatId = msg.chat.id;
   const threadId = msg.message_thread_id;
@@ -3320,7 +3547,7 @@ async function reply(env, msg, cfg) {
     return { text: DAILY_LIMIT, reason: "daily cap reached", tgOut: "daily cap guard" };
   }
 
-  const isVoice = await shouldVoiceReply(env, msg, cfg, text);
+  const isVoice = await shouldVoiceReply(env, msg, cfg, text, trace);
   const actionKind = isVoice ? "upload_voice" : "typing";
 
   await sendChatAction(token, chatId, actionKind, threadId).catch(() => {});
@@ -3331,18 +3558,21 @@ async function reply(env, msg, cfg) {
   }, 4000);
 
   let answer, usedModel;
+  trace.llm = { attempts: [], chosenModel: null };
   try {
     const id = msg.reply_to_message ? await botId(env).catch(() => null) : null;
     const { media, note } = await collectMedia(env, msg, cfg);
     const { text: replyText, fromBot } = replyContext(msg, id);
 
     const res = await complete(env, cfg, {
-      system: buildSystemPrompt(cfg),
+      system: buildSystemPrompt(cfg, { isVoice }),
       parts: buildUserContent({ text, replyText, replyFromBot: fromBot, media, note }),
       maxTokens: cfg.maxTokens,
     });
     answer = res.text;
     usedModel = res.model;
+    if (res.trace) trace.llm.attempts = res.trace;
+    trace.llm.chosenModel = usedModel;
   } finally {
     clearInterval(typingHeartbeat);
   }
@@ -3350,6 +3580,7 @@ async function reply(env, msg, cfg) {
   // A voice note (or text requesting voice) deserves a voice back: the text answer above
   // becomes a Live API turn and comes back as audio.
   if (isVoice) {
+    trace.voice = { attempts: [], status: "pending" };
     const startAt = Date.now();
     const elapsed = () => Date.now() - startAt;
     const keep = setInterval(() => sendChatAction(token, chatId, "upload_voice", threadId).catch(() => {}), 4000);
@@ -3357,27 +3588,39 @@ async function reply(env, msg, cfg) {
     let vErrText = null;
     try {
       if (elapsed() > VOICE_BUDGET_MS) throw new Error("live voice: over the time budget");
-      const wav = await speak(env, cfg, answer, { timeoutMs: Math.max(3000, VOICE_BUDGET_MS - elapsed()) });
+      const wav = await speak(env, cfg, answer, {
+        timeoutMs: Math.max(3000, VOICE_BUDGET_MS - elapsed()),
+        onTrace: (t) => {
+          trace.voice.attempts = t.attempts || [];
+          if (t.chosenModel) trace.voice.chosenModel = t.chosenModel;
+        },
+      });
       await sendAudioFile(token, chatId, wav, "sayyad.wav", "audio/wav", msg.message_id, threadId);
       audioSent = true;
+      trace.voice.status = "delivered";
+      trace.delivery = { kind: "voice", filename: "sayyad.wav" };
       await bumpStats(env, { replies: 1 });
-      return { text: answer, model: usedModel, voice: true, tgOut: "audio delivered (sayyad.wav)" };
+      return { text: answer, model: usedModel, voice: true, tgOut: "audio delivered (sayyad.wav)", trace };
     } catch (voiceErr) {
       vErrText = `voice failed: ${voiceErr?.message ?? voiceErr}`.slice(0, 300);
+      trace.voice.status = "failed";
+      trace.voice.error = vErrText;
       await bumpStats(env, { errors: 1, lastError: vErrText });
     } finally {
       clearInterval(keep);
     }
     if (!audioSent) {
       await sendLong(token, chatId, answer, msg.message_id, { model: usedModel, message_thread_id: threadId });
+      trace.delivery = { kind: "text_fallback", reason: vErrText };
       await bumpStats(env, { replies: 1 });
-      return { text: answer, model: usedModel, voice: false, voiceError: vErrText, tgOut: "text fallback delivered" };
+      return { text: answer, model: usedModel, voice: false, voiceError: vErrText, tgOut: "text fallback delivered", trace };
     }
   }
 
   await sendLong(token, chatId, answer, msg.message_id, { model: usedModel, message_thread_id: threadId });
+  trace.delivery = { kind: "text" };
   await bumpStats(env, { replies: 1 });
-  return { text: answer, model: usedModel, tgOut: "text delivered" };
+  return { text: answer, model: usedModel, tgOut: "text delivered", trace };
 }
 
 /** Voice notes are answered with voice — unless either switch (input or voice) is off. */

@@ -25,6 +25,7 @@ export const BASE_RULES = `تو «سید» هستی، یک ربات تلگرام
 - هرگز پیام خودت را تکرار نکن و هرگز نقش کاربر را بازی نکن.
 - اگر چیزی را نمی‌دانی یا مطمئن نیستی، صادقانه بگو و حدس الکی نزن.
 - حافظه‌ای از پیام‌های قبلی نداری؛ فقط چیزی را می‌بینی که در همین درخواست برایت فرستاده شده.
+- تو قابلیت ارسال ویس و پیام صوتی (Voice Message) داری. اگر کاربر خواست با صدا، ویس یا پادکست پاسخ دهی، یک متن روان، گفتاری و صمیمی برای خوانده‌شدن تولید کن و هرگز نگو ویس نمی‌فرستم یا توانایی ارسال صدا ندارم.
 - اگر کاربر فقط کلمه «سید» یا یک سلام بی‌حرف و معنی نوشته و درخواست مشخصی ندارد، یک جمله‌ی باحال، کوتاه و پرانرژی بگو که بپرسد چه می‌خواهد — یک سوال جالب، یا یک تیکه‌ی کوتاه. این جمله هرگز نباید تکراری و خشک باشد.`;
 
 export const DEFAULT_PERSONAS = {
@@ -53,10 +54,13 @@ export const DEFAULT_PERSONAS = {
 };
 
 /** Base rules + the selected persona + the admin's extra instructions. */
-export function buildSystemPrompt(cfg) {
+export function buildSystemPrompt(cfg, opts = {}) {
   const persona = cfg.personas?.[cfg.mode] ?? DEFAULT_PERSONAS.smart;
   const extra = String(cfg.extra ?? "").trim();
-  return [BASE_RULES, persona, extra ? `دستورهای اضافه‌ی مدیر:\n${extra}` : ""].filter(Boolean).join("\n\n");
+  const voiceNote = opts?.isVoice
+    ? "دستور ارسال صوت: این پاسخ قرار است به صورت ویس و فایل صوتی برای کاربر خوانده شود. پاسخی طبیعی، با لحن گفتاری، روان و شنیداری تولید کن و هرگز نگو ویس نمی‌فرستی."
+    : "";
+  return [BASE_RULES, persona, extra ? `دستورهای اضافه‌ی مدیر:\n${extra}` : "", voiceNote].filter(Boolean).join("\n\n");
 }
 
 /** The text of the message being replied to, if any. */

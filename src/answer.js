@@ -122,11 +122,15 @@ export async function processMessage(env, msg) {
       let outcome = null;
       let replyError = null;
       let tgOut = null;
+      const trace = { intent: null, llm: null, voice: null, delivery: null };
       try {
-        outcome = await reply(env, msg, cfg);
+        outcome = await reply(env, msg, cfg, trace);
         tgOut = outcome?.tgOut ?? "delivered";
       } catch (e) {
         replyError = e;
+        if (e.trace && trace.llm) {
+          trace.llm.attempts = e.trace;
+        }
         const reason = String(e?.message ?? e);
         await bumpStats(env, { errors: 1, lastError: reason.slice(0, 300) });
         const text =
@@ -142,6 +146,9 @@ export async function processMessage(env, msg) {
           tgOut = `failed to send error notice: ${String(sendErr?.message ?? sendErr).slice(0, 120)}`;
         }
       } finally {
+        const fullTrace = outcome?.trace || trace;
+        logPipelineTrace(msg, outcome, replyError, fullTrace);
+
         await appendArchive(
           env,
           archiveRecord(msg, {
@@ -155,6 +162,7 @@ export async function processMessage(env, msg) {
             voice: outcome?.voice,
             voiceError: outcome?.voiceError,
             tgOut,
+            trace: fullTrace,
           }),
         ).catch(() => {});
       }
@@ -164,9 +172,46 @@ export async function processMessage(env, msg) {
   }
 }
 
+function logPipelineTrace(msg, outcome, replyError, trace) {
+  const user = msg.from?.first_name || msg.from?.username || msg.from?.id || "user";
+  const textSnippet = (msg.text || msg.caption || "").replace(/\s+/g, " ").slice(0, 50);
+  console.log(`\n[Trace] 📨 Message from ${user} (Chat ${msg.chat?.id}): "${textSnippet}"`);
+  if (trace?.intent) {
+    const isV = trace.intent.requested ? "🎙️ Voice YES" : "💬 Voice NO";
+    console.log(`  ├─ Intent: ${isV} [${trace.intent.method || "default"}] ${trace.intent.reason || ""}`);
+  }
+  if (trace?.llm?.attempts?.length) {
+    console.log(`  ├─ LLM Routing:`);
+    for (const a of trace.llm.attempts) {
+      const icon = a.status === "ok" ? "✅" : "⚠️";
+      const keyStr = a.keyIndex !== undefined ? ` Key #${a.keyIndex + 1}` : "";
+      const msStr = a.ms !== undefined ? ` in ${a.ms}ms` : "";
+      const errStr = a.error ? ` (${a.error.slice(0, 60)})` : "";
+      console.log(`  │   ${icon} ${a.model}${keyStr} -> ${a.status}${msStr}${errStr}`);
+    }
+  }
+  if (outcome?.model) {
+    console.log(`  ├─ Selected Model: ${outcome.model}`);
+  }
+  if (trace?.voice) {
+    const vIcon = trace.voice.status === "delivered" ? "✅" : "❌";
+    console.log(`  ├─ Voice TTS: ${vIcon} ${trace.voice.status} ${trace.voice.chosenModel ? `[${trace.voice.chosenModel}]` : ""}`);
+    if (trace.voice.attempts?.length) {
+      for (const va of trace.voice.attempts) {
+        console.log(`  │   ${va.ok ? "✅" : "❌"} ${va.model} -> ${va.ok ? "OK" : va.error} (${va.ms}ms)`);
+      }
+    }
+  }
+  if (replyError) {
+    console.log(`  └─ ❌ Error: ${replyError.message || replyError}`);
+  } else {
+    console.log(`  └─ 📤 Telegram Out: ${outcome?.tgOut || "delivered"}`);
+  }
+}
+
 const config_enabled = (cfg) => cfg.enabled !== false;
 
-async function reply(env, msg, cfg) {
+async function reply(env, msg, cfg, trace = {}) {
   const token = env.TELEGRAM_BOT_TOKEN;
   const chatId = msg.chat.id;
   const threadId = msg.message_thread_id;
@@ -190,7 +235,7 @@ async function reply(env, msg, cfg) {
     return { text: DAILY_LIMIT, reason: "daily cap reached", tgOut: "daily cap guard" };
   }
 
-  const isVoice = await shouldVoiceReply(env, msg, cfg, text);
+  const isVoice = await shouldVoiceReply(env, msg, cfg, text, trace);
   const actionKind = isVoice ? "upload_voice" : "typing";
 
   await sendChatAction(token, chatId, actionKind, threadId).catch(() => {});
@@ -201,18 +246,21 @@ async function reply(env, msg, cfg) {
   }, 4000);
 
   let answer, usedModel;
+  trace.llm = { attempts: [], chosenModel: null };
   try {
     const id = msg.reply_to_message ? await botId(env).catch(() => null) : null;
     const { media, note } = await collectMedia(env, msg, cfg);
     const { text: replyText, fromBot } = replyContext(msg, id);
 
     const res = await complete(env, cfg, {
-      system: buildSystemPrompt(cfg),
+      system: buildSystemPrompt(cfg, { isVoice }),
       parts: buildUserContent({ text, replyText, replyFromBot: fromBot, media, note }),
       maxTokens: cfg.maxTokens,
     });
     answer = res.text;
     usedModel = res.model;
+    if (res.trace) trace.llm.attempts = res.trace;
+    trace.llm.chosenModel = usedModel;
   } finally {
     clearInterval(typingHeartbeat);
   }
@@ -220,6 +268,7 @@ async function reply(env, msg, cfg) {
   // A voice note (or text requesting voice) deserves a voice back: the text answer above
   // becomes a Live API turn and comes back as audio.
   if (isVoice) {
+    trace.voice = { attempts: [], status: "pending" };
     const startAt = Date.now();
     const elapsed = () => Date.now() - startAt;
     const keep = setInterval(() => sendChatAction(token, chatId, "upload_voice", threadId).catch(() => {}), 4000);
@@ -227,27 +276,39 @@ async function reply(env, msg, cfg) {
     let vErrText = null;
     try {
       if (elapsed() > VOICE_BUDGET_MS) throw new Error("live voice: over the time budget");
-      const wav = await speak(env, cfg, answer, { timeoutMs: Math.max(3000, VOICE_BUDGET_MS - elapsed()) });
+      const wav = await speak(env, cfg, answer, {
+        timeoutMs: Math.max(3000, VOICE_BUDGET_MS - elapsed()),
+        onTrace: (t) => {
+          trace.voice.attempts = t.attempts || [];
+          if (t.chosenModel) trace.voice.chosenModel = t.chosenModel;
+        },
+      });
       await sendAudioFile(token, chatId, wav, "sayyad.wav", "audio/wav", msg.message_id, threadId);
       audioSent = true;
+      trace.voice.status = "delivered";
+      trace.delivery = { kind: "voice", filename: "sayyad.wav" };
       await bumpStats(env, { replies: 1 });
-      return { text: answer, model: usedModel, voice: true, tgOut: "audio delivered (sayyad.wav)" };
+      return { text: answer, model: usedModel, voice: true, tgOut: "audio delivered (sayyad.wav)", trace };
     } catch (voiceErr) {
       vErrText = `voice failed: ${voiceErr?.message ?? voiceErr}`.slice(0, 300);
+      trace.voice.status = "failed";
+      trace.voice.error = vErrText;
       await bumpStats(env, { errors: 1, lastError: vErrText });
     } finally {
       clearInterval(keep);
     }
     if (!audioSent) {
       await sendLong(token, chatId, answer, msg.message_id, { model: usedModel, message_thread_id: threadId });
+      trace.delivery = { kind: "text_fallback", reason: vErrText };
       await bumpStats(env, { replies: 1 });
-      return { text: answer, model: usedModel, voice: false, voiceError: vErrText, tgOut: "text fallback delivered" };
+      return { text: answer, model: usedModel, voice: false, voiceError: vErrText, tgOut: "text fallback delivered", trace };
     }
   }
 
   await sendLong(token, chatId, answer, msg.message_id, { model: usedModel, message_thread_id: threadId });
+  trace.delivery = { kind: "text" };
   await bumpStats(env, { replies: 1 });
-  return { text: answer, model: usedModel, tgOut: "text delivered" };
+  return { text: answer, model: usedModel, tgOut: "text delivered", trace };
 }
 
 /** Voice notes are answered with voice — unless either switch (input or voice) is off. */

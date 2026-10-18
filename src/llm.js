@@ -90,11 +90,18 @@ async function runGeminiPool(env, cfg, payload) {
   const quota = await loadQuota(env);
   const now = Date.now();
   const dirty = new Set();
+  const trace = [];
   let last;
 
   for (const model of pool) {
-    if ((quota[model] ?? 0) > now) continue;
-    if ((minuteQuota.get(model) ?? 0) > now) continue;
+    if ((quota[model] ?? 0) > now) {
+      trace.push({ model, status: "skipped_quota_parked", error: "model parked until quota reset" });
+      continue;
+    }
+    if ((minuteQuota.get(model) ?? 0) > now) {
+      trace.push({ model, status: "skipped_minute_parked", error: "model temporarily paused" });
+      continue;
+    }
 
     const poolKeys = getKeyPool(env);
     const usableKeys = poolKeys.filter((k) => !k.disabled);
@@ -109,39 +116,49 @@ async function runGeminiPool(env, cfg, payload) {
       attemptsOnModel++;
       const keyHandle = await acquireKeyWithWait(env, { model, maxWaitMs: 0 });
       if (!keyHandle) {
+        trace.push({ model, status: "no_key_available", error: "all keys in cooldown or busy" });
         break; // No available key for this model
       }
 
       const apiKey = keyHandle.key;
+      const attemptStart = Date.now();
 
       try {
         const use = { ...cfg, apiKey, provider: { ...cfg.provider, model } };
         const r = await completeGemini(env, use, payload);
+        const ms = Date.now() - attemptStart;
+        trace.push({ model, keyIndex: keyHandle.index, status: "ok", ms });
         keyHandle.release();
         if (dirty.size) await saveQuota(env, quota);
-        return { ...r, model };
+        return { ...r, model, trace };
       } catch (e) {
+        const ms = Date.now() - attemptStart;
         last = e;
         lastModelQuotaError = e;
         keyHandle.release(e);
 
         if (e instanceof DailyQuotaError) {
+          trace.push({ model, keyIndex: keyHandle.index, status: "daily_quota (429)", error: e.message, ms });
           modelDailyFailures++;
           continue; // Try next key for this model
         }
         if (e instanceof MinuteQuotaError) {
+          trace.push({ model, keyIndex: keyHandle.index, status: "minute_quota (429)", error: e.message, ms });
           modelMinuteFailures++;
           continue; // Try next key for this model
         }
         if (e instanceof UnknownModelError) {
+          trace.push({ model, keyIndex: keyHandle.index, status: "model_not_found (404)", error: e.message, ms });
           quota[e.model] = nextPacificMidnight();
           dirty.add(e.model);
           break; // A 404 model name cannot succeed with any key
         }
         if (/quota|resource_exhausted|high demand|spikes in demand|overloaded|temporarily unavailable/i.test(e?.message)) {
+          trace.push({ model, keyIndex: keyHandle.index, status: "high_demand (429)", error: e?.message, ms });
           modelMinuteFailures++;
           continue;
         }
+        trace.push({ model, keyIndex: keyHandle.index, status: "error", error: String(e?.message ?? e).slice(0, 200), ms });
         throw e;
       }
     }
@@ -180,9 +197,13 @@ async function runGeminiPool(env, cfg, payload) {
   if (last instanceof DailyQuotaError || last instanceof MinuteQuotaError || anyParked) {
     const unparkTimes = pool.map((m) => Math.max(quota[m] ?? 0, minuteQuota.get(m) ?? 0)).filter((t) => t > now);
     const resumeAt = unparkTimes.length ? Math.min(...unparkTimes) : poolResumeTime(quota, pool);
-    throw new PoolExhausted(resumeAt, last?.message);
+    const err = new PoolExhausted(resumeAt, last?.message);
+    err.trace = trace;
+    throw err;
   }
-  throw last ?? new PoolExhausted(nextPacificMidnight(), "no model available");
+  const err = last ?? new PoolExhausted(nextPacificMidnight(), "no model available");
+  err.trace = trace;
+  throw err;
 }
 
 /** Every model in the pool is spent until `resetAt`. Carries the exact hour it frees up. */
@@ -203,7 +224,10 @@ export async function complete(env, cfg, payload) {
       if (!isCredentialError(e)) throw e;
       const baseUrl = DEFAULT_BASE_URLS.openai;
       const model = mapModelForProvider(cfg.provider?.model, "openai", baseUrl);
-      return completeOpenAI(env, { ...cfg, provider: { ...cfg.provider, kind: "openai", model, baseUrl } }, payload);
+      const t0 = Date.now();
+      const r = await completeOpenAI(env, { ...cfg, provider: { ...cfg.provider, kind: "openai", model, baseUrl } }, payload);
+      const openAiTrace = [...(e.trace || []), { provider: "openai", model, status: "ok", ms: Date.now() - t0 }];
+      return { ...r, model, trace: openAiTrace };
     }
   }
 
@@ -222,7 +246,9 @@ export async function complete(env, cfg, payload) {
       },
     };
     try {
-      return await providerFor(use)(env, use, payload);
+      const t0 = Date.now();
+      const r = await providerFor(use)(env, use, payload);
+      return { ...r, model, trace: [{ provider: kind, model, status: "ok", ms: Date.now() - t0 }] };
     } catch (e) {
       last = e;
       if (!isCredentialError(e)) throw e;

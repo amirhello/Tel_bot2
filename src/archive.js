@@ -29,6 +29,7 @@ export function archiveRecord(msg, outcome) {
     if (outcome.voice !== undefined) r.voice = outcome.voice;
     if (outcome.voiceError) r.verr = String(outcome.voiceError).slice(0, 500);
     if (outcome.tgOut) r.tgOut = String(outcome.tgOut).slice(0, 300);
+    if (outcome.trace) r.trace = outcome.trace;
   }
   return r;
 }

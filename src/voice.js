@@ -260,17 +260,24 @@ export async function speak(env, cfg, text, opts = {}) {
   const pool = [primary, ...FALLBACK_VOICE_MODELS.filter((m) => m !== primary)];
 
   let lastErr;
+  const attempts = [];
   for (let i = 0; i < pool.length; i++) {
     const model = pool[i];
     const elapsed = Date.now() - startAt;
     const remaining = timeoutMs - elapsed;
     if (i > 0 && remaining < 2000) break;
 
+    const t0 = Date.now();
     try {
-      return await speakOnce(key, model, words, Math.max(1, remaining));
+      const wav = await speakOnce(key, model, words, Math.max(1, remaining));
+      attempts.push({ model, ok: true, ms: Date.now() - t0 });
+      opts.onTrace?.({ attempts, chosenModel: model, status: "ok" });
+      return wav;
     } catch (e) {
       const clean = String(e?.message ?? e).replace(/key=[^&\s]+/gi, "key=[REDACTED]");
       lastErr = new Error(clean);
+      attempts.push({ model, ok: false, error: clean.slice(0, 150), ms: Date.now() - t0 });
+      opts.onTrace?.({ attempts, lastError: clean.slice(0, 150), status: "failed" });
       if (!/model|not found|unknown|404|unsupported|unavailable|closed before any audio/i.test(clean)) {
         throw lastErr;
       }
@@ -312,20 +319,32 @@ const INTENT_SYSTEM_PROMPT =
  * Detect if user message is asking for a voice reply.
  * Uses fast regex for clear cases, and Gemma 4 for colloquial/nuanced Persian requests.
  */
-export async function detectVoiceIntent(env, text, cfg) {
-  if (cfg?.voice?.enabled === false) return false;
+export async function detectVoiceIntent(env, text, cfg, traceContext = null) {
+  if (cfg?.voice?.enabled === false) {
+    if (traceContext) traceContext.intent = { requested: false, reason: "voice disabled in config" };
+    return false;
+  }
   if (!text || typeof text !== "string") return false;
   const clean = text.trim();
   if (!clean) return false;
 
   // 1. If text has no hint of voice/audio words at all, skip immediately without LLM call
-  if (!VOICE_HINT_RE.test(clean)) return false;
+  if (!VOICE_HINT_RE.test(clean)) {
+    if (traceContext) traceContext.intent = { requested: false, method: "fast_hint_filter", reason: "no voice keywords in text" };
+    return false;
+  }
 
   // 2. Fast negative check
-  if (VOICE_NEGATIVE_RE.test(clean)) return false;
+  if (VOICE_NEGATIVE_RE.test(clean)) {
+    if (traceContext) traceContext.intent = { requested: false, method: "fast_regex_negative", reason: "explicit negative request" };
+    return false;
+  }
 
   // 3. Fast positive check
-  if (VOICE_POSITIVE_RE.test(clean)) return true;
+  if (VOICE_POSITIVE_RE.test(clean)) {
+    if (traceContext) traceContext.intent = { requested: true, method: "fast_regex_positive", reason: "keyword matched: " + clean.slice(0, 40) };
+    return true;
+  }
 
   // 4. Nuanced / colloquial check via Gemma 4
   try {
@@ -347,9 +366,24 @@ export async function detectVoiceIntent(env, text, cfg) {
     });
 
     const out = String(res?.text || "").trim().toUpperCase();
-    return out.includes("YES");
-  } catch {
-    // If Gemma or network is unavailable, gracefully default to false (text answer)
+    const isYes = out.includes("YES");
+    if (traceContext) {
+      traceContext.intent = {
+        requested: isYes,
+        method: "gemma_classifier",
+        model: res?.model || "gemma-4-31b",
+        output: out.slice(0, 30),
+      };
+    }
+    return isYes;
+  } catch (err) {
+    if (traceContext) {
+      traceContext.intent = {
+        requested: false,
+        method: "gemma_classifier_error",
+        error: String(err?.message ?? err).slice(0, 100),
+      };
+    }
     return false;
   }
 }
@@ -359,11 +393,17 @@ export async function detectVoiceIntent(env, text, cfg) {
  * 1. If incoming message is an audio/voice note.
  * 2. If incoming text asks for a voice response (intent detected).
  */
-export async function shouldVoiceReply(env, msg, cfg, text) {
-  if (cfg?.voice?.enabled === false) return false;
-  if (msg?.voice && cfg?.media?.audio?.enabled !== false) return true;
+export async function shouldVoiceReply(env, msg, cfg, text, traceContext = null) {
+  if (cfg?.voice?.enabled === false) {
+    if (traceContext) traceContext.intent = { requested: false, reason: "voice disabled in config" };
+    return false;
+  }
+  if (msg?.voice && cfg?.media?.audio?.enabled !== false) {
+    if (traceContext) traceContext.intent = { requested: true, method: "incoming_voice", reason: "user sent voice note" };
+    return true;
+  }
   if (text) {
-    return await detectVoiceIntent(env, text, cfg);
+    return await detectVoiceIntent(env, text, cfg, traceContext);
   }
   return false;
 }

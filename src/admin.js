@@ -239,6 +239,12 @@ label.check input{width:auto}
 .msg{white-space:pre-wrap;word-break:break-word;background:#111722;border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:8px;direction:rtl;text-align:right}
 .replybox{white-space:pre-wrap;word-break:break-word;background:#0d1e16;border:1px solid #1a4427;border-radius:8px;padding:10px;margin-top:8px;direction:rtl;text-align:right}
 .errbox{white-space:pre-wrap;word-break:break-word;background:#241113;border:1px solid #5a1e22;border-radius:8px;padding:10px;margin-top:8px;color:#fca5a5;direction:ltr;text-align:left;font-family:ui-monospace,monospace;font-size:13px}
+.tracebox{background:#080c14;border:1px solid #1f293d;border-radius:8px;padding:12px;margin-top:10px;font-family:ui-monospace,monospace;font-size:12px;color:#94a3b8;direction:ltr;text-align:left}
+.tracetitle{font-weight:700;color:#38bdf8;margin-bottom:8px;font-size:13px}
+.traceline{margin:5px 0}
+.traceul{margin:4px 0 8px 18px;padding:0;list-style:disc}
+.traceul li{margin:3px 0}
+.tracebox code{background:#172033;padding:2px 5px;border-radius:4px;color:#e2e8f0;font-size:11px}
 `;
 
 const LOGIN = `<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -533,7 +539,15 @@ function logCard(it){
   sum.appendChild(el("span", tagCls, tagText));
   if (it.model) sum.appendChild(el("span", "tag", it.model));
   if (it.ms !== undefined) sum.appendChild(el("span", "tag", it.ms + " ms"));
-  if (it.verr) sum.appendChild(el("span", "tag err", "voice err"));
+  if (it.voice !== undefined) {
+    if (it.voice) {
+      sum.appendChild(el("span", "tag on", "🎙️ voice"));
+    } else if (it.verr) {
+      sum.appendChild(el("span", "tag err", "voice fallback"));
+    }
+  } else if (it.verr) {
+    sum.appendChild(el("span", "tag err", "voice err"));
+  }
   sum.appendChild(el("span", "where", (it.c && it.c.t) || ""));
   sum.appendChild(el("span", "prev", (it.k || "") + " · " + (it.x || "").replace(/\\s+/g, " ").slice(0, 70)));
   det.appendChild(sum);
@@ -569,6 +583,103 @@ function logCard(it){
     er.appendChild(el("b", null, "Error: "));
     er.appendChild(document.createTextNode(it.err));
     body.appendChild(er);
+  }
+  if (it.trace) {
+    var trBox = el("div", "tracebox");
+    trBox.appendChild(el("div", "tracetitle", "⚙️ Execution Pipeline Trace:"));
+
+    if (it.trace.intent) {
+      var intLine = el("div", "traceline");
+      intLine.appendChild(el("b", null, "• Intent: "));
+      var isReq = it.trace.intent.requested;
+      intLine.appendChild(el("span", "tag" + (isReq ? " on" : ""), isReq ? "🎙️ Voice Requested" : "💬 Text Only"));
+      intLine.appendChild(document.createTextNode(" via "));
+      intLine.appendChild(el("code", null, it.trace.intent.method || "default"));
+      if (it.trace.intent.reason) {
+        intLine.appendChild(document.createTextNode(" (" + it.trace.intent.reason + ")"));
+      }
+      trBox.appendChild(intLine);
+    }
+
+    if (it.trace.llm) {
+      var llmLine = el("div", "traceline");
+      llmLine.appendChild(el("b", null, "• LLM Routing: "));
+      if (it.trace.llm.chosenModel) {
+        llmLine.appendChild(document.createTextNode("Selected "));
+        llmLine.appendChild(el("code", null, it.trace.llm.chosenModel));
+      }
+      trBox.appendChild(llmLine);
+
+      if (Array.isArray(it.trace.llm.attempts) && it.trace.llm.attempts.length) {
+        var attUl = el("ul", "traceul");
+        it.trace.llm.attempts.forEach(function(att) {
+          var li = el("li", null);
+          var icon = att.status === "ok" ? "✅ " : "⚠️ ";
+          li.appendChild(document.createTextNode(icon));
+          li.appendChild(el("code", null, att.model));
+          if (att.keyIndex !== undefined) {
+            li.appendChild(document.createTextNode(" (Key #" + (att.keyIndex + 1) + ")"));
+          }
+          li.appendChild(document.createTextNode(": "));
+          li.appendChild(el("b", null, att.status));
+          if (att.ms !== undefined) {
+            li.appendChild(document.createTextNode(" [" + att.ms + "ms]"));
+          }
+          if (att.error) {
+            li.appendChild(document.createTextNode(" — " + att.error));
+          }
+          attUl.appendChild(li);
+        });
+        trBox.appendChild(attUl);
+      }
+    }
+
+    if (it.trace.voice) {
+      var vLine = el("div", "traceline");
+      var isVOk = it.trace.voice.status === "delivered";
+      vLine.appendChild(el("b", null, "• Voice Synthesis: "));
+      vLine.appendChild(document.createTextNode((isVOk ? "✅ " : "❌ ") + "Status: "));
+      vLine.appendChild(el("b", null, it.trace.voice.status));
+      if (it.trace.voice.chosenModel) {
+        vLine.appendChild(document.createTextNode(" (Model: "));
+        vLine.appendChild(el("code", null, it.trace.voice.chosenModel));
+        vLine.appendChild(document.createTextNode(")"));
+      }
+      trBox.appendChild(vLine);
+
+      if (Array.isArray(it.trace.voice.attempts) && it.trace.voice.attempts.length) {
+        var vUl = el("ul", "traceul");
+        it.trace.voice.attempts.forEach(function(vAtt) {
+          var li = el("li", null);
+          li.appendChild(document.createTextNode(vAtt.ok ? "✅ " : "❌ "));
+          li.appendChild(el("code", null, vAtt.model));
+          li.appendChild(document.createTextNode(": " + (vAtt.ok ? "Success" : "Failed")));
+          if (vAtt.ms !== undefined) {
+            li.appendChild(document.createTextNode(" [" + vAtt.ms + "ms]"));
+          }
+          if (vAtt.error) {
+            li.appendChild(document.createTextNode(" — " + vAtt.error));
+          }
+          vUl.appendChild(li);
+        });
+        trBox.appendChild(vUl);
+      }
+    }
+
+    if (it.trace.delivery) {
+      var dLine = el("div", "traceline");
+      dLine.appendChild(el("b", null, "• Telegram Delivery: "));
+      var dKind = it.trace.delivery.kind === "voice" ? "🎙️ Voice Audio File (WAV)"
+                : it.trace.delivery.kind === "text_fallback" ? "⚠️ Text Fallback (Voice failed)"
+                : "💬 Standard Text";
+      dLine.appendChild(el("span", "tag" + (it.trace.delivery.kind === "voice" ? " on" : ""), dKind));
+      if (it.trace.delivery.reason) {
+        dLine.appendChild(document.createTextNode(" (" + it.trace.delivery.reason + ")"));
+      }
+      trBox.appendChild(dLine);
+    }
+
+    body.appendChild(trBox);
   }
   det.appendChild(body);
   return det;
