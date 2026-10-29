@@ -146,7 +146,7 @@ await t("a spent model is parked and the next one answers", async () => {
 
   const parked = JSON.parse(e.CONFIG.store["quota:v1"]);
   assert.equal(parked["gemini-3.5-flash-lite"], nextPacificMidnight(), "the spent model is remembered");
-  assert.equal("gemini-3.8-flash" in parked, false, "the healthy one is not parked");
+  assert.equal("gemini-3.1-flash-lite" in parked, false, "the healthy one is not parked");
 });
 
 await t("a minute-spent model is parked in-memory for 60s and the next one answers", async () => {
@@ -166,7 +166,7 @@ await t("a minute-spent model is parked in-memory for 60s and the next one answe
   responder = () => ok("from-second-again");
   assert.equal((await complete(e, cfg(), payload)).text, "from-second-again");
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, geminiURL("gemini-3.8-flash"));
+  assert.equal(calls[0].url, geminiURL("gemini-3.1-flash-lite"));
   clearMinuteQuota();
 });
 
@@ -202,7 +202,7 @@ await t("a parked model is skipped without spending a request on it", async () =
   const r = await complete(e, cfg(), payload);
   assert.equal(r.text, "from-second");
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, geminiURL("gemini-3.8-flash"), "went straight to the next model");
+  assert.equal(calls[0].url, geminiURL("gemini-3.1-flash-lite"), "went straight to the next model");
 });
 
 await t("a genuine failure never silently reroutes to another model", async () => {
@@ -365,19 +365,19 @@ await t("intelligent MALFORMED_RESPONSE and empty response falls back to next mo
     if (url.includes("gemini-3.5-flash-lite")) {
       return json({ candidates: [{ content: { parts: [] } }] }); // "Gemini returned no text"
     }
-    return ok("from gemini-3.8-flash");
+    return ok("from gemini-3.1-flash-lite");
   };
 
   const r = await complete(e, cfg(), payload);
-  assert.equal(r.text, "from gemini-3.8-flash");
+  assert.equal(r.text, "from gemini-3.1-flash-lite");
   assert.equal(calls.length, 2);
   assert.ok(calls[0].url.includes("gemini-3.5-flash-lite"));
-  assert.ok(calls[1].url.includes("gemini-3.8-flash"));
+  assert.ok(calls[1].url.includes("gemini-3.1-flash-lite"));
   assert.ok(r.trace.some((t) => t.status === "malformed_response (glitch)"));
   clearMinuteQuota();
 });
 
-await t("MALFORMED_RESPONSE in error message seamlessly falls back to gemini-3.8-flash", async () => {
+await t("MALFORMED_RESPONSE in error message seamlessly falls back to next model", async () => {
   clearMinuteQuota();
   clearKeyPoolCache();
   const e = env({ GEMINI_API_KEY: "k" });
@@ -392,7 +392,7 @@ await t("MALFORMED_RESPONSE in error message seamlessly falls back to gemini-3.8
   const r = await complete(e, cfg(), payload);
   assert.equal(r.text, "recovered from flash");
   assert.ok(calls.length >= 2);
-  assert.ok(calls.at(-1).url.includes("gemini-3.8-flash"));
+  assert.ok(calls.at(-1).url.includes("gemini-3.1-flash-lite"));
   assert.ok(r.trace.some((t) => t.status === "malformed_response (glitch)"));
   clearMinuteQuota();
 });
@@ -418,7 +418,7 @@ await t("model loop re-evaluates timestamp so an expired minute quota is not ski
   calls = [];
 
   // Simulate model 2 having a minute quota that expires in 50ms
-  minuteQuota.set("gemini-3.8-flash", Date.now() + 50);
+  minuteQuota.set("gemini-3.1-flash-lite", Date.now() + 50);
 
   // Model 1 takes 80ms to fail with 429 daily quota
   responder = (url) => {
@@ -427,14 +427,14 @@ await t("model loop re-evaluates timestamp so an expired minute quota is not ski
       while (Date.now() - start < 80) {} // busy wait to let 50ms expire
       return json({ error: { message: "per day quota reached" } }, 429);
     }
-    return ok("answered by gemini-3.8-flash");
+    return ok("answered by gemini-3.1-flash-lite");
   };
 
   const r = await complete(e, cfg(), payload);
-  assert.equal(r.text, "answered by gemini-3.8-flash");
+  assert.equal(r.text, "answered by gemini-3.1-flash-lite");
   assert.equal(calls.length, 2);
   assert.ok(calls[0].url.includes("gemini-3.5-flash-lite"));
-  assert.ok(calls[1].url.includes("gemini-3.8-flash"), "gemini-3.8-flash was not skipped because cooldown expired during attempt");
+  assert.ok(calls[1].url.includes("gemini-3.1-flash-lite"), "gemini-3.1-flash-lite was not skipped because cooldown expired during attempt");
   clearMinuteQuota();
 });
 

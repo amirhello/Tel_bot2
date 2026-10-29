@@ -23,23 +23,31 @@ export function nextPacificMidnight(now = Date.now()) {
  */
 export const MULTIMODAL_MODELS = [
   "gemini-3.5-flash-lite",
-  "gemini-3.8-flash",
-  "gemini-3.7-flash",
-  "gemini-3.6-flash",
-  "gemini-3-flash",
-  "gemini-2.5-flash",
   "gemini-3.1-flash-lite",
+  "gemini-2.5-flash-lite",
+  "gemini-2.5-flash",
+  "gemini-3.6-flash",
+  "gemini-3.7-flash",
+  "gemini-3-flash",
+  "gemini-3.8-flash",
 ];
 
 export const TEXT_EXTENDED_MODELS = [
-  "Antigravity",
-  "gemma-4-26b",
   "gemma-4-31b",
+  "gemma-4-26b",
+  "Antigravity",
 ];
 
 export const DEFAULT_MODEL_POOL = [
-  ...MULTIMODAL_MODELS,
-  ...TEXT_EXTENDED_MODELS,
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
+  "gemma-4-31b",
+  "gemma-4-26b",
+  "gemini-2.5-flash-lite",
+  "gemini-2.5-flash",
+  "gemini-3.6-flash",
+  "gemini-3.8-flash",
+  "Antigravity",
 ];
 
 /* ------------------------------------------------------------------ config */

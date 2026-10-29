@@ -9,7 +9,21 @@ export async function tg(token, method, payload) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload ?? {}),
   });
-  return res.json();
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    // If Telegram returned 429 Too Many Requests, respect retry_after
+    if (res.status === 429 && data?.parameters?.retry_after && method !== "getUpdates") {
+      const waitSec = Math.min(10, data.parameters.retry_after);
+      await new Promise((r) => setTimeout(r, waitSec * 1000));
+      const retryRes = await fetch(api(token, method), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload ?? {}),
+      });
+      return retryRes.json().catch(() => data);
+    }
+  }
+  return data ?? { ok: false, error: "invalid_json" };
 }
 
 export const getMe = (token) => tg(token, "getMe");
@@ -47,9 +61,24 @@ export const setWebhook = (token, url, secretToken) =>
 
 export const deleteWebhook = (token) => tg(token, "deleteWebhook", { drop_pending_updates: false });
 export const getWebhookInfo = (token) => tg(token, "getWebhookInfo");
+const lastChatAction = new Map();
+
 export const sendChatAction = (token, chatId, action = "typing", threadId) => {
-  const payload = { chat_id: chatId, action };
   const tid = typeof threadId === "object" ? (threadId?.message_thread_id ?? threadId?.threadId) : threadId;
+  const key = `${chatId}:${tid || 0}:${action}`;
+  const now = Date.now();
+  const last = lastChatAction.get(key) || 0;
+  // If sent within last 3.5 seconds for the same chat, skip to prevent 429 flood
+  if (now - last < 3500) {
+    return Promise.resolve({ ok: true, result: true, skipped: true });
+  }
+  lastChatAction.set(key, now);
+  if (lastChatAction.size > 500) {
+    for (const [k, v] of lastChatAction) {
+      if (now - v > 30_000) lastChatAction.delete(k);
+    }
+  }
+  const payload = { chat_id: chatId, action };
   if (tid) payload.message_thread_id = tid;
   return tg(token, "sendChatAction", payload);
 };

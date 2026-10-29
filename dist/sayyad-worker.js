@@ -133,7 +133,7 @@ const errorMessage = (json, text) =>
  * read in the first message. A non-JSON body still throws with its real status, so a
  * Cloudflare HTML block page reads as 403 and is not retried into oblivion.
  */
-async function callJson(url, { headers, body, retries = 2, backoff = DEFAULT_BACKOFF, retryOn = isTransient, timeoutMs = 15_000 }) {
+async function callJson(url, { headers, body, retries = 2, backoff = DEFAULT_BACKOFF, retryOn = isTransient, timeoutMs = 8_000 }) {
   const attempts = Math.max(0, retries) + 1;
   let last;
 
@@ -204,23 +204,31 @@ function nextPacificMidnight(now = Date.now()) {
  */
 const MULTIMODAL_MODELS = [
   "gemini-3.5-flash-lite",
-  "gemini-3.8-flash",
-  "gemini-3.7-flash",
-  "gemini-3.6-flash",
-  "gemini-3-flash",
-  "gemini-2.5-flash",
   "gemini-3.1-flash-lite",
+  "gemini-2.5-flash-lite",
+  "gemini-2.5-flash",
+  "gemini-3.6-flash",
+  "gemini-3.7-flash",
+  "gemini-3-flash",
+  "gemini-3.8-flash",
 ];
 
 const TEXT_EXTENDED_MODELS = [
-  "Antigravity",
-  "gemma-4-26b",
   "gemma-4-31b",
+  "gemma-4-26b",
+  "Antigravity",
 ];
 
 const DEFAULT_MODEL_POOL = [
-  ...MULTIMODAL_MODELS,
-  ...TEXT_EXTENDED_MODELS,
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
+  "gemma-4-31b",
+  "gemma-4-26b",
+  "gemini-2.5-flash-lite",
+  "gemini-2.5-flash",
+  "gemini-3.6-flash",
+  "gemini-3.8-flash",
+  "Antigravity",
 ];
 
 /* ------------------------------------------------------------------ config */
@@ -1295,6 +1303,10 @@ async function runGeminiPool(env, cfg, payload) {
           trace.push({ model, keyIndex: keyHandle.index, status: "malformed_response (glitch)", error: e?.message, ms });
           modelMinuteFailures++;
           break;
+        }
+        if (/timeout|aborted|network error|econnreset|etimedout|socket hang up|eai_again|fetch failed/i.test(e?.message)) {
+          trace.push({ model, keyIndex: keyHandle.index, status: "network_timeout", error: e?.message, ms });
+          continue;
         }
         trace.push({ model, keyIndex: keyHandle.index, status: "error", error: String(e?.message ?? e).slice(0, 200), ms });
         throw e;
@@ -2751,7 +2763,21 @@ async function tg(token, method, payload) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload ?? {}),
   });
-  return res.json();
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    // If Telegram returned 429 Too Many Requests, respect retry_after
+    if (res.status === 429 && data?.parameters?.retry_after && method !== "getUpdates") {
+      const waitSec = Math.min(10, data.parameters.retry_after);
+      await new Promise((r) => setTimeout(r, waitSec * 1000));
+      const retryRes = await fetch(api(token, method), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload ?? {}),
+      });
+      return retryRes.json().catch(() => data);
+    }
+  }
+  return data ?? { ok: false, error: "invalid_json" };
 }
 
 const getMe = (token) => tg(token, "getMe");
@@ -2789,9 +2815,24 @@ const setWebhook = (token, url, secretToken) =>
 
 const deleteWebhook = (token) => tg(token, "deleteWebhook", { drop_pending_updates: false });
 const getWebhookInfo = (token) => tg(token, "getWebhookInfo");
+const lastChatAction = new Map();
+
 const sendChatAction = (token, chatId, action = "typing", threadId) => {
-  const payload = { chat_id: chatId, action };
   const tid = typeof threadId === "object" ? (threadId?.message_thread_id ?? threadId?.threadId) : threadId;
+  const key = `${chatId}:${tid || 0}:${action}`;
+  const now = Date.now();
+  const last = lastChatAction.get(key) || 0;
+  // If sent within last 3.5 seconds for the same chat, skip to prevent 429 flood
+  if (now - last < 3500) {
+    return Promise.resolve({ ok: true, result: true, skipped: true });
+  }
+  lastChatAction.set(key, now);
+  if (lastChatAction.size > 500) {
+    for (const [k, v] of lastChatAction) {
+      if (now - v > 30_000) lastChatAction.delete(k);
+    }
+  }
+  const payload = { chat_id: chatId, action };
   if (tid) payload.message_thread_id = tid;
   return tg(token, "sendChatAction", payload);
 };

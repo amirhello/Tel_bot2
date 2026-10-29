@@ -167,6 +167,10 @@ async function runGeminiPool(env, cfg, payload) {
           modelMinuteFailures++;
           break;
         }
+        if (/timeout|aborted|network error|econnreset|etimedout|socket hang up|eai_again|fetch failed/i.test(e?.message)) {
+          trace.push({ model, keyIndex: keyHandle.index, status: "network_timeout", error: e?.message, ms });
+          continue;
+        }
         trace.push({ model, keyIndex: keyHandle.index, status: "error", error: String(e?.message ?? e).slice(0, 200), ms });
         throw e;
       }

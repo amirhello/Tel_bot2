@@ -46,7 +46,7 @@ const errorMessage = (json, text) =>
  * read in the first message. A non-JSON body still throws with its real status, so a
  * Cloudflare HTML block page reads as 403 and is not retried into oblivion.
  */
-export async function callJson(url, { headers, body, retries = 2, backoff = DEFAULT_BACKOFF, retryOn = isTransient, timeoutMs = 15_000 }) {
+export async function callJson(url, { headers, body, retries = 2, backoff = DEFAULT_BACKOFF, retryOn = isTransient, timeoutMs = 8_000 }) {
   const attempts = Math.max(0, retries) + 1;
   let last;
 

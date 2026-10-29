@@ -250,8 +250,19 @@ async function startPolling() {
       const url = `https://api.telegram.org/bot${token}/getUpdates?offset=${offset}&timeout=25&allowed_updates=["message"]`;
       const res = await fetch(url, { signal: AbortSignal.timeout(35_000) });
       if (!res.ok) {
-        console.error(`Telegram getUpdates HTTP ${res.status}`);
-        await sleep(3000);
+        let waitSec = 3;
+        try {
+          const errData = await res.json();
+          if (errData?.parameters?.retry_after) waitSec = Math.max(1, errData.parameters.retry_after);
+        } catch {}
+        if (res.status === 429) {
+          console.warn(`⚠️ [Telegram] Rate limited (HTTP 429). Pausing getUpdates for ${waitSec}s...`);
+        } else if (res.status === 502 || res.status === 504) {
+          console.warn(`⚠️ [Telegram] Server temporary error (HTTP ${res.status}). Waiting ${waitSec}s...`);
+        } else {
+          console.error(`Telegram getUpdates HTTP ${res.status}`);
+        }
+        await sleep(waitSec * 1000);
         continue;
       }
 
@@ -268,6 +279,7 @@ async function startPolling() {
           processMessage(env, update.message).catch((err) => {
             console.error("Message processing error:", err?.message || err);
           });
+          if (data.result.length > 1) await sleep(40);
         }
       }
     } catch (pollErr) {
