@@ -77,6 +77,17 @@ export function thinkingConfig(cfg) {
   return { thinkingConfig: { thinkingBudget: budget } };
 }
 
+export const SEARCH_GROUNDING_MODELS = [
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash",
+];
+
+export function isSearchSupported(model) {
+  const m = String(model || "").toLowerCase();
+  return SEARCH_GROUNDING_MODELS.some((sm) => m.includes(sm));
+}
+
 export function safetySettings(cfg) {
   return Object.entries(SAFETY_CATEGORIES).map(([key, category]) => ({
     category,
@@ -84,7 +95,7 @@ export function safetySettings(cfg) {
   }));
 }
 
-export function buildGeminiBody(cfg, { system, parts, maxTokens }, shape = {}) {
+export function buildGeminiBody(cfg, { system, parts, maxTokens, search }, shape = {}) {
   const body = {
     systemInstruction: { parts: [{ text: system }] },
     contents: [{ role: "user", parts: parts.map(toGeminiPart).filter(Boolean) }],
@@ -93,6 +104,13 @@ export function buildGeminiBody(cfg, { system, parts, maxTokens }, shape = {}) {
   if (!shape.noThinking) body.generationConfig = { ...body.generationConfig, ...thinkingConfig(cfg) };
   else delete body.generationConfig.thinkingConfig;
   if (!shape.noSafety) body.safetySettings = safetySettings(cfg);
+
+  const model = cfg?.provider?.model;
+  const wantSearch = (search || cfg?.search) && !shape.noTools && isSearchSupported(model);
+  if (wantSearch) {
+    body.tools = [{ googleSearch: {} }];
+  }
+
   return body;
 }
 
@@ -104,6 +122,31 @@ export function readGeminiText(data) {
     .map((p) => p.text)
     .join("")
     .trim();
+}
+
+/** Extract search queries and source citations from Google Search Grounding metadata. */
+export function readGeminiSources(data) {
+  const grounding = data?.candidates?.[0]?.groundingMetadata;
+  if (!grounding) return { queries: [], sources: [] };
+  const queries = Array.isArray(grounding.webSearchQueries) ? grounding.webSearchQueries : [];
+  const rawChunks = Array.isArray(grounding.groundingChunks) ? grounding.groundingChunks : [];
+  const sources = [];
+  const seen = new Set();
+  for (const c of rawChunks) {
+    const uri = c?.web?.uri;
+    if (!uri || seen.has(uri)) continue;
+    seen.add(uri);
+    let title = c?.web?.title;
+    if (!title) {
+      try {
+        title = new URL(uri).hostname.replace(/^www\./, "");
+      } catch {
+        title = "منبع وب";
+      }
+    }
+    sources.push({ title, url: uri });
+  }
+  return { queries, sources: sources.slice(0, 5) };
 }
 
 /**
@@ -124,14 +167,15 @@ const retryableForGemini = (e) =>
  * refuse a custom safety level. Drop the optional blocks one at a time rather than
  * letting the admin discover it as a broken bot.
  */
-function shapes(cfg) {
+function shapes(cfg, search) {
   const list = [{}];
+  if (search || cfg?.search) list.push({ noTools: true });
   if (cfg?.thinking) list.push({ noThinking: true });
-  list.push({ noThinking: true, noSafety: true });
+  list.push({ noTools: true, noThinking: true, noSafety: true });
   return list;
 }
 
-export async function completeGemini(env, cfg, { system, parts, maxTokens }) {
+export async function completeGemini(env, cfg, { system, parts, maxTokens, search }) {
   const apiKey = cfg?.apiKey || env.GEMINI_API_KEY;
   if (!apiKey) throw new ApiError("GEMINI_API_KEY secret is not set", 500);
 
@@ -139,13 +183,13 @@ export async function completeGemini(env, cfg, { system, parts, maxTokens }) {
   const url = `${cfg.provider.baseUrl}/models/${encodeURIComponent(model)}:generateContent`;
   let last = new ApiError("model returned an empty answer");
 
-  const shapeList = shapes(cfg);
+  const shapeList = shapes(cfg, search);
   for (const shape of shapeList) {
     let data;
     try {
       data = await callJson(url, {
         headers: { "x-goog-api-key": apiKey, "content-type": "application/json" },
-        body: buildGeminiBody(cfg, { system, parts, maxTokens }, shape),
+        body: buildGeminiBody(cfg, { system, parts, maxTokens, search }, shape),
         retryOn: retryableForGemini,
       });
     } catch (e) {
@@ -170,7 +214,10 @@ export async function completeGemini(env, cfg, { system, parts, maxTokens }) {
     }
 
     const text = readGeminiText(data);
-    if (text) return { text, usage: data.usageMetadata ?? null, model };
+    if (text) {
+      const { queries, sources } = readGeminiSources(data);
+      return { text, queries, sources, usage: data.usageMetadata ?? null, model };
+    }
 
     const candidate = data?.candidates?.[0];
     const finishReason = candidate?.finishReason;

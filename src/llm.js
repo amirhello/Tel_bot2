@@ -1,6 +1,6 @@
 import { ApiError, isCredentialError } from "./http.js";
 import { acquireKey, acquireKeyWithWait, clearKeyPoolCache, extractKeys, getKeyPool } from "./keyPool.js";
-import { DailyQuotaError, MinuteQuotaError, UnknownModelError, completeGemini } from "./providerGemini.js";
+import { DailyQuotaError, MinuteQuotaError, UnknownModelError, completeGemini, isSearchSupported } from "./providerGemini.js";
 import { completeOpenAI } from "./providerOpenai.js";
 import { DEFAULT_BASE_URLS, MULTIMODAL_MODELS, loadQuota, nextPacificMidnight, poolResumeTime, saveQuota } from "./store.js";
 
@@ -85,7 +85,16 @@ async function runGeminiPool(env, cfg, payload) {
 
   // Modality-aware routing: filter to multimodal models if media is present
   const hasMedia = hasMediaPayload(payload);
-  const pool = hasMedia ? rawPool.filter(isMultimodalModel) : rawPool;
+  let pool = hasMedia ? rawPool.filter(isMultimodalModel) : rawPool;
+
+  // Search-aware routing: prioritize models supporting googleSearch grounding if search is requested
+  const wantSearch = Boolean(payload?.search || cfg?.search);
+  if (wantSearch) {
+    const searchModels = pool.filter(isSearchSupported);
+    searchModels.sort((a, b) => (b.includes("2.5-flash") && !b.includes("lite") ? 1 : 0) - (a.includes("2.5-flash") && !a.includes("lite") ? 1 : 0));
+    const nonSearchModels = pool.filter((m) => !isSearchSupported(m));
+    pool = [...searchModels, ...nonSearchModels];
+  }
 
   const quota = await loadQuota(env);
   const now = Date.now();

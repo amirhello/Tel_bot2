@@ -4,8 +4,9 @@ import { appendArchive, archiveRecord } from "./archive.js";
 import { PoolExhausted, complete } from "./llm.js";
 import { collectMedia } from "./media.js";
 import { DEFAULT_PERSONAS, buildSystemPrompt, buildUserContent, replyContext } from "./prompt.js";
-import { botId, botUsername, sendAudioFile, sendChatAction, sendLong, sendText } from "./telegram.js";
-import { isCommand, isSupportedChat, shouldAnswer } from "./trigger.js";
+import { botId, botUsername, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText } from "./telegram.js";
+import { isCommand, isSupportedChat, shouldAnswer, detectSearchIntent } from "./trigger.js";
+import { hasRichFormatting, isRtlText, mdToRichHtml } from "./text.js";
 import { bumpStats, loadConfig, loadStats, usedToday } from "./store.js";
 import { shouldVoiceReply, speak } from "./voice.js";
 const ERRORS = [
@@ -222,6 +223,11 @@ function logPipelineTrace(msg, outcome, replyError, trace) {
     const isV = trace.intent.requested ? "🎙️ Voice YES" : "💬 Voice NO";
     console.log(`  ├─ Intent: ${isV} [${trace.intent.method || "default"}] ${trace.intent.reason || ""}`);
   }
+  if (trace?.search) {
+    const isS = trace.search.requested ? "🔍 Search YES" : "🔎 Search NO";
+    const srcCount = trace.search.sources?.length ? ` (${trace.search.sources.length} sources)` : "";
+    console.log(`  ├─ Search: ${isS}${srcCount} [${trace.search.reason || "auto"}]`);
+  }
   if (trace?.llm?.attempts?.length) {
     console.log(`  ├─ LLM Routing:`);
     for (const a of trace.llm.attempts) {
@@ -269,6 +275,38 @@ function logPipelineTrace(msg, outcome, replyError, trace) {
   }
 }
 
+/** Append web source citations from search grounding to the reply. */
+export function appendSources(text, sources) {
+  if (!Array.isArray(sources) || !sources.length) return text;
+  const lines = sources.map((s) => `• [${s.title}](${s.url})`);
+  return `${text.trim()}\n\n🌐 **منابع سرچ:**\n${lines.join("\n")}`;
+}
+
+/**
+ * Deliver text reply to Telegram, attempting Bot API 10.3 rich_message
+ * if text contains tables or rich tags, with graceful fallback to sendLong.
+ */
+export async function deliverTextReply(token, chatId, text, replyTo, opts = {}) {
+  const threadId = opts.message_thread_id ?? opts.threadId;
+  const model = opts.model;
+
+  if (hasRichFormatting(text)) {
+    try {
+      const isRtl = isRtlText(text);
+      const richHtml = mdToRichHtml(text);
+      const res = await sendRichMessage(token, chatId, richHtml, replyTo, isRtl, threadId);
+      if (res?.ok) {
+        return { kind: "rich_message", tgOut: "rich message delivered (Bot API 10.3)" };
+      }
+    } catch {
+      // Degrade gracefully to sendLong
+    }
+  }
+
+  await sendLong(token, chatId, text, replyTo, { model, message_thread_id: threadId });
+  return { kind: "text", tgOut: "text delivered" };
+}
+
 const config_enabled = (cfg) => cfg.enabled !== false;
 
 async function reply(env, msg, cfg, trace = {}) {
@@ -298,6 +336,9 @@ async function reply(env, msg, cfg, trace = {}) {
   const isVoice = await shouldVoiceReply(env, msg, cfg, text, trace);
   const actionKind = isVoice ? "upload_voice" : "typing";
 
+  const isSearch = detectSearchIntent(text);
+  trace.search = { requested: isSearch, reason: isSearch ? "search intent detected" : "standard prompt" };
+
   await sendChatAction(token, chatId, actionKind, threadId).catch(() => {});
   await bumpStats(env, { requests: 1, lastUsed: new Date().toISOString() });
 
@@ -316,11 +357,17 @@ async function reply(env, msg, cfg, trace = {}) {
       system: buildSystemPrompt(cfg, { isVoice }),
       parts: buildUserContent({ text, replyText, replyFromBot: fromBot, media, note }),
       maxTokens: cfg.maxTokens,
+      search: isSearch,
     });
     answer = res.text;
     usedModel = res.model;
     if (res.trace) trace.llm.attempts = res.trace;
     trace.llm.chosenModel = usedModel;
+
+    if (res.sources?.length) {
+      trace.search.sources = res.sources;
+      answer = appendSources(answer, res.sources);
+    }
   } finally {
     clearInterval(typingHeartbeat);
   }
@@ -358,17 +405,23 @@ async function reply(env, msg, cfg, trace = {}) {
       clearInterval(keep);
     }
     if (!audioSent) {
-      await sendLong(token, chatId, answer, msg.message_id, { model: usedModel, message_thread_id: threadId });
+      const deliveryRes = await deliverTextReply(token, chatId, answer, msg.message_id, {
+        model: usedModel,
+        message_thread_id: threadId,
+      });
       trace.delivery = { kind: "text_fallback", reason: vErrText };
       await bumpStats(env, { replies: 1 });
-      return { text: answer, model: usedModel, voice: false, voiceError: vErrText, tgOut: "text fallback delivered", trace };
+      return { text: answer, model: usedModel, voice: false, voiceError: vErrText, tgOut: deliveryRes.tgOut, trace };
     }
   }
 
-  await sendLong(token, chatId, answer, msg.message_id, { model: usedModel, message_thread_id: threadId });
-  trace.delivery = { kind: "text" };
+  const deliveryRes = await deliverTextReply(token, chatId, answer, msg.message_id, {
+    model: usedModel,
+    message_thread_id: threadId,
+  });
+  trace.delivery = { kind: deliveryRes.kind };
   await bumpStats(env, { replies: 1 });
-  return { text: answer, model: usedModel, tgOut: "text delivered", trace };
+  return { text: answer, model: usedModel, tgOut: deliveryRes.tgOut, trace };
 }
 
 /** Voice notes are answered with voice — unless either switch (input or voice) is off. */

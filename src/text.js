@@ -82,6 +82,14 @@ export function isRtlText(s) {
   return /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/.test(String(s ?? ""));
 }
 
+/** Check if text contains structured markdown tables or Telegram 10.3 rich tags. */
+export function hasRichFormatting(text) {
+  const s = String(text ?? "");
+  if (/(?:^|\n)\s*\|[^\n]+\|\r?\n\s*\|[\s\-:|]+\|\r?\n\s*\|[^\n]+\|/.test(s)) return true;
+  if (/<(table|details|tg-button|blockquote\s+expandable)/i.test(s)) return true;
+  return false;
+}
+
 /**
  * Converts markdown tables (| h1 | h2 |\n|---|---|\n| d1 | d2 |)
  * to Telegram native <table bordered striped> (Bot API 10.3+).

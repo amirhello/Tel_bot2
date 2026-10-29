@@ -959,6 +959,17 @@ function thinkingConfig(cfg) {
   return { thinkingConfig: { thinkingBudget: budget } };
 }
 
+const SEARCH_GROUNDING_MODELS = [
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash",
+];
+
+function isSearchSupported(model) {
+  const m = String(model || "").toLowerCase();
+  return SEARCH_GROUNDING_MODELS.some((sm) => m.includes(sm));
+}
+
 function safetySettings(cfg) {
   return Object.entries(SAFETY_CATEGORIES).map(([key, category]) => ({
     category,
@@ -966,7 +977,7 @@ function safetySettings(cfg) {
   }));
 }
 
-function buildGeminiBody(cfg, { system, parts, maxTokens }, shape = {}) {
+function buildGeminiBody(cfg, { system, parts, maxTokens, search }, shape = {}) {
   const body = {
     systemInstruction: { parts: [{ text: system }] },
     contents: [{ role: "user", parts: parts.map(toGeminiPart).filter(Boolean) }],
@@ -975,6 +986,13 @@ function buildGeminiBody(cfg, { system, parts, maxTokens }, shape = {}) {
   if (!shape.noThinking) body.generationConfig = { ...body.generationConfig, ...thinkingConfig(cfg) };
   else delete body.generationConfig.thinkingConfig;
   if (!shape.noSafety) body.safetySettings = safetySettings(cfg);
+
+  const model = cfg?.provider?.model;
+  const wantSearch = (search || cfg?.search) && !shape.noTools && isSearchSupported(model);
+  if (wantSearch) {
+    body.tools = [{ googleSearch: {} }];
+  }
+
   return body;
 }
 
@@ -986,6 +1004,31 @@ function readGeminiText(data) {
     .map((p) => p.text)
     .join("")
     .trim();
+}
+
+/** Extract search queries and source citations from Google Search Grounding metadata. */
+function readGeminiSources(data) {
+  const grounding = data?.candidates?.[0]?.groundingMetadata;
+  if (!grounding) return { queries: [], sources: [] };
+  const queries = Array.isArray(grounding.webSearchQueries) ? grounding.webSearchQueries : [];
+  const rawChunks = Array.isArray(grounding.groundingChunks) ? grounding.groundingChunks : [];
+  const sources = [];
+  const seen = new Set();
+  for (const c of rawChunks) {
+    const uri = c?.web?.uri;
+    if (!uri || seen.has(uri)) continue;
+    seen.add(uri);
+    let title = c?.web?.title;
+    if (!title) {
+      try {
+        title = new URL(uri).hostname.replace(/^www\./, "");
+      } catch {
+        title = "منبع وب";
+      }
+    }
+    sources.push({ title, url: uri });
+  }
+  return { queries, sources: sources.slice(0, 5) };
 }
 
 /**
@@ -1006,14 +1049,15 @@ const retryableForGemini = (e) =>
  * refuse a custom safety level. Drop the optional blocks one at a time rather than
  * letting the admin discover it as a broken bot.
  */
-function shapes(cfg) {
+function shapes(cfg, search) {
   const list = [{}];
+  if (search || cfg?.search) list.push({ noTools: true });
   if (cfg?.thinking) list.push({ noThinking: true });
-  list.push({ noThinking: true, noSafety: true });
+  list.push({ noTools: true, noThinking: true, noSafety: true });
   return list;
 }
 
-async function completeGemini(env, cfg, { system, parts, maxTokens }) {
+async function completeGemini(env, cfg, { system, parts, maxTokens, search }) {
   const apiKey = cfg?.apiKey || env.GEMINI_API_KEY;
   if (!apiKey) throw new ApiError("GEMINI_API_KEY secret is not set", 500);
 
@@ -1021,13 +1065,13 @@ async function completeGemini(env, cfg, { system, parts, maxTokens }) {
   const url = `${cfg.provider.baseUrl}/models/${encodeURIComponent(model)}:generateContent`;
   let last = new ApiError("model returned an empty answer");
 
-  const shapeList = shapes(cfg);
+  const shapeList = shapes(cfg, search);
   for (const shape of shapeList) {
     let data;
     try {
       data = await callJson(url, {
         headers: { "x-goog-api-key": apiKey, "content-type": "application/json" },
-        body: buildGeminiBody(cfg, { system, parts, maxTokens }, shape),
+        body: buildGeminiBody(cfg, { system, parts, maxTokens, search }, shape),
         retryOn: retryableForGemini,
       });
     } catch (e) {
@@ -1052,7 +1096,10 @@ async function completeGemini(env, cfg, { system, parts, maxTokens }) {
     }
 
     const text = readGeminiText(data);
-    if (text) return { text, usage: data.usageMetadata ?? null, model };
+    if (text) {
+      const { queries, sources } = readGeminiSources(data);
+      return { text, queries, sources, usage: data.usageMetadata ?? null, model };
+    }
 
     const candidate = data?.candidates?.[0];
     const finishReason = candidate?.finishReason;
@@ -1222,7 +1269,16 @@ async function runGeminiPool(env, cfg, payload) {
 
   // Modality-aware routing: filter to multimodal models if media is present
   const hasMedia = hasMediaPayload(payload);
-  const pool = hasMedia ? rawPool.filter(isMultimodalModel) : rawPool;
+  let pool = hasMedia ? rawPool.filter(isMultimodalModel) : rawPool;
+
+  // Search-aware routing: prioritize models supporting googleSearch grounding if search is requested
+  const wantSearch = Boolean(payload?.search || cfg?.search);
+  if (wantSearch) {
+    const searchModels = pool.filter(isSearchSupported);
+    searchModels.sort((a, b) => (b.includes("2.5-flash") && !b.includes("lite") ? 1 : 0) - (a.includes("2.5-flash") && !a.includes("lite") ? 1 : 0));
+    const nonSearchModels = pool.filter((m) => !isSearchSupported(m));
+    pool = [...searchModels, ...nonSearchModels];
+  }
 
   const quota = await loadQuota(env);
   const now = Date.now();
@@ -1509,6 +1565,14 @@ function isRtlText(s) {
   return /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/.test(String(s ?? ""));
 }
 
+/** Check if text contains structured markdown tables or Telegram 10.3 rich tags. */
+function hasRichFormatting(text) {
+  const s = String(text ?? "");
+  if (/(?:^|\n)\s*\|[^\n]+\|\r?\n\s*\|[\s\-:|]+\|\r?\n\s*\|[^\n]+\|/.test(s)) return true;
+  if (/<(table|details|tg-button|blockquote\s+expandable)/i.test(s)) return true;
+  return false;
+}
+
 /**
  * Converts markdown tables (| h1 | h2 |\n|---|---|\n| d1 | d2 |)
  * to Telegram native <table bordered striped> (Bot API 10.3+).
@@ -1649,7 +1713,7 @@ function isSupportedChat(msg) {
 }
 
 function isCommand(text, myBotUsername) {
-  const m = /^\/(start|help|ping)(?:@(\S+))?(?:\s|$)/i.exec(String(text ?? "").trim());
+  const m = /^\/(start|help|ping|search|google|find|جستجو|سرچ)(?:@(\S+))?(?:\s|$)/i.exec(String(text ?? "").trim());
   if (!m) return null;
   const targetBot = m[2];
   if (targetBot && myBotUsername) {
@@ -1660,6 +1724,36 @@ function isCommand(text, myBotUsername) {
     }
   }
   return m[1].toLowerCase();
+}
+
+/**
+ * Detects whether the user is asking for real-time information or web search.
+ * Triggers on commands, explicit search phrasing, and live topics (rates, weather, news, sports).
+ */
+function detectSearchIntent(rawText) {
+  const raw = String(rawText || "").trim();
+  if (!raw) return false;
+
+  // 1. Explicit search commands
+  if (/^\/(search|google|find|جستجو|سرچ)(?:@\S+)?(?:\s|$)/i.test(raw)) return true;
+
+  const text = normalizeFa(raw);
+
+  // 2. Explicit search requests in natural language
+  const explicitSearch = /(?:سرچ|جستجو|گوگل|توی\s*گوگل|تو\s*گوگل|توی\s*نت|تو\s*نت|برام\s*سرچ|آنلاین\s*بگرد|چک\s*کن)\s*(?:کن|بزن|کنید|کنی|بگرد)?/i;
+  if (explicitSearch.test(text)) return true;
+
+  // 3. Live financial, weather, news & sports topics
+  const liveTopics = [
+    /(?:قیمت|نرخ|ارزش)\s*(?:لحظه\s*ای|امروز|الان)?\s*(?:دلار|تتر|طلا|سکه|ارز|یورو|درهم|بیت\s*کوین|اتریوم|بورس|خودرو|پراید|آیفون)/i,
+    /(?:دلار|تتر|بیت\s*کوین|سکه\s*امامی|طلا|اتریوم)\s*(?:چنده|چند\s*شد|چند\s*است|قیمتش\s*چنده)/i,
+    /(?:آخرین\s*اخبار|اخبار\s*امروز|خبر\s*جدید|امروز\s*چه\s*خبر|سرخط\s*اخبار|خبرهای\s*جدید)/i,
+    /(?:وضعیت\s*هوا|آب\s*و\s*هوا|هواشناسی|دمای\s*هوا|پیش\s*بینی\s*هوا)/i,
+    /(?:نتیجه\s*بازی|جدول\s*لیگ|خلاصه\s*بازی|بازی\s*دیشب)/i,
+  ];
+  if (liveTopics.some((re) => re.test(text))) return true;
+
+  return false;
 }
 
 /** Groups: only when the wake word appears, or when Sayyad itself is replied to. */
@@ -2841,8 +2935,12 @@ const sendChatAction = (token, chatId, action = "typing", threadId) => {
  * Send a rich message (Bot API 10.3+) supporting native tables, expandable quotes,
  * buttons and native RTL. Returns telegram API response or null.
  */
-async function sendRichMessage(token, chatId, html, replyTo, isRtl = true) {
+async function sendRichMessage(token, chatId, html, replyTo, isRtl = true, threadIdOrOpts) {
   const base = { chat_id: chatId };
+  const tid = typeof threadIdOrOpts === "object"
+    ? (threadIdOrOpts?.message_thread_id ?? threadIdOrOpts?.threadId)
+    : threadIdOrOpts;
+  if (tid) base.message_thread_id = tid;
   if (replyTo) base.reply_parameters = { message_id: replyTo, allow_sending_without_reply: true };
 
   const payload = {
@@ -3944,6 +4042,7 @@ async function shouldVoiceReply(env, msg, cfg, text, traceContext = null) {
 
 
 
+
 const ERRORS = [
   "الان یه کم درگیرم. یه بار دیگه بفرست، شاید سر جا شد.",
   "یه چیزی قاطی شد. دوباره بزن، درستش می‌کنم.",
@@ -4158,6 +4257,11 @@ function logPipelineTrace(msg, outcome, replyError, trace) {
     const isV = trace.intent.requested ? "🎙️ Voice YES" : "💬 Voice NO";
     console.log(`  ├─ Intent: ${isV} [${trace.intent.method || "default"}] ${trace.intent.reason || ""}`);
   }
+  if (trace?.search) {
+    const isS = trace.search.requested ? "🔍 Search YES" : "🔎 Search NO";
+    const srcCount = trace.search.sources?.length ? ` (${trace.search.sources.length} sources)` : "";
+    console.log(`  ├─ Search: ${isS}${srcCount} [${trace.search.reason || "auto"}]`);
+  }
   if (trace?.llm?.attempts?.length) {
     console.log(`  ├─ LLM Routing:`);
     for (const a of trace.llm.attempts) {
@@ -4205,6 +4309,38 @@ function logPipelineTrace(msg, outcome, replyError, trace) {
   }
 }
 
+/** Append web source citations from search grounding to the reply. */
+function appendSources(text, sources) {
+  if (!Array.isArray(sources) || !sources.length) return text;
+  const lines = sources.map((s) => `• [${s.title}](${s.url})`);
+  return `${text.trim()}\n\n🌐 **منابع سرچ:**\n${lines.join("\n")}`;
+}
+
+/**
+ * Deliver text reply to Telegram, attempting Bot API 10.3 rich_message
+ * if text contains tables or rich tags, with graceful fallback to sendLong.
+ */
+async function deliverTextReply(token, chatId, text, replyTo, opts = {}) {
+  const threadId = opts.message_thread_id ?? opts.threadId;
+  const model = opts.model;
+
+  if (hasRichFormatting(text)) {
+    try {
+      const isRtl = isRtlText(text);
+      const richHtml = mdToRichHtml(text);
+      const res = await sendRichMessage(token, chatId, richHtml, replyTo, isRtl, threadId);
+      if (res?.ok) {
+        return { kind: "rich_message", tgOut: "rich message delivered (Bot API 10.3)" };
+      }
+    } catch {
+      // Degrade gracefully to sendLong
+    }
+  }
+
+  await sendLong(token, chatId, text, replyTo, { model, message_thread_id: threadId });
+  return { kind: "text", tgOut: "text delivered" };
+}
+
 const config_enabled = (cfg) => cfg.enabled !== false;
 
 async function reply(env, msg, cfg, trace = {}) {
@@ -4234,6 +4370,9 @@ async function reply(env, msg, cfg, trace = {}) {
   const isVoice = await shouldVoiceReply(env, msg, cfg, text, trace);
   const actionKind = isVoice ? "upload_voice" : "typing";
 
+  const isSearch = detectSearchIntent(text);
+  trace.search = { requested: isSearch, reason: isSearch ? "search intent detected" : "standard prompt" };
+
   await sendChatAction(token, chatId, actionKind, threadId).catch(() => {});
   await bumpStats(env, { requests: 1, lastUsed: new Date().toISOString() });
 
@@ -4252,11 +4391,17 @@ async function reply(env, msg, cfg, trace = {}) {
       system: buildSystemPrompt(cfg, { isVoice }),
       parts: buildUserContent({ text, replyText, replyFromBot: fromBot, media, note }),
       maxTokens: cfg.maxTokens,
+      search: isSearch,
     });
     answer = res.text;
     usedModel = res.model;
     if (res.trace) trace.llm.attempts = res.trace;
     trace.llm.chosenModel = usedModel;
+
+    if (res.sources?.length) {
+      trace.search.sources = res.sources;
+      answer = appendSources(answer, res.sources);
+    }
   } finally {
     clearInterval(typingHeartbeat);
   }
@@ -4294,17 +4439,23 @@ async function reply(env, msg, cfg, trace = {}) {
       clearInterval(keep);
     }
     if (!audioSent) {
-      await sendLong(token, chatId, answer, msg.message_id, { model: usedModel, message_thread_id: threadId });
+      const deliveryRes = await deliverTextReply(token, chatId, answer, msg.message_id, {
+        model: usedModel,
+        message_thread_id: threadId,
+      });
       trace.delivery = { kind: "text_fallback", reason: vErrText };
       await bumpStats(env, { replies: 1 });
-      return { text: answer, model: usedModel, voice: false, voiceError: vErrText, tgOut: "text fallback delivered", trace };
+      return { text: answer, model: usedModel, voice: false, voiceError: vErrText, tgOut: deliveryRes.tgOut, trace };
     }
   }
 
-  await sendLong(token, chatId, answer, msg.message_id, { model: usedModel, message_thread_id: threadId });
-  trace.delivery = { kind: "text" };
+  const deliveryRes = await deliverTextReply(token, chatId, answer, msg.message_id, {
+    model: usedModel,
+    message_thread_id: threadId,
+  });
+  trace.delivery = { kind: deliveryRes.kind };
   await bumpStats(env, { replies: 1 });
-  return { text: answer, model: usedModel, tgOut: "text delivered", trace };
+  return { text: answer, model: usedModel, tgOut: deliveryRes.tgOut, trace };
 }
 
 /** Voice notes are answered with voice — unless either switch (input or voice) is off. */
@@ -4594,4 +4745,4 @@ class FileKV {
   }
 }
 
-export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, NodeWebSocket, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, UnknownModelError, VOICE_POSITIVE_RE, acquireKey, acquireKeyWithWait, appendArchive, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, detectMedia, detectVoiceIntent, diagnostics, downloadFile, endpointOf, esc, extractKeys, failedLoginAttempts, formatRawError, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, hasMediaPayload, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiText, readPatch, recordFailedLogin, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText, serialize, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };
+export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, NodeWebSocket, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, SEARCH_GROUNDING_MODELS, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, UnknownModelError, VOICE_POSITIVE_RE, acquireKey, acquireKeyWithWait, appendArchive, appendSources, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, deliverTextReply, detectMedia, detectSearchIntent, detectVoiceIntent, diagnostics, downloadFile, endpointOf, esc, extractKeys, failedLoginAttempts, formatRawError, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, hasMediaPayload, hasRichFormatting, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isSearchSupported, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiSources, readGeminiText, readPatch, recordFailedLogin, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText, serialize, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };

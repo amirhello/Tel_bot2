@@ -1,6 +1,6 @@
 import { assert, t, done, M } from "./harness.mjs";
 
-const { mdToHtml, splitText, normalizeFa, toBase64, clampInt, truncate, preview } = M;
+const { mdToHtml, splitText, normalizeFa, toBase64, clampInt, truncate, preview, hasRichFormatting, isRtlText, mdToRichHtml } = M;
 
 await t("mdToHtml renders bold, italic and inline code", () => {
   assert.equal(mdToHtml("سلام **دنیا** و *این*"), "سلام <b>دنیا</b> و <i>این</i>");
@@ -96,6 +96,26 @@ await t("truncate and preview keep text readable", () => {
   assert.equal(truncate("abc", 10), "abc");
   assert.equal(preview("a\n\n  b   c", 90), "a b c");
   assert.equal(preview("x".repeat(200), 10).length, 10);
+});
+
+await t("hasRichFormatting identifies markdown tables and rich telegram tags", () => {
+  assert.equal(hasRichFormatting("متن ساده"), false);
+  assert.equal(hasRichFormatting("| نام | قیمت |\n|---|---|\n| تتر | ۶۵ |"), true);
+  assert.equal(hasRichFormatting("<table bordered striped><tr><td>x</td></tr></table>"), true);
+  assert.equal(hasRichFormatting("<details><summary>بیشتر</summary>توضیحات</details>"), true);
+  assert.equal(hasRichFormatting("<blockquote expandable>نقل قول</blockquote>"), true);
+});
+
+await t("mdToRichHtml converts tables and quotes to Telegram Bot API 10.3 tags", () => {
+  const tableMd = "| شهر | دما |\n|---|---|\n| تهران | ۲۵ |";
+  const rich = mdToRichHtml(tableMd);
+  assert.ok(rich.includes("<table bordered striped>"));
+  assert.ok(rich.includes("<th>شهر</th>"));
+  assert.ok(rich.includes("<td>تهران</td>"));
+
+  const quoteMd = "> این یک نقل قول است";
+  const quoteRich = mdToRichHtml(quoteMd);
+  assert.ok(quoteRich.includes("<blockquote expandable>"));
 });
 
 done();

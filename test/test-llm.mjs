@@ -12,10 +12,13 @@ import {
   toGeminiPart,
   buildGeminiBody,
   readGeminiText,
+  readGeminiSources,
+  isSearchSupported,
   thinkingConfig,
   safetySettings,
   completeGemini,
 } from "../src/providerGemini.js";
+import { appendSources } from "../src/answer.js";
 import { toOpenAIPart, completeOpenAI } from "../src/providerOpenai.js";
 import { ApiError } from "../src/http.js";
 
@@ -349,6 +352,66 @@ await t("BUG-01: individual key DailyQuotaError does not immediately park model 
   const storedQuota = testEnv.CONFIG.store["quota:v1"] ? JSON.parse(testEnv.CONFIG.store["quota:v1"]) : {};
   assert.equal("gemini-3.5-flash-lite" in storedQuota, false, "model must not be parked when another key succeeded");
   responder = () => json({ choices: [{ message: { content: "ok" } }] });
+});
+
+await t("isSearchSupported identifies search-capable models", () => {
+  assert.equal(isSearchSupported("gemini-2.5-flash"), true);
+  assert.equal(isSearchSupported("gemini-2.5-flash-lite"), true);
+  assert.equal(isSearchSupported("gemini-2.0-flash"), true);
+  assert.equal(isSearchSupported("gemini-3.5-flash-lite"), false);
+  assert.equal(isSearchSupported("gemini-3.8-flash"), false);
+  assert.equal(isSearchSupported("gemma-4-31b"), false);
+});
+
+await t("buildGeminiBody adds googleSearch tool only for search-supported models", () => {
+  const searchCfg = cfg({ provider: { kind: "gemini", model: "gemini-2.5-flash" } });
+  const bodyWithSearch = buildGeminiBody(searchCfg, { system: "SYS", parts: [{ type: "text", text: "Q" }], search: true });
+  assert.deepEqual(bodyWithSearch.tools, [{ googleSearch: {} }]);
+
+  const nonSearchCfg = cfg({ provider: { kind: "gemini", model: "gemini-3.5-flash-lite" } });
+  const bodyWithoutSearch = buildGeminiBody(nonSearchCfg, { system: "SYS", parts: [{ type: "text", text: "Q" }], search: true });
+  assert.equal(bodyWithoutSearch.tools, undefined);
+});
+
+await t("readGeminiSources parses groundingMetadata into clean sources", () => {
+  const fakeData = {
+    candidates: [
+      {
+        groundingMetadata: {
+          webSearchQueries: ["قیمت دلار امروز"],
+          groundingChunks: [
+            { web: { uri: "https://tgju.org/profile/price_dollar_rl", title: "قیمت دلار و ارز" } },
+            { web: { uri: "https://isna.ir/news/123", title: "خبرگزاری ایسنا" } },
+            { web: { uri: "https://tgju.org/profile/price_dollar_rl", title: "duplicate" } },
+            { web: { uri: "https://example.com/page" } },
+          ],
+        },
+      },
+    ],
+  };
+  const { queries, sources } = readGeminiSources(fakeData);
+  assert.deepEqual(queries, ["قیمت دلار امروز"]);
+  assert.equal(sources.length, 3);
+  assert.equal(sources[0].title, "قیمت دلار و ارز");
+  assert.equal(sources[0].url, "https://tgju.org/profile/price_dollar_rl");
+  assert.equal(sources[1].url, "https://isna.ir/news/123");
+  assert.equal(sources[2].title, "example.com");
+});
+
+await t("appendSources formats search citations as clean markdown footnotes", () => {
+  const answer = "قیمت امروز ۶۵ هزار تومان است.";
+  const sources = [
+    { title: "سایت طلا و ارز", url: "https://tgju.org" },
+    { title: "ایسنا", url: "https://isna.ir" },
+  ];
+  const formatted = appendSources(answer, sources);
+  assert.ok(formatted.startsWith("قیمت امروز ۶۵ هزار تومان است."));
+  assert.ok(formatted.includes("🌐 **منابع سرچ:**"));
+  assert.ok(formatted.includes("• [سایت طلا و ارز](https://tgju.org)"));
+  assert.ok(formatted.includes("• [ایسنا](https://isna.ir)"));
+
+  assert.equal(appendSources("متن عادی", []), "متن عادی");
+  assert.equal(appendSources("متن عادی", null), "متن عادی");
 });
 
 done();

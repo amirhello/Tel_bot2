@@ -87,8 +87,12 @@ export const sendChatAction = (token, chatId, action = "typing", threadId) => {
  * Send a rich message (Bot API 10.3+) supporting native tables, expandable quotes,
  * buttons and native RTL. Returns telegram API response or null.
  */
-export async function sendRichMessage(token, chatId, html, replyTo, isRtl = true) {
+export async function sendRichMessage(token, chatId, html, replyTo, isRtl = true, threadIdOrOpts) {
   const base = { chat_id: chatId };
+  const tid = typeof threadIdOrOpts === "object"
+    ? (threadIdOrOpts?.message_thread_id ?? threadIdOrOpts?.threadId)
+    : threadIdOrOpts;
+  if (tid) base.message_thread_id = tid;
   if (replyTo) base.reply_parameters = { message_id: replyTo, allow_sending_without_reply: true };
 
   const payload = {
