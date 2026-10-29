@@ -37,6 +37,7 @@ function archiveRecord(msg, outcome) {
     if (outcome.model) r.model = outcome.model;
     if (outcome.reply) r.reply = String(outcome.reply).slice(0, 4000);
     if (outcome.error) r.err = String(outcome.error).slice(0, 1000);
+    if (outcome.rawError) r.rawErr = String(outcome.rawError).slice(0, 4000);
     if (outcome.reason) r.reason = String(outcome.reason).slice(0, 300);
     if (outcome.ms !== undefined) r.ms = outcome.ms;
     if (outcome.voice !== undefined) r.voice = outcome.voice;
@@ -89,10 +90,16 @@ async function appendArchive(env, record) {
 
 /** An HTTP failure that carries its status, so callers can tell 400 from 429. */
 class ApiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, details = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    if (details) {
+      this.details = details;
+      if (details.url) this.url = details.url;
+      if (details.model) this.model = details.model;
+      if (details.code) this.code = details.code;
+    }
   }
 }
 
@@ -151,11 +158,11 @@ async function callJson(url, { headers, body, retries = 2, backoff = DEFAULT_BAC
       if (parsed && res.ok && !json?.error) return json;
 
       error = parsed
-        ? new ApiError(`API ${res.status}: ${errorMessage(json, text)}`, res.status)
-        : new ApiError(`API returned non-JSON (${res.status}): ${text.slice(0, 200)}`, res.status);
+        ? new ApiError(`API ${res.status}: ${errorMessage(json, text)}`, res.status, { url, status: res.status, body: json || text })
+        : new ApiError(`API returned non-JSON (${res.status}): ${text.slice(0, 200)}`, res.status, { url, status: res.status, rawText: text.slice(0, 1000) });
     } catch (e) {
       if (e instanceof ApiError) throw e;
-      error = new ApiError(`network error: ${String(e?.message ?? e)}`, 0);
+      error = new ApiError(`network error: ${String(e?.message ?? e)}`, 0, { url, originalError: String(e?.stack ?? e?.message ?? e) });
     }
 
     if (!retryOn(error)) throw error;
@@ -240,8 +247,8 @@ function defaultConfig(personas) {
     schemaVersion: SCHEMA_VERSION,
     enabled: true,
     mode: "smart",
-    maxTokens: 2000,
-    thinking: "medium",
+    maxTokens: 8000,
+    thinking: "low",
     extra: "",
     dailyCap: 1000, // across the whole model pool, not per model
     provider: {
@@ -298,8 +305,8 @@ function normalizeConfig(saved, personas) {
     voiceName: String(saved?.voice?.voiceName || base.voice.voiceName || "Aoede").trim(),
   };
 
-  c.thinking = THINKING_LEVELS.includes(c.thinking) ? c.thinking : "medium";
-  c.maxTokens = clampNum(c.maxTokens, 200, 8000, 2000);
+  c.thinking = THINKING_LEVELS.includes(c.thinking) ? c.thinking : "low";
+  c.maxTokens = clampNum(c.maxTokens, 200, 8000, 8000);
   c.dailyCap = clampNum(c.dailyCap, 0, 100000, 1000);
   c.extra = String(c.extra ?? "").slice(0, 4000);
   c.enabled = c.enabled !== false;
@@ -925,18 +932,22 @@ function toGeminiPart(part) {
 const THINKING_BUDGETS = {
   off: 0,
   minimal: 1024,
-  low: 2048,
+  low: 2000,
   medium: 4096,
   high: 8192,
 };
 
 /**
  * thinkingConfig. Google Gemini REST API expects thinkingConfig.thinkingBudget (integer token count:
- * minimal: 1024, low: 2048, medium: 4096, high: 8192, off: 0).
+ * minimal: 1024, low: 2000, medium: 4096, high: 8192, off: 0).
  */
 function thinkingConfig(cfg) {
+  if (cfg?.thinking === "off") return { thinkingConfig: { thinkingBudget: 0 } };
+  if (typeof cfg?.thinkingBudget === "number") {
+    return { thinkingConfig: { thinkingBudget: cfg.thinkingBudget } };
+  }
   if (!cfg?.thinking) return {};
-  const budget = THINKING_BUDGETS[cfg.thinking] !== undefined ? THINKING_BUDGETS[cfg.thinking] : 4096;
+  const budget = THINKING_BUDGETS[cfg.thinking] !== undefined ? THINKING_BUDGETS[cfg.thinking] : 2000;
   return { thinkingConfig: { thinkingBudget: budget } };
 }
 
@@ -1012,6 +1023,10 @@ async function completeGemini(env, cfg, { system, parts, maxTokens }) {
         retryOn: retryableForGemini,
       });
     } catch (e) {
+      if (e instanceof ApiError) {
+        e.model = model;
+        e.url = url;
+      }
       if (e.status === 404) throw new UnknownModelError(model, `${model}: ${e.message}`);
       const isQuota =
         (e.status === 429 || e.status === 503) &&
@@ -1249,6 +1264,8 @@ async function runGeminiPool(env, cfg, payload) {
         return { ...r, model, trace };
       } catch (e) {
         const ms = Date.now() - attemptStart;
+        e.keyIndex = keyHandle.index;
+        e.model = model;
         last = e;
         lastModelQuotaError = e;
         keyHandle.release(e);
@@ -1327,10 +1344,20 @@ async function runGeminiPool(env, cfg, payload) {
       : fallbackReset;
     const err = new PoolExhausted(resumeAt, last?.message);
     err.trace = trace;
+    if (last?.keyIndex !== undefined) err.keyIndex = last.keyIndex;
+    if (last?.model) err.model = last.model;
+    if (last?.url) err.url = last.url;
+    if (last?.status !== undefined) err.status = last.status;
+    if (last?.details) err.details = last.details;
     throw err;
   }
   const err = last ?? new PoolExhausted(fallbackReset, "no model available");
   err.trace = trace;
+  if (last?.keyIndex !== undefined) err.keyIndex = last.keyIndex;
+  if (last?.model) err.model = last.model;
+  if (last?.url) err.url = last.url;
+  if (last?.status !== undefined) err.status = last.status;
+  if (last?.details) err.details = last.details;
   throw err;
 }
 
@@ -2005,6 +2032,10 @@ label.check input{width:auto}
 .traceul{margin:4px 0 8px 18px;padding:0;list-style:disc}
 .traceul li{margin:3px 0}
 .tracebox code{background:#172033;padding:2px 5px;border-radius:4px;color:#e2e8f0;font-size:11px}
+.rawerr{margin-top:10px;background:#180b0c;border:1px solid #6b2125;border-radius:8px;padding:8px 12px;font-family:ui-monospace,monospace;font-size:12px;color:#fca5a5;direction:ltr;text-align:left}
+.rawerr summary{cursor:pointer;font-weight:600;color:#f87171;outline:none;user-select:none;display:flex;align-items:center;gap:6px}
+.rawerr summary:hover{color:#fca5a5}
+.rawerr pre{margin:8px 0 0;padding:10px;background:#0d0405;border:1px solid #451316;border-radius:6px;max-height:240px;overflow:auto;font-size:11px;color:#fecaca;white-space:pre-wrap;word-break:break-all}
 `;
 
 const LOGIN = `<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -2343,6 +2374,15 @@ function logCard(it){
     er.appendChild(el("b", null, "Error: "));
     er.appendChild(document.createTextNode(it.err));
     body.appendChild(er);
+  }
+  if (it.rawErr || it.err) {
+    var rawText = it.rawErr || it.err;
+    var rawDet = el("details", "rawerr");
+    var rawSum = el("summary", null, "🔍 Raw Error Details");
+    rawDet.appendChild(rawSum);
+    var rawPre = el("pre", null, rawText);
+    rawDet.appendChild(rawPre);
+    body.appendChild(rawDet);
   }
   if (it.trace) {
     var trBox = el("div", "tracebox");
@@ -4013,6 +4053,7 @@ async function processMessage(env, msg) {
             model: outcome?.model,
             reply: outcome?.text,
             error: replyError ? String(replyError.message ?? replyError) : null,
+            rawError: formatRawError(replyError, fullTrace),
             ms: Date.now() - startedAt,
             reason: outcome?.reason,
             voice: outcome?.voice,
@@ -4026,6 +4067,46 @@ async function processMessage(env, msg) {
   } catch (outerErr) {
     console.error("processMessage fatal error:", outerErr);
   }
+}
+
+function formatRawError(err, trace) {
+  if (!err) return null;
+  const lines = [];
+  lines.push(`Message: ${err.message || String(err)}`);
+  if (err.name) lines.push(`Type: ${err.name}`);
+  if (err.status !== undefined) lines.push(`HTTP Status: ${err.status}`);
+  if (err.code) lines.push(`Code: ${err.code}`);
+  const failedModel = err.model || trace?.llm?.chosenModel || trace?.llm?.attempts?.at(-1)?.model;
+  if (failedModel) lines.push(`Target Model: ${failedModel}`);
+  const failedKey = err.keyIndex !== undefined ? err.keyIndex : trace?.llm?.attempts?.at(-1)?.keyIndex;
+  if (failedKey !== undefined) lines.push(`Key Index: Key #${failedKey + 1}`);
+  if (err.url) lines.push(`URL: ${err.url}`);
+
+  if (trace?.llm?.attempts?.length) {
+    lines.push(`\n[LLM Attempts History]`);
+    for (const a of trace.llm.attempts) {
+      const keyPart = a.keyIndex !== undefined ? ` Key #${a.keyIndex + 1}` : "";
+      const msPart = a.ms !== undefined ? ` in ${a.ms}ms` : "";
+      const errPart = a.error ? ` (${a.error})` : "";
+      lines.push(`• ${a.model}${keyPart} -> ${a.status}${msPart}${errPart}`);
+    }
+  }
+
+  if (err.details) {
+    lines.push(`\n[Raw Details / Payload]`);
+    try {
+      lines.push(typeof err.details === "object" ? JSON.stringify(err.details, null, 2) : String(err.details));
+    } catch {
+      lines.push(String(err.details));
+    }
+  }
+
+  if (err.stack) {
+    lines.push(`\n[Stack Trace]`);
+    lines.push(err.stack);
+  }
+
+  return lines.join("\n");
 }
 
 function logPipelineTrace(msg, outcome, replyError, trace) {
@@ -4060,6 +4141,24 @@ function logPipelineTrace(msg, outcome, replyError, trace) {
   }
   if (replyError) {
     console.log(`  └─ ❌ Error: ${replyError.message || replyError}`);
+    console.log(`     ┌─ 🔍 Raw Error Info:`);
+    if (replyError.name) console.log(`     │  Type: ${replyError.name}`);
+    if (replyError.status !== undefined) console.log(`     │  HTTP Status: ${replyError.status}`);
+    if (replyError.code) console.log(`     │  Code: ${replyError.code}`);
+    const failedModel = replyError.model || trace?.llm?.chosenModel || trace?.llm?.attempts?.at(-1)?.model;
+    if (failedModel) console.log(`     │  Model: ${failedModel}`);
+    const failedKey = replyError.keyIndex !== undefined ? replyError.keyIndex : trace?.llm?.attempts?.at(-1)?.keyIndex;
+    if (failedKey !== undefined) console.log(`     │  Key: Key #${failedKey + 1}`);
+    if (replyError.url) console.log(`     │  URL: ${replyError.url}`);
+    if (replyError.details) {
+      const dStr = typeof replyError.details === "object" ? JSON.stringify(replyError.details) : String(replyError.details);
+      console.log(`     │  Raw Payload: ${dStr.slice(0, 300)}`);
+    }
+    if (replyError.stack) {
+      const firstStack = replyError.stack.split("\n")[1]?.trim();
+      if (firstStack) console.log(`     │  Location: ${firstStack}`);
+    }
+    console.log(`     └────────────────────────`);
   } else {
     console.log(`  └─ 📤 Telegram Out: ${outcome?.tgOut || "delivered"}`);
   }
@@ -4454,4 +4553,4 @@ class FileKV {
   }
 }
 
-export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, NodeWebSocket, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, UnknownModelError, VOICE_POSITIVE_RE, acquireKey, acquireKeyWithWait, appendArchive, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, detectMedia, detectVoiceIntent, diagnostics, downloadFile, endpointOf, esc, extractKeys, failedLoginAttempts, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, hasMediaPayload, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiText, readPatch, recordFailedLogin, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText, serialize, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };
+export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, NodeWebSocket, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, UnknownModelError, VOICE_POSITIVE_RE, acquireKey, acquireKeyWithWait, appendArchive, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, detectMedia, detectVoiceIntent, diagnostics, downloadFile, endpointOf, esc, extractKeys, failedLoginAttempts, formatRawError, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, hasMediaPayload, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiText, readPatch, recordFailedLogin, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText, serialize, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };

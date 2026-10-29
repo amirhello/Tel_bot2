@@ -3,10 +3,16 @@
 
 /** An HTTP failure that carries its status, so callers can tell 400 from 429. */
 export class ApiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, details = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    if (details) {
+      this.details = details;
+      if (details.url) this.url = details.url;
+      if (details.model) this.model = details.model;
+      if (details.code) this.code = details.code;
+    }
   }
 }
 
@@ -65,11 +71,11 @@ export async function callJson(url, { headers, body, retries = 2, backoff = DEFA
       if (parsed && res.ok && !json?.error) return json;
 
       error = parsed
-        ? new ApiError(`API ${res.status}: ${errorMessage(json, text)}`, res.status)
-        : new ApiError(`API returned non-JSON (${res.status}): ${text.slice(0, 200)}`, res.status);
+        ? new ApiError(`API ${res.status}: ${errorMessage(json, text)}`, res.status, { url, status: res.status, body: json || text })
+        : new ApiError(`API returned non-JSON (${res.status}): ${text.slice(0, 200)}`, res.status, { url, status: res.status, rawText: text.slice(0, 1000) });
     } catch (e) {
       if (e instanceof ApiError) throw e;
-      error = new ApiError(`network error: ${String(e?.message ?? e)}`, 0);
+      error = new ApiError(`network error: ${String(e?.message ?? e)}`, 0, { url, originalError: String(e?.stack ?? e?.message ?? e) });
     }
 
     if (!retryOn(error)) throw error;

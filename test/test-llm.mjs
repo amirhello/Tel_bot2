@@ -73,6 +73,7 @@ await t("video and audio travel as inlineData on the native path", () => {
 });
 
 await t("thinking maps to thinkingConfig.thinkingBudget", () => {
+  assert.deepEqual(thinkingConfig(cfg({ thinking: "low" })), { thinkingConfig: { thinkingBudget: 2000 } });
   assert.deepEqual(thinkingConfig(cfg({ thinking: "medium" })), { thinkingConfig: { thinkingBudget: 4096 } });
   assert.deepEqual(thinkingConfig(cfg({ thinking: "high" })), { thinkingConfig: { thinkingBudget: 8192 } });
   assert.deepEqual(thinkingConfig(cfg({ thinking: "off" })), { thinkingConfig: { thinkingBudget: 0 } });

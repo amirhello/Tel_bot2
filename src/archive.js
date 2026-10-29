@@ -24,6 +24,7 @@ export function archiveRecord(msg, outcome) {
     if (outcome.model) r.model = outcome.model;
     if (outcome.reply) r.reply = String(outcome.reply).slice(0, 4000);
     if (outcome.error) r.err = String(outcome.error).slice(0, 1000);
+    if (outcome.rawError) r.rawErr = String(outcome.rawError).slice(0, 4000);
     if (outcome.reason) r.reason = String(outcome.reason).slice(0, 300);
     if (outcome.ms !== undefined) r.ms = outcome.ms;
     if (outcome.voice !== undefined) r.voice = outcome.voice;

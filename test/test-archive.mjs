@@ -105,10 +105,12 @@ await t("archiveRecord preserves AI reply, model, and error details", () => {
     answered: true,
     ok: false,
     error: "429 quota exceeded",
+    rawError: "Detailed raw error trace\nHTTP 429\nKey #1",
   });
   assert.equal(fail.a, true);
   assert.equal(fail.ok, false);
   assert.equal(fail.err, "429 quota exceeded");
+  assert.equal(fail.rawErr, "Detailed raw error trace\nHTTP 429\nKey #1");
   assert.equal(fail.reply, undefined);
 });
 

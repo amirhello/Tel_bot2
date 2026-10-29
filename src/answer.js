@@ -158,6 +158,7 @@ export async function processMessage(env, msg) {
             model: outcome?.model,
             reply: outcome?.text,
             error: replyError ? String(replyError.message ?? replyError) : null,
+            rawError: formatRawError(replyError, fullTrace),
             ms: Date.now() - startedAt,
             reason: outcome?.reason,
             voice: outcome?.voice,
@@ -171,6 +172,46 @@ export async function processMessage(env, msg) {
   } catch (outerErr) {
     console.error("processMessage fatal error:", outerErr);
   }
+}
+
+export function formatRawError(err, trace) {
+  if (!err) return null;
+  const lines = [];
+  lines.push(`Message: ${err.message || String(err)}`);
+  if (err.name) lines.push(`Type: ${err.name}`);
+  if (err.status !== undefined) lines.push(`HTTP Status: ${err.status}`);
+  if (err.code) lines.push(`Code: ${err.code}`);
+  const failedModel = err.model || trace?.llm?.chosenModel || trace?.llm?.attempts?.at(-1)?.model;
+  if (failedModel) lines.push(`Target Model: ${failedModel}`);
+  const failedKey = err.keyIndex !== undefined ? err.keyIndex : trace?.llm?.attempts?.at(-1)?.keyIndex;
+  if (failedKey !== undefined) lines.push(`Key Index: Key #${failedKey + 1}`);
+  if (err.url) lines.push(`URL: ${err.url}`);
+
+  if (trace?.llm?.attempts?.length) {
+    lines.push(`\n[LLM Attempts History]`);
+    for (const a of trace.llm.attempts) {
+      const keyPart = a.keyIndex !== undefined ? ` Key #${a.keyIndex + 1}` : "";
+      const msPart = a.ms !== undefined ? ` in ${a.ms}ms` : "";
+      const errPart = a.error ? ` (${a.error})` : "";
+      lines.push(`• ${a.model}${keyPart} -> ${a.status}${msPart}${errPart}`);
+    }
+  }
+
+  if (err.details) {
+    lines.push(`\n[Raw Details / Payload]`);
+    try {
+      lines.push(typeof err.details === "object" ? JSON.stringify(err.details, null, 2) : String(err.details));
+    } catch {
+      lines.push(String(err.details));
+    }
+  }
+
+  if (err.stack) {
+    lines.push(`\n[Stack Trace]`);
+    lines.push(err.stack);
+  }
+
+  return lines.join("\n");
 }
 
 function logPipelineTrace(msg, outcome, replyError, trace) {
@@ -205,6 +246,24 @@ function logPipelineTrace(msg, outcome, replyError, trace) {
   }
   if (replyError) {
     console.log(`  └─ ❌ Error: ${replyError.message || replyError}`);
+    console.log(`     ┌─ 🔍 Raw Error Info:`);
+    if (replyError.name) console.log(`     │  Type: ${replyError.name}`);
+    if (replyError.status !== undefined) console.log(`     │  HTTP Status: ${replyError.status}`);
+    if (replyError.code) console.log(`     │  Code: ${replyError.code}`);
+    const failedModel = replyError.model || trace?.llm?.chosenModel || trace?.llm?.attempts?.at(-1)?.model;
+    if (failedModel) console.log(`     │  Model: ${failedModel}`);
+    const failedKey = replyError.keyIndex !== undefined ? replyError.keyIndex : trace?.llm?.attempts?.at(-1)?.keyIndex;
+    if (failedKey !== undefined) console.log(`     │  Key: Key #${failedKey + 1}`);
+    if (replyError.url) console.log(`     │  URL: ${replyError.url}`);
+    if (replyError.details) {
+      const dStr = typeof replyError.details === "object" ? JSON.stringify(replyError.details) : String(replyError.details);
+      console.log(`     │  Raw Payload: ${dStr.slice(0, 300)}`);
+    }
+    if (replyError.stack) {
+      const firstStack = replyError.stack.split("\n")[1]?.trim();
+      if (firstStack) console.log(`     │  Location: ${firstStack}`);
+    }
+    console.log(`     └────────────────────────`);
   } else {
     console.log(`  └─ 📤 Telegram Out: ${outcome?.tgOut || "delivered"}`);
   }

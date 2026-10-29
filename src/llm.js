@@ -135,6 +135,8 @@ async function runGeminiPool(env, cfg, payload) {
         return { ...r, model, trace };
       } catch (e) {
         const ms = Date.now() - attemptStart;
+        e.keyIndex = keyHandle.index;
+        e.model = model;
         last = e;
         lastModelQuotaError = e;
         keyHandle.release(e);
@@ -213,10 +215,20 @@ async function runGeminiPool(env, cfg, payload) {
       : fallbackReset;
     const err = new PoolExhausted(resumeAt, last?.message);
     err.trace = trace;
+    if (last?.keyIndex !== undefined) err.keyIndex = last.keyIndex;
+    if (last?.model) err.model = last.model;
+    if (last?.url) err.url = last.url;
+    if (last?.status !== undefined) err.status = last.status;
+    if (last?.details) err.details = last.details;
     throw err;
   }
   const err = last ?? new PoolExhausted(fallbackReset, "no model available");
   err.trace = trace;
+  if (last?.keyIndex !== undefined) err.keyIndex = last.keyIndex;
+  if (last?.model) err.model = last.model;
+  if (last?.url) err.url = last.url;
+  if (last?.status !== undefined) err.status = last.status;
+  if (last?.details) err.details = last.details;
   throw err;
 }
 

@@ -9,7 +9,7 @@ await t("a fresh KV gets a complete, valid config", () => {
   assert.equal(c.enabled, true);
   assert.equal(c.provider.kind, "gemini");
   assert.equal(c.provider.model, "gemini-3.5-flash-lite");
-  assert.equal(c.thinking, "medium");
+  assert.equal(c.thinking, "low");
   assert.deepEqual(Object.keys(c.media).sort(), ["audio", "image", "video"]);
   assert.equal(c.safety.harassment, "BLOCK_NONE");
 });
@@ -39,7 +39,7 @@ await t("bad values are repaired, not trusted", () => {
     personas,
   );
   assert.equal(c.mode, "smart");
-  assert.equal(c.thinking, "medium");
+  assert.equal(c.thinking, "low");
   assert.equal(c.maxTokens, 8000);
   assert.equal(c.dailyCap, 1000, "a nonsense budget must fall back, never become 'unlimited'");
   assert.equal(c.enabled, true, "only an explicit false switches the bot off");

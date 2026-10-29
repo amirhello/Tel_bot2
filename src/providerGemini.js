@@ -58,18 +58,22 @@ export function toGeminiPart(part) {
 export const THINKING_BUDGETS = {
   off: 0,
   minimal: 1024,
-  low: 2048,
+  low: 2000,
   medium: 4096,
   high: 8192,
 };
 
 /**
  * thinkingConfig. Google Gemini REST API expects thinkingConfig.thinkingBudget (integer token count:
- * minimal: 1024, low: 2048, medium: 4096, high: 8192, off: 0).
+ * minimal: 1024, low: 2000, medium: 4096, high: 8192, off: 0).
  */
 export function thinkingConfig(cfg) {
+  if (cfg?.thinking === "off") return { thinkingConfig: { thinkingBudget: 0 } };
+  if (typeof cfg?.thinkingBudget === "number") {
+    return { thinkingConfig: { thinkingBudget: cfg.thinkingBudget } };
+  }
   if (!cfg?.thinking) return {};
-  const budget = THINKING_BUDGETS[cfg.thinking] !== undefined ? THINKING_BUDGETS[cfg.thinking] : 4096;
+  const budget = THINKING_BUDGETS[cfg.thinking] !== undefined ? THINKING_BUDGETS[cfg.thinking] : 2000;
   return { thinkingConfig: { thinkingBudget: budget } };
 }
 
@@ -145,6 +149,10 @@ export async function completeGemini(env, cfg, { system, parts, maxTokens }) {
         retryOn: retryableForGemini,
       });
     } catch (e) {
+      if (e instanceof ApiError) {
+        e.model = model;
+        e.url = url;
+      }
       if (e.status === 404) throw new UnknownModelError(model, `${model}: ${e.message}`);
       const isQuota =
         (e.status === 429 || e.status === 503) &&

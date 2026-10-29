@@ -268,6 +268,10 @@ label.check input{width:auto}
 .traceul{margin:4px 0 8px 18px;padding:0;list-style:disc}
 .traceul li{margin:3px 0}
 .tracebox code{background:#172033;padding:2px 5px;border-radius:4px;color:#e2e8f0;font-size:11px}
+.rawerr{margin-top:10px;background:#180b0c;border:1px solid #6b2125;border-radius:8px;padding:8px 12px;font-family:ui-monospace,monospace;font-size:12px;color:#fca5a5;direction:ltr;text-align:left}
+.rawerr summary{cursor:pointer;font-weight:600;color:#f87171;outline:none;user-select:none;display:flex;align-items:center;gap:6px}
+.rawerr summary:hover{color:#fca5a5}
+.rawerr pre{margin:8px 0 0;padding:10px;background:#0d0405;border:1px solid #451316;border-radius:6px;max-height:240px;overflow:auto;font-size:11px;color:#fecaca;white-space:pre-wrap;word-break:break-all}
 `;
 
 const LOGIN = `<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -606,6 +610,15 @@ function logCard(it){
     er.appendChild(el("b", null, "Error: "));
     er.appendChild(document.createTextNode(it.err));
     body.appendChild(er);
+  }
+  if (it.rawErr || it.err) {
+    var rawText = it.rawErr || it.err;
+    var rawDet = el("details", "rawerr");
+    var rawSum = el("summary", null, "🔍 Raw Error Details");
+    rawDet.appendChild(rawSum);
+    var rawPre = el("pre", null, rawText);
+    rawDet.appendChild(rawPre);
+    body.appendChild(rawDet);
   }
   if (it.trace) {
     var trBox = el("div", "tracebox");

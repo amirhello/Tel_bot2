@@ -66,8 +66,8 @@ export function defaultConfig(personas) {
     schemaVersion: SCHEMA_VERSION,
     enabled: true,
     mode: "smart",
-    maxTokens: 2000,
-    thinking: "medium",
+    maxTokens: 8000,
+    thinking: "low",
     extra: "",
     dailyCap: 1000, // across the whole model pool, not per model
     provider: {
@@ -124,8 +124,8 @@ export function normalizeConfig(saved, personas) {
     voiceName: String(saved?.voice?.voiceName || base.voice.voiceName || "Aoede").trim(),
   };
 
-  c.thinking = THINKING_LEVELS.includes(c.thinking) ? c.thinking : "medium";
-  c.maxTokens = clampNum(c.maxTokens, 200, 8000, 2000);
+  c.thinking = THINKING_LEVELS.includes(c.thinking) ? c.thinking : "low";
+  c.maxTokens = clampNum(c.maxTokens, 200, 8000, 8000);
   c.dailyCap = clampNum(c.dailyCap, 0, 100000, 1000);
   c.extra = String(c.extra ?? "").slice(0, 4000);
   c.enabled = c.enabled !== false;
