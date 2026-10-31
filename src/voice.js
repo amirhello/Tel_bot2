@@ -402,7 +402,7 @@ export async function detectIntent(env, text, cfg, traceContext = null) {
         kind: "gemini",
         baseUrl: cfg?.provider?.kind === "gemini" && cfg?.provider?.baseUrl ? cfg.provider.baseUrl : DEFAULT_BASE_URLS.gemini,
         model: "gemma-4-31b",
-        modelPool: ["gemma-4-31b", "gemma-4-26b"],
+        modelPool: ["gemma-4-31b", "gemma-4-31b-it", "gemma-4-26b", "gemma-4-26b-it", "gemini-3.5-flash-lite"],
       },
       maxTokens: 50,
       thinking: "off",
@@ -432,7 +432,8 @@ export async function detectIntent(env, text, cfg, traceContext = null) {
       traceContext.intent = {
         requested: false,
         method: "gemma_classifier_error",
-        error: String(err?.message ?? err).slice(0, 100),
+        reason: String(err?.message ?? err).slice(0, 150),
+        error: String(err?.message ?? err).slice(0, 150),
       };
     }
     return { search: false, voice: false };

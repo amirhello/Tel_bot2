@@ -22,7 +22,7 @@ await t("detectIntent calls Gemma once and parses search and voice flags from JS
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     const body = JSON.parse(init.body);
-    gemmaPrompt = body.contents?.[0]?.parts?.[0]?.text || "";
+    gemmaPrompt = body.contents?.[0]?.parts?.[1]?.text || body.contents?.[0]?.parts?.[0]?.text || "";
     return json({
       candidates: [{ content: { parts: [{ text: JSON.stringify({ search: true, voice: false }) }] } }],
     });

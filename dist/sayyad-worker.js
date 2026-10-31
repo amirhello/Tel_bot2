@@ -988,16 +988,35 @@ function safetySettings(cfg) {
 }
 
 function buildGeminiBody(cfg, { system, parts, maxTokens, search }, shape = {}) {
-  const body = {
-    systemInstruction: { parts: [{ text: system }] },
-    contents: [{ role: "user", parts: parts.map(toGeminiPart).filter(Boolean) }],
-    generationConfig: { maxOutputTokens: maxTokens, ...thinkingConfig(cfg) },
-  };
-  if (!shape.noThinking) body.generationConfig = { ...body.generationConfig, ...thinkingConfig(cfg) };
-  else delete body.generationConfig.thinkingConfig;
-  if (!shape.noSafety) body.safetySettings = safetySettings(cfg);
+  const model = String(cfg?.provider?.model || "").toLowerCase();
+  const isGemma = model.includes("gemma");
 
-  const model = cfg?.provider?.model;
+  let effectiveParts = (parts || []).map(toGeminiPart).filter(Boolean);
+  let systemInstruction = system ? { parts: [{ text: system }] } : undefined;
+
+  if (isGemma || shape.noSystem) {
+    if (system) {
+      effectiveParts = [{ text: `${system}\n\n` }, ...effectiveParts];
+    }
+    systemInstruction = undefined;
+  }
+
+  const body = {
+    contents: [{ role: "user", parts: effectiveParts }],
+    generationConfig: { maxOutputTokens: maxTokens },
+  };
+
+  if (systemInstruction) {
+    body.systemInstruction = systemInstruction;
+  }
+
+  if (!isGemma && !shape.noThinking) {
+    body.generationConfig = { ...body.generationConfig, ...thinkingConfig(cfg) };
+  }
+  if (!isGemma && !shape.noSafety) {
+    body.safetySettings = safetySettings(cfg);
+  }
+
   const wantSearch = (search || cfg?.search) && !shape.noTools && isSearchSupported(model);
   if (wantSearch) {
     body.tools = [{ googleSearch: {} }];
@@ -1061,6 +1080,11 @@ const retryableForGemini = (e) =>
  * letting the admin discover it as a broken bot.
  */
 function shapes(cfg, search) {
+  const model = String(cfg?.provider?.model || "").toLowerCase();
+  const isGemma = model.includes("gemma");
+  if (isGemma) {
+    return [{ noSystem: true, noThinking: true, noSafety: true, noTools: true }];
+  }
   const list = [{}];
   if (search || cfg?.search) list.push({ noTools: true });
   if (cfg?.thinking) list.push({ noThinking: true });
@@ -2572,6 +2596,8 @@ function logCard(it){
       intLine.appendChild(el("code", null, it.trace.intent.method || "default"));
       if (it.trace.intent.reason) {
         intLine.appendChild(document.createTextNode(" (" + it.trace.intent.reason + ")"));
+      } else if (it.trace.intent.error) {
+        intLine.appendChild(document.createTextNode(" (" + it.trace.intent.error + ")"));
       }
       trBox.appendChild(intLine);
     }
@@ -4044,7 +4070,7 @@ async function detectIntent(env, text, cfg, traceContext = null) {
         kind: "gemini",
         baseUrl: cfg?.provider?.kind === "gemini" && cfg?.provider?.baseUrl ? cfg.provider.baseUrl : DEFAULT_BASE_URLS.gemini,
         model: "gemma-4-31b",
-        modelPool: ["gemma-4-31b", "gemma-4-26b"],
+        modelPool: ["gemma-4-31b", "gemma-4-31b-it", "gemma-4-26b", "gemma-4-26b-it", "gemini-3.5-flash-lite"],
       },
       maxTokens: 50,
       thinking: "off",
@@ -4074,7 +4100,8 @@ async function detectIntent(env, text, cfg, traceContext = null) {
       traceContext.intent = {
         requested: false,
         method: "gemma_classifier_error",
-        error: String(err?.message ?? err).slice(0, 100),
+        reason: String(err?.message ?? err).slice(0, 150),
+        error: String(err?.message ?? err).slice(0, 150),
       };
     }
     return { search: false, voice: false };

@@ -385,6 +385,16 @@ await t("buildGeminiBody adds googleSearch tool only for search-supported models
   assert.equal(bodyWithoutSearch.tools, undefined);
 });
 
+await t("buildGeminiBody merges system instruction into user parts and omits thinking/safety for Gemma models", () => {
+  const gemmaCfg = cfg({ provider: { kind: "gemini", model: "gemma-4-31b" }, thinking: "medium" });
+  const body = buildGeminiBody(gemmaCfg, { system: "SYS_PROMPT", parts: [{ type: "text", text: "USER_MSG" }], maxTokens: 100 });
+  assert.equal(body.systemInstruction, undefined);
+  assert.equal(body.safetySettings, undefined);
+  assert.equal(body.generationConfig.thinkingConfig, undefined);
+  assert.equal(body.contents[0].parts[0].text, "SYS_PROMPT\n\n");
+  assert.equal(body.contents[0].parts[1].text, "USER_MSG");
+});
+
 await t("readGeminiSources parses groundingMetadata into clean sources", () => {
   const fakeData = {
     candidates: [

@@ -633,6 +633,8 @@ function logCard(it){
       intLine.appendChild(el("code", null, it.trace.intent.method || "default"));
       if (it.trace.intent.reason) {
         intLine.appendChild(document.createTextNode(" (" + it.trace.intent.reason + ")"));
+      } else if (it.trace.intent.error) {
+        intLine.appendChild(document.createTextNode(" (" + it.trace.intent.error + ")"));
       }
       trBox.appendChild(intLine);
     }
