@@ -54,7 +54,7 @@ export const setWebhook = (token, url, secretToken) =>
   tg(token, "setWebhook", {
     url,
     secret_token: secretToken,
-    allowed_updates: ["message"],
+    allowed_updates: ["message", "callback_query"],
     drop_pending_updates: true,
     max_connections: 10,
   });
@@ -183,4 +183,40 @@ export async function sendAudioFile(token, chatId, bytes, fileName, mime, replyT
   if (second?.ok) return second;
 
   throw new Error(`sendAudio failed: ${first?.description ?? second?.description ?? "unknown"}`);
+}
+
+/** Send message with inline keyboard markup. */
+export function sendInlineKeyboard(token, chatId, text, inlineKeyboard, replyTo, threadIdOrOpts) {
+  const tid = typeof threadIdOrOpts === "object"
+    ? (threadIdOrOpts?.message_thread_id ?? threadIdOrOpts?.threadId)
+    : threadIdOrOpts;
+  const payload = {
+    chat_id: chatId,
+    text,
+    reply_markup: { inline_keyboard: inlineKeyboard },
+  };
+  if (replyTo) payload.reply_parameters = { message_id: replyTo, allow_sending_without_reply: true };
+  if (tid) payload.message_thread_id = tid;
+  return tg(token, "sendMessage", payload);
+}
+
+/** Answer incoming callback query from inline button tap. */
+export function answerCallbackQuery(token, callbackQueryId, text, showAlert = false) {
+  const payload = {
+    callback_query_id: callbackQueryId,
+    show_alert: Boolean(showAlert),
+  };
+  if (text) payload.text = text;
+  return tg(token, "answerCallbackQuery", payload);
+}
+
+/** Edit existing message text and optional reply markup. */
+export function editMessageText(token, chatId, messageId, text, replyMarkup) {
+  const payload = {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+  };
+  if (replyMarkup) payload.reply_markup = replyMarkup;
+  return tg(token, "editMessageText", payload);
 }

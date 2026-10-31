@@ -1,7 +1,7 @@
 // Entrypoint. Routing only — every decision lives in another module.
 
 import { handleAdmin, isAuthed, json, timingSafeEqual } from "./admin.js";
-import { processMessage } from "./answer.js";
+import { processMessage, processCallback } from "./answer.js";
 import { diagnostics, reportPage, resetWebhook, setup, signWebhookSecret } from "./tools.js";
 
 const seen = new Set();
@@ -72,5 +72,6 @@ async function webhook(req, env, ctx) {
   }
 
   if (update?.message) ctx.waitUntil(processMessage(env, update.message));
+  if (update?.callback_query) ctx.waitUntil(processCallback(env, update.callback_query));
   return new Response("ok");
 }

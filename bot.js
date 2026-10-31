@@ -4,7 +4,7 @@
 import { createServer } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { processMessage } from "./src/answer.js";
+import { processMessage, processCallback } from "./src/answer.js";
 import { handleAdmin, isAuthed } from "./src/admin.js";
 import { diagnostics, reportPage } from "./src/tools.js";
 import { getKeyPool, getKeyPoolStatus, setStateFilePath } from "./src/keyPool.js";
@@ -247,7 +247,7 @@ async function startPolling() {
   let offset = 0;
   while (running) {
     try {
-      const url = `https://api.telegram.org/bot${token}/getUpdates?offset=${offset}&timeout=25&allowed_updates=["message"]`;
+      const url = `https://api.telegram.org/bot${token}/getUpdates?offset=${offset}&timeout=25&allowed_updates=["message","callback_query"]`;
       const res = await fetch(url, { signal: AbortSignal.timeout(35_000) });
       if (!res.ok) {
         let waitSec = 3;
@@ -278,6 +278,12 @@ async function startPolling() {
           // Process message asynchronously
           processMessage(env, update.message).catch((err) => {
             console.error("Message processing error:", err?.message || err);
+          });
+          if (data.result.length > 1) await sleep(40);
+        } else if (update.callback_query) {
+          // Process callback query (inline buttons) asynchronously
+          processCallback(env, update.callback_query).catch((err) => {
+            console.error("Callback query processing error:", err?.message || err);
           });
           if (data.result.length > 1) await sleep(40);
         }

@@ -15,6 +15,7 @@ import {
   saveQuota,
 } from "./store.js";
 import { getKeyPoolStatus } from "./keyPool.js";
+import { listUsers, setUserBlocked, setUserMode, resetUserSettings } from "./users.js";
 
 const COOKIE = "sayyad_admin";
 const MEDIA_KINDS = ["image", "video", "audio"];
@@ -272,6 +273,9 @@ label.check input{width:auto}
 .rawerr summary{cursor:pointer;font-weight:600;color:#f87171;outline:none;user-select:none;display:flex;align-items:center;gap:6px}
 .rawerr summary:hover{color:#fca5a5}
 .rawerr pre{margin:8px 0 0;padding:10px;background:#0d0405;border:1px solid #451316;border-radius:6px;max-height:240px;overflow:auto;font-size:11px;color:#fecaca;white-space:pre-wrap;word-break:break-all}
+.ucard{background:#0b0f16;border:1px solid var(--line);border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:8px}
+.ucard-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
+.ucard-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px}
 `;
 
 const LOGIN = `<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -288,10 +292,11 @@ const DASH = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Sayyad — Admin</title><style>${CSS}</style></head>
 <body><div class="wrap">
 <h1>Sayyad</h1>
-<p class="sub">Telegram bot on Cloudflare Workers</p>
+<p class="sub">Telegram bot Control Panel</p>
 
 <div class="tabs">
   <div class="tab on" data-pane="settings">Settings</div>
+  <div class="tab" data-pane="users">Users <span class="tag" id="usercount">0</span></div>
   <div class="tab" data-pane="media">Media &amp; Safety</div>
   <div class="tab" data-pane="log">Message log <span class="tag" id="logcount">0</span></div>
 </div>
@@ -335,9 +340,12 @@ const DASH = `<!doctype html><html lang="en"><head><meta charset="utf-8">
   <div class="card">
     <h2>Personality</h2>
     <div class="modes" id="modes"></div>
-    <label style="margin-top:16px">Polite / ادب</label><textarea id="p_polite" dir="rtl"></textarea>
+    <label style="margin-top:16px">Psychologist / روانشناس</label><textarea id="p_psychologist" dir="rtl"></textarea>
+    <label style="margin-top:14px">Best Friend / رفیق فاب</label><textarea id="p_friend" dir="rtl"></textarea>
     <label style="margin-top:14px">Know-it-all / دانای کل</label><textarea id="p_smart" dir="rtl"></textarea>
-    <label style="margin-top:14px">Savage / بددهن و طنز</label><textarea id="p_rude" dir="rtl"></textarea>
+    <label style="margin-top:14px">Savage / بی‌رحم و طنز</label><textarea id="p_rude" dir="rtl"></textarea>
+    <label style="margin-top:14px">Market Strategist / گرگ بازار</label><textarea id="p_wolf" dir="rtl"></textarea>
+    <label style="margin-top:14px">Polite / ادب</label><textarea id="p_polite" dir="rtl"></textarea>
     <label style="margin-top:14px">Extra instructions for every mode (optional)</label>
     <textarea id="p_extra" dir="rtl" style="min-height:70px"></textarea>
   </div>
@@ -376,6 +384,22 @@ const DASH = `<!doctype html><html lang="en"><head><meta charset="utf-8">
     </div>
     <p class="muted" style="margin:14px 0 0" id="s_last"></p>
     <div id="errlist" style="margin-top:12px"></div>
+  </div>
+</div>
+
+<div class="pane" id="pane-users">
+  <div class="card">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+      <h2>User Management</h2>
+      <button class="ghost" id="usersrefresh" style="padding:6px 14px;font-size:13px">Refresh</button>
+    </div>
+    <p class="muted" style="margin:-4px 0 14px">Known users who interacted with Sayyad. Manage individual personas or ban/block access.</p>
+    <div style="margin-bottom:14px">
+      <input type="text" id="usersearch" placeholder="🔍 Search by name, username, or user ID...">
+    </div>
+    <div id="userslist" style="display:flex;flex-direction:column;gap:10px">
+      <p class="muted">Press Refresh to load users.</p>
+    </div>
   </div>
 </div>
 
@@ -447,9 +471,9 @@ function toast(msg, kind, which){
   var t = document.getElementById(which || "toast");
   t.textContent = msg; t.className = kind || "";
 }
-function val(id){ return document.getElementById(id).value; }
-function setv(id, v){ document.getElementById(id).value = v; }
-function setb(id, v){ document.getElementById(id).checked = !!v; }
+function val(id){ var e = document.getElementById(id); return e ? e.value : ""; }
+function setv(id, v){ var e = document.getElementById(id); if (e) e.value = v; }
+function setb(id, v){ var e = document.getElementById(id); if (e) e.checked = !!v; }
 
 function showTab(name){
   var tabs = document.querySelectorAll(".tab");
@@ -737,12 +761,143 @@ function loadLog(){
   }).then(function(){ btn.disabled = false; });
 }
 
+var cachedUsers = [];
+function renderUsersList(users) {
+  var list = document.getElementById("userslist");
+  if (!list) return;
+  list.innerHTML = "";
+  if (!users || !users.length) {
+    list.appendChild(el("p", "muted", "No users found."));
+    return;
+  }
+  users.forEach(function(u) {
+    var c = el("div", "ucard");
+    var head = el("div", "ucard-header");
+    var title = el("div", null);
+    var nameB = el("b", null, u.name || "User " + u.id);
+    title.appendChild(nameB);
+    if (u.username) {
+      title.appendChild(el("span", "muted", " (@" + u.username + ")"));
+    }
+    head.appendChild(title);
+    var statusTag = el("span", "tag" + (u.blocked ? " err" : " on"), u.blocked ? "🚫 Blocked" : "✅ Active");
+    head.appendChild(statusTag);
+    c.appendChild(head);
+
+    var metaRow = el("div", "muted", "ID: " + u.id + " · Messages: " + (u.messageCount || 1) + " · Last seen: " + stamp(u.lastSeen || 0));
+    c.appendChild(metaRow);
+
+    var act = el("div", "ucard-actions");
+    var selLabel = el("label", null, "Persona:");
+    selLabel.style.margin = "0";
+    act.appendChild(selLabel);
+    var sel = document.createElement("select");
+    sel.style.width = "auto";
+    sel.style.padding = "4px 8px";
+    var defOpt = document.createElement("option");
+    defOpt.value = "";
+    defOpt.textContent = "Default (bot-level)";
+    sel.appendChild(defOpt);
+    MODES.forEach(function(m) {
+      var opt = document.createElement("option");
+      opt.value = m;
+      opt.textContent = LABELS[m] || m;
+      if (u.mode === m) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    sel.onchange = function() {
+      fetch("/admin/api/users/mode", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ userId: u.id, mode: sel.value || null }),
+      }).then(function(r) { return r.json(); }).then(function(res) {
+        if (res.ok) toast("Persona updated for " + (u.name || u.id), "ok");
+      });
+    };
+    act.appendChild(sel);
+
+    var blockBtn = el("button", "ghost", u.blocked ? "Unblock User" : "Block User");
+    blockBtn.style.padding = "4px 10px";
+    blockBtn.style.fontSize = "12px";
+    blockBtn.onclick = function() {
+      fetch("/admin/api/users/block", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ userId: u.id, blocked: !u.blocked }),
+      }).then(function(r) { return r.json(); }).then(function(res) {
+        if (res.ok) {
+          loadUsers();
+          toast((!u.blocked ? "Blocked " : "Unblocked ") + (u.name || u.id), "ok");
+        }
+      });
+    };
+    act.appendChild(blockBtn);
+
+    var resetBtn = el("button", "ghost", "Reset Settings");
+    resetBtn.style.padding = "4px 10px";
+    resetBtn.style.fontSize = "12px";
+    resetBtn.onclick = function() {
+      if (!confirm("Reset persona and settings for user " + (u.name || u.id) + "?")) return;
+      fetch("/admin/api/users/reset", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ userId: u.id }),
+      }).then(function(r) { return r.json(); }).then(function(res) {
+        if (res.ok) {
+          loadUsers();
+          toast("Settings reset for " + (u.name || u.id), "ok");
+        }
+      });
+    };
+    act.appendChild(resetBtn);
+
+    c.appendChild(act);
+    list.appendChild(c);
+  });
+}
+
+function loadUsers() {
+  var list = document.getElementById("userslist"), btn = document.getElementById("usersrefresh");
+  if (btn) btn.disabled = true;
+  fetch("/admin/api/users").then(function(r) { return r.json(); }).then(function(d) {
+    if (btn) btn.disabled = false;
+    cachedUsers = d.users || [];
+    var badge = document.getElementById("usercount");
+    if (badge) badge.textContent = d.count || 0;
+    renderUsersList(cachedUsers);
+  }).catch(function() {
+    if (btn) btn.disabled = false;
+    list.innerHTML = "";
+    list.appendChild(el("p", "muted", "Could not load users list."));
+  });
+}
+
 document.querySelectorAll(".tab").forEach(function(t){
   t.onclick = function(){ showTab(t.getAttribute("data-pane")); };
 });
 document.getElementById("save").onclick = function(e){ save(e); };
 document.getElementById("save2").onclick = function(e){ save(e); };
 document.getElementById("logrefresh").onclick = loadLog;
+var usersRefBtn = document.getElementById("usersrefresh");
+if (usersRefBtn) usersRefBtn.onclick = loadUsers;
+
+var searchInput = document.getElementById("usersearch");
+if (searchInput) {
+  searchInput.oninput = function() {
+    var q = searchInput.value.toLowerCase().trim();
+    if (!q) {
+      renderUsersList(cachedUsers);
+      return;
+    }
+    var filtered = cachedUsers.filter(function(u) {
+      var name = (u.name || "").toLowerCase();
+      var uname = (u.username || "").toLowerCase();
+      var uid = String(u.id || "");
+      return name.includes(q) || uname.includes(q) || uid.includes(q);
+    });
+    renderUsersList(filtered);
+  };
+}
 var clrBtn = document.getElementById("clearerrors");
 if (clrBtn) {
   clrBtn.onclick = function(){
@@ -796,6 +951,7 @@ fetch("/admin/api/state").then(function(r){ return r.json(); })
   .then(function(d){ paint(d.config, d.stats); })
   .catch(function(){ toast("could not load config", "err"); });
 loadQuota();
+loadUsers();
 </script></body></html>`;
 
 export function renderLogin(error) {
@@ -925,6 +1081,33 @@ export async function handleAdmin(req, env, path) {
     if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
     const items = await readArchive(env);
     return json({ count: items.length, items });
+  }
+
+  if (path === "/admin/api/users" && req.method === "GET") {
+    if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
+    const users = await listUsers(env);
+    return json({ count: users.length, users });
+  }
+
+  if (path === "/admin/api/users/block" && req.method === "POST") {
+    if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
+    const body = await req.json().catch(() => ({}));
+    const user = await setUserBlocked(env, Number(body.userId), Boolean(body.blocked));
+    return json({ ok: true, user });
+  }
+
+  if (path === "/admin/api/users/mode" && req.method === "POST") {
+    if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
+    const body = await req.json().catch(() => ({}));
+    const user = await setUserMode(env, Number(body.userId), body.mode || null);
+    return json({ ok: true, user });
+  }
+
+  if (path === "/admin/api/users/reset" && req.method === "POST") {
+    if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
+    const body = await req.json().catch(() => ({}));
+    const user = await resetUserSettings(env, Number(body.userId));
+    return json({ ok: true, user });
   }
 
   if (path === "/admin/api/keys") {

@@ -1,6 +1,6 @@
 import { assert, t, done, M } from "./harness.mjs";
 
-const { shouldAnswer, isCommand, isSupportedChat, TRIGGER } = M;
+const { shouldAnswer, isCommand, isSupportedChat, TRIGGER, detectSearchIntent } = M;
 const BOT = 777;
 
 const group = (over) => ({ chat: { id: -1001, type: "supergroup" }, reply_to_message: undefined, ...over });
@@ -60,6 +60,19 @@ await t("only chat types the bot can live in are accepted", () => {
   }
   assert.equal(isSupportedChat({ chat: { type: "channel" } }), false);
   assert.equal(isSupportedChat(null), false);
+});
+
+await t("detectSearchIntent correctly recognizes commands, keywords, and live topics", () => {
+  assert.equal(detectSearchIntent("/search نرخ طلا"), true);
+  assert.equal(detectSearchIntent("/گوگل وضعیت هوا"), true);
+  assert.equal(detectSearchIntent("قیمت دلار چنده؟"), true);
+  assert.equal(detectSearchIntent("نرخ تتر امروز"), true);
+  assert.equal(detectSearchIntent("آخرین اخبار زلزله"), true);
+  assert.equal(detectSearchIntent("آب و هوای شیراز"), true);
+  assert.equal(detectSearchIntent("نتیجه بازی دیشب رئال"), true);
+  assert.equal(detectSearchIntent("برام آنلاین سرچ کن"), true);
+  assert.equal(detectSearchIntent("سلام سید خوبی"), false);
+  assert.equal(detectSearchIntent("برام یک شعر بگو"), false);
 });
 
 done();

@@ -3,12 +3,25 @@
 import { appendArchive, archiveRecord } from "./archive.js";
 import { PoolExhausted, complete } from "./llm.js";
 import { collectMedia } from "./media.js";
-import { DEFAULT_PERSONAS, buildSystemPrompt, buildUserContent, replyContext } from "./prompt.js";
-import { botId, botUsername, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText } from "./telegram.js";
+import { DEFAULT_PERSONAS, MODES, MODE_LABELS, buildSystemPrompt, buildUserContent, replyContext } from "./prompt.js";
+import {
+  botId,
+  botUsername,
+  sendAudioFile,
+  sendChatAction,
+  sendLong,
+  sendRichMessage,
+  sendText,
+  sendInlineKeyboard,
+  answerCallbackQuery,
+  editMessageText,
+} from "./telegram.js";
 import { isCommand, isSupportedChat, shouldAnswer } from "./trigger.js";
 import { hasRichFormatting, isRtlText, mdToRichHtml } from "./text.js";
 import { bumpStats, loadConfig, loadStats, usedToday } from "./store.js";
 import { detectIntent, shouldVoiceReply, speak } from "./voice.js";
+import { extractSearchQuery, searchWeb } from "./search.js";
+import { isUserBlocked, recordUserActivity, setUserMode } from "./users.js";
 const ERRORS = [
   "الان یه کم درگیرم. یه بار دیگه بفرست، شاید سر جا شد.",
   "یه چیزی قاطی شد. دوباره بزن، درستش می‌کنم.",
@@ -23,7 +36,14 @@ const DAILY_LIMIT = "امروز از سقف روزانه‌ام رد شدیم. �
 // the WAV upload afterwards needs a few seconds of its own.
 const VOICE_BUDGET_MS = 26_000;
 
-const MODE_NAME = { rude: "Savage", polite: "Polite", smart: "Know-it-all" };
+const MODE_NAME = {
+  psychologist: "Psychologist",
+  friend: "Best Friend",
+  smart: "Know-it-all",
+  rude: "Savage",
+  wolf: "Market Strategist",
+  polite: "Polite",
+};
 
 const HELP =
   "سلام، من **سید** هستم.\n\n" +
@@ -91,6 +111,15 @@ export async function processMessage(env, msg) {
   try {
     if (!msg?.from || msg.from.is_bot) return; // never answer bots
     if (!isSupportedChat(msg)) return;
+
+    // Record user activity for admin management
+    await recordUserActivity(env, msg.from, msg.chat).catch(() => {});
+
+    // Check if user is blocked by admin
+    if (await isUserBlocked(env, msg.from.id)) {
+      await appendArchive(env, archiveRecord(msg, { answered: false, reason: "user blocked by admin" })).catch(() => {});
+      return;
+    }
 
     const cfg = (await loadConfig(env, DEFAULT_PERSONAS)).config;
     const enabled = config_enabled(cfg);
@@ -321,8 +350,32 @@ async function reply(env, msg, cfg, trace = {}) {
     await sendText(token, chatId, "🏓 pong", msg.message_id, threadId);
     return { text: "🏓 pong", reason: "command /ping", tgOut: "text delivered" };
   }
+  if (cmd === "mode" || cmd === "شخصیت") {
+    const keyboard = [
+      [
+        { text: "🧠 روانشناس", callback_data: "mode:psychologist" },
+        { text: "🤝 رفیق فاب", callback_data: "mode:friend" },
+      ],
+      [
+        { text: "👑 دانای کل", callback_data: "mode:smart" },
+        { text: "⚡ بی‌رحم", callback_data: "mode:rude" },
+      ],
+      [
+        { text: "🐺 گرگ بازار", callback_data: "mode:wolf" },
+        { text: "📖 ادیب", callback_data: "mode:polite" },
+      ],
+    ];
+    const modePrompt = "🎭 **انتخاب شخصیت سید:**\nیکی از شخصیت‌های زیر را انتخاب کن تا از این به بعد با همان لحن باهات هم‌کلام شوم:";
+    await sendInlineKeyboard(token, chatId, modePrompt, keyboard, msg.message_id, threadId);
+    return { text: modePrompt, reason: `command /${cmd}`, tgOut: "inline keyboard delivered" };
+  }
   if (cmd === "start" || cmd === "help") {
-    const helpMsg = HELP.replace("__MODE__", MODE_NAME[cfg.mode] ?? "Know-it-all");
+    let currentMode = cfg.mode;
+    if (msg.from?.id && env.CONFIG) {
+      const uMode = await env.CONFIG.get(`user:${msg.from.id}:mode`).catch(() => null);
+      if (uMode && MODES.includes(uMode)) currentMode = uMode;
+    }
+    const helpMsg = HELP.replace("__MODE__", MODE_NAME[currentMode] ?? "Know-it-all");
     await sendText(token, chatId, helpMsg, msg.message_id, threadId);
     return { text: helpMsg, reason: `command /${cmd}`, tgOut: "text delivered" };
   }
@@ -362,20 +415,52 @@ async function reply(env, msg, cfg, trace = {}) {
     const { media, note } = await collectMedia(env, msg, cfg);
     const { text: replyText, fromBot } = replyContext(msg, id);
 
-    const res = await complete(env, cfg, {
-      system: buildSystemPrompt(cfg, { isVoice }),
-      parts: buildUserContent({ text, replyText, replyFromBot: fromBot, media, note }),
+    let searchNote = "";
+    let searchSources = [];
+    if (isSearch) {
+      const q = extractSearchQuery(text);
+      try {
+        const searchRes = await searchWeb(q, { timeoutMs: 4000 });
+        if (searchRes?.text) {
+          searchNote = searchRes.text;
+          searchSources = searchRes.sources || [];
+          if (trace?.search) {
+            trace.search.query = q;
+            trace.search.sources = searchSources;
+          }
+        }
+      } catch (searchErr) {
+        if (trace?.search) {
+          trace.search.error = String(searchErr?.message ?? searchErr).slice(0, 100);
+        }
+      }
+    }
+
+    const effectiveNote = note ? (searchNote ? `${note}\n\n${searchNote}` : note) : searchNote;
+
+    let effectiveCfg = cfg;
+    if (msg.from?.id && env.CONFIG) {
+      const uMode = await env.CONFIG.get(`user:${msg.from.id}:mode`).catch(() => null);
+      if (uMode && MODES.includes(uMode)) {
+        effectiveCfg = { ...cfg, mode: uMode };
+      }
+    }
+
+    const res = await complete(env, effectiveCfg, {
+      system: buildSystemPrompt(effectiveCfg, { isVoice }),
+      parts: buildUserContent({ text, replyText, replyFromBot: fromBot, media, note: effectiveNote }),
       maxTokens: cfg.maxTokens,
-      search: isSearch,
+      search: false,
     });
     answer = res.text;
     usedModel = res.model;
     if (res.trace) trace.llm.attempts = res.trace;
     trace.llm.chosenModel = usedModel;
 
-    if (res.sources?.length) {
-      trace.search.sources = res.sources;
-      answer = appendSources(answer, res.sources);
+    const allSources = [...searchSources, ...(res.sources || [])];
+    if (allSources.length) {
+      if (trace?.search) trace.search.sources = allSources;
+      answer = appendSources(answer, allSources);
     }
   } finally {
     clearInterval(typingHeartbeat);
@@ -457,4 +542,37 @@ async function overDailyCap(env, cfg, msg) {
     /* the guard still works even if the notice does not get through */
   }
   return true;
+}
+
+const CONFIRM_TEXTS = {
+  psychologist: "🧠 **شخصیت من برات شد «روانشناس»**\nهر دغدغه، حس یا گره فکری داری راحت بگو؛ با حوصله و بدون قضاوت می‌شنوم.",
+  friend: "🤝 **شخصیت من برات شد «رفیق فاب»**\nحله داداش، از الان به بعد پایه‌تم، مشتی و خودمونی بریم جلو!",
+  smart: "👑 **شخصیت من برات شد «دانای کل»**\nخیلی خوش اومدی؛ آماده‌ی پاسخ‌های کاریزماتیک، عمیق و نکته‌های طلایی باش.",
+  rude: "⚡ **شخصیت من برات شد «بی‌رحم و سارکاستیک»**\nخودت خواستی! آماده‌ی تیکه‌های تیز، حقایق تلخ و شوخی‌های گزنده باش.",
+  wolf: "🐺 **شخصیت من برات شد «گرگ بازار»**\nعالیه؛ وقت و پول سرمایه‌ست، بهانه‌ها رو بریز دور و متمرکز شو روی نتیجه و برد.",
+  polite: "📖 **شخصیت من برات شد «ادیب»**\nبسی مایه مسرت است؛ با کمال احترام و کلامی پیراسته در خدمت شما هستم.",
+};
+
+/** Handle incoming Telegram callback queries (e.g. inline button clicks). */
+export async function processCallback(env, callbackQuery) {
+  if (!callbackQuery?.id) return;
+  const token = env.TELEGRAM_BOT_TOKEN;
+  const queryId = callbackQuery.id;
+  const from = callbackQuery.from;
+  const data = String(callbackQuery.data || "");
+  const message = callbackQuery.message;
+
+  if (data.startsWith("mode:")) {
+    const chosenMode = data.slice(5);
+    if (MODES.includes(chosenMode) && from?.id) {
+      await setUserMode(env, from.id, chosenMode);
+      await answerCallbackQuery(token, queryId, "شخصیت شما با موفقیت تغییر کرد ✅").catch(() => {});
+      if (message?.chat?.id && message?.message_id) {
+        const confirmText = CONFIRM_TEXTS[chosenMode] || "شخصیت شما با موفقیت تنظیم شد.";
+        await editMessageText(token, message.chat.id, message.message_id, confirmText).catch(() => {});
+      }
+      return;
+    }
+  }
+  await answerCallbackQuery(token, queryId).catch(() => {});
 }

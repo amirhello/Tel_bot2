@@ -51,7 +51,7 @@ await t("no placeholders are left unreplaced", () => {
   for (const p of ["__MODES__", "__LABELS__", "__THINKING__", "__SAFETY__", "__MEDIAS__", "__LEVELS__"]) {
     assert.ok(!d.includes(p), p);
   }
-  assert.ok(d.includes('"polite","smart","rude"'), "the mode list must be injected");
+  assert.ok(d.includes('"polite"') && d.includes('"smart"') && d.includes('"rude"') && d.includes('"psychologist"'), "the mode list must be injected");
   assert.ok(d.includes("BLOCK_NONE"), "the safety levels must be injected");
   assert.ok(d.includes("minimal"), "the thinking levels must be injected");
   assert.equal((d.match(/<option value="BLOCK_NONE">/g) ?? []).length, 4, "one select per safety category");

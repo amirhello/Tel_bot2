@@ -1,7 +1,7 @@
 // ============================================================================
 //  Sayyad — Telegram bot on Cloudflare Workers
 //  GENERATED FILE. Do not edit by hand: edit ./src and run "node build.mjs".
-//  Module order, resolved from the import graph: archive.js, http.js, store.js, keyPool.js, providerGemini.js, providerOpenai.js, llm.js, text.js, trigger.js, prompt.js, admin.js, telegram.js, media.js, nodeWs.js, voice.js, answer.js, tools.js, index.js, nodeStore.js
+//  Module order, resolved from the import graph: archive.js, http.js, text.js, trigger.js, prompt.js, store.js, keyPool.js, providerGemini.js, providerOpenai.js, llm.js, users.js, admin.js, telegram.js, media.js, nodeWs.js, voice.js, search.js, answer.js, tools.js, index.js, nodeStore.js
 // ============================================================================
 import https from "node:https";
 import http from "node:http";
@@ -178,8 +178,434 @@ const isShapeError = (e) => e instanceof ApiError && (e.status === 400 || e.stat
 /** A missing credential is the only reason to try the other provider. */
 const isCredentialError = (e) => e instanceof ApiError && (e.status === 500 && /API key|secret/i.test(e.message));
 
+// ------------------------------ src/text.js ------------------------------
+// Pure text helpers. No I/O, no bindings, no imports.
+
+/** Escape text for Telegram HTML parse_mode. */
+function esc(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/**
+ * Convert the limited markdown a model emits (**bold**, *italic*, `code`, ```block```)
+ * into Telegram HTML. Code is lifted out first so it is escaped exactly once.
+ */
+function mdToHtml(md) {
+  const slots = [];
+  const keep = (rendered) => {
+    slots.push(rendered);
+    return `\u0000S${slots.length - 1}\u0000`;
+  };
+
+  let s = String(md ?? "");
+
+  s = s.replace(/```[a-zA-Z0-9]*\n?([\s\S]*?)```/g, (_m, code) =>
+    keep(`<pre><code>${esc(code.replace(/\n$/, ""))}</code></pre>`));
+  s = s.replace(/`([^`\n]+)`/g, (_m, code) => keep(`<code>${esc(code)}</code>`));
+
+  s = esc(s);
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  s = s.replace(/(^|[^*\w\\])\*([^*\n]+)\*/g, "$1<i>$2</i>");
+  s = s.replace(/(^|[^_\w\\])_([^_\n]+)_/g, "$1<i>$2</i>");
+  s = s.replace(/^#{1,6}\s*(.+)$/gm, "<b>$1</b>");
+  s = s.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, "$1 ($2)");
+  s = s.replace(/\u0000S(\d+)\u0000/g, (_m, i) => slots[Number(i)]);
+
+  return s.trim();
+}
+
+/** Split a long reply into Telegram-sized chunks, preferring line then word boundaries. */
+function splitText(text, limit = 3900) {
+  const out = [];
+  let rest = String(text ?? "").trim();
+  if (!rest) return [""];
+
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf("\n", limit);
+    if (cut < limit * 0.5) cut = rest.lastIndexOf(" ", limit);
+    if (cut < limit * 0.3) cut = limit;
+
+    // Check if cut point falls between a UTF-16 surrogate pair (High surrogate 0xD800-0xDBFF)
+    if (cut > 0) {
+      const code = rest.charCodeAt(cut - 1);
+      if (code >= 0xd800 && code <= 0xdbff) {
+        cut--;
+      }
+    }
+    if (cut <= 0) {
+      cut = (rest.charCodeAt(0) >= 0xd800 && rest.charCodeAt(0) <= 0xdbff && rest.length >= 2) ? 2 : 1;
+    }
+
+    out.push(rest.slice(0, cut).trimEnd());
+    rest = rest.slice(cut).replace(/^\s+/, "");
+  }
+  out.push(rest);
+  return out.filter((p) => p.length);
+}
+
+/**
+ * Normalise Persian/Arabic so the trigger word matches however it was typed:
+ * ي -> ی, ك -> ک, drop tashkeel and tatweel, strip ZWNJ.
+ */
+function normalizeFa(s) {
+  return String(s ?? "")
+    .replace(/[\u0610-\u061A\u0640\u064B-\u065F\u0670\u06D6-\u06ED]/g, "")
+    .replace(/[\u0649\u064A]/g, "\u06CC")
+    .replace(/\u0643/g, "\u06A9")
+    .replace(/[\u06AA\u06AB]/g, "\u06A9")
+    .replace(/[\u200C\u200E\u200F]/g, " ");
+}
+
+function isRtlText(s) {
+  return /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/.test(String(s ?? ""));
+}
+
+/** Check if text contains structured markdown tables or Telegram 10.3 rich tags. */
+function hasRichFormatting(text) {
+  const s = String(text ?? "");
+  if (/(?:^|\n)\s*\|[^\n]+\|\r?\n\s*\|[\s\-:|]+\|\r?\n\s*\|[^\n]+\|/.test(s)) return true;
+  if (/<(table|details|tg-button|blockquote\s+expandable)/i.test(s)) return true;
+  return false;
+}
+
+/**
+ * Converts markdown tables (| h1 | h2 |\n|---|---|\n| d1 | d2 |)
+ * to Telegram native <table bordered striped> (Bot API 10.3+).
+ */
+function renderMarkdownTables(text) {
+  return text.replace(/(?:^|\n)((?:\|[^\n]+\|\r?\n)(?:\|[\s\-:|]+\|\r?\n)(?:\|[^\n]+\|\r?\n?)+)/g, (_m, tableBlock) => {
+    const lines = tableBlock.trim().split(/\r?\n/).filter(Boolean);
+    if (lines.length < 2) return tableBlock;
+
+    const parseCells = (line) =>
+      line
+        .replace(/^\||\|$/g, "")
+        .split("|")
+        .map((c) => esc(c.trim()));
+
+    const headers = parseCells(lines[0]);
+    const rows = lines.slice(2).map(parseCells);
+
+    const thead = `<thead><tr>${headers.map((h) => `<th>${h}</th>`).join("")}</tr></thead>`;
+    const tbody = `<tbody>${rows
+      .map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`)
+      .join("")}</tbody>`;
+
+    return `\n<table bordered striped>${thead}${tbody}</table>\n`;
+  });
+}
+
+/**
+ * Converts markdown blockquotes (> quote) to Telegram <blockquote expandable>.
+ */
+function renderBlockquotes(text) {
+  return text.replace(/(?:^|\n)((?:>[^\n]*\r?\n?)+)/g, (_m, block) => {
+    const content = block
+      .split(/\r?\n/)
+      .map((l) => l.replace(/^>\s?/, ""))
+      .join("\n")
+      .trim();
+    if (!content) return "";
+    return `\n<blockquote expandable>${esc(content)}</blockquote>\n`;
+  });
+}
+
+/**
+ * Converts markdown to Telegram Rich Message HTML (Bot API 10.3+).
+ * Supports <table bordered striped>, <blockquote expandable>, <details><summary>,
+ * <tg-button>, <footer>, <h3>, with guaranteed closed tags.
+ */
+function mdToRichHtml(md, opts = {}) {
+  let s = String(md ?? "").trim();
+  if (!s) return "";
+
+  const slots = [];
+  const keep = (rendered) => {
+    slots.push(rendered);
+    return `\u0000S${slots.length - 1}\u0000`;
+  };
+
+  // 1. Preserve pre/code blocks
+  s = s.replace(/```[a-zA-Z0-9]*\n?([\s\S]*?)```/g, (_m, code) =>
+    keep(`<pre><code>${esc(code.replace(/\n$/, ""))}</code></pre>`));
+  s = s.replace(/`([^`\n]+)`/g, (_m, code) => keep(`<code>${esc(code)}</code>`));
+
+  // 2. Render markdown tables
+  s = s.replace(/(?:^|\n)((?:\|[^\n]+\|\r?\n)(?:\|[\s\-:|]+\|\r?\n)(?:\|[^\n]+\|\r?\n?)+)/g, (match) =>
+    keep(renderMarkdownTables(match)));
+
+  // 3. Render blockquotes as expandable
+  s = s.replace(/(?:^|\n)((?:>[^\n]*\r?\n?)+)/g, (match) =>
+    keep(renderBlockquotes(match)));
+
+  // 4. Preserve native rich tags if already emitted by model or template
+  s = s.replace(/<(tg-button-row|tg-button|table|details|summary|blockquote|figure|footer|h[1-6]|p)[^>]*>[\s\S]*?<\/\1>/gi, (tag) => keep(tag));
+  s = s.replace(/<img[^>]*>/gi, (tag) => keep(tag));
+
+  // 5. Convert headers ### Header to <h3>Header</h3>
+  s = s.replace(/^#{1,4}\s+(.+)$/gm, (_m, h) => keep(`<h3>${esc(h)}</h3>`));
+
+  // 6. Escape general text
+  s = esc(s);
+
+  // 7. Inline styling
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  s = s.replace(/(^|[^*\w\\])\*([^*\n]+)\*/g, "$1<i>$2</i>");
+  s = s.replace(/(^|[^_\w\\])_([^_\n]+)_/g, "$1<i>$2</i>");
+  s = s.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, '<a href="$2">$1</a>');
+
+  // 8. Restore preserved slots
+  s = s.replace(/\u0000S(\d+)\u0000/g, (_m, i) => slots[Number(i)]);
+
+  // 9. Append footer if provided
+  if (opts.footer) {
+    s += `\n<footer>${esc(opts.footer)}</footer>`;
+  }
+
+  return s.trim();
+}
+
+/** Base64-encode bytes in chunks, so a multi-megabyte buffer cannot blow the stack. */
+function toBase64(bytes) {
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(bytes).toString("base64");
+  }
+  let bin = "";
+  const CH = 0x8000;
+  for (let i = 0; i < bytes.length; i += CH) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+  }
+  return btoa(bin);
+}
+
+function clampInt(v, min, max, fallback) {
+  const n = Number.parseInt(v, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function truncate(s, n) {
+  s = String(s ?? "");
+  return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+/** A one-line preview for collapsed list rows. */
+function preview(s, n = 90) {
+  return String(s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+}
+
+// ------------------------------ src/trigger.js ------------------------------
+// Decides when the bot speaks, and recognises its commands.
+
+
+
+const TRIGGER = "سید";
+
+const CHAT_TYPES = new Set(["private", "group", "supergroup"]);
+
+function isSupportedChat(msg) {
+  return Boolean(msg?.chat) && CHAT_TYPES.has(msg.chat.type);
+}
+
+function isCommand(text, myBotUsername) {
+  const m = /^\/(start|help|ping|search|google|find|جستجو|سرچ|mode|شخصیت)(?:@(\S+))?(?:\s|$)/i.exec(String(text ?? "").trim());
+  if (!m) return null;
+  const targetBot = m[2];
+  if (targetBot && myBotUsername) {
+    const cleanTarget = targetBot.toLowerCase().replace(/^@/, "");
+    const cleanMine = myBotUsername.toLowerCase().replace(/^@/, "");
+    if (cleanTarget !== cleanMine) {
+      return null;
+    }
+  }
+  return m[1].toLowerCase();
+}
+
+/**
+ * Detects whether the user is asking for real-time information or web search.
+ * Triggers on commands, explicit search phrasing, and live topics (rates, weather, news, sports).
+ */
+function detectSearchIntent(rawText) {
+  const raw = String(rawText || "").trim();
+  if (!raw) return false;
+
+  // 1. Explicit search commands
+  if (/^\/(search|google|find|جستجو|سرچ)(?:@\S+)?(?:\s|$)/i.test(raw)) return true;
+
+  const text = normalizeFa(raw);
+
+  // 2. Explicit search requests in natural language
+  const explicitSearch = /(?:سرچ|جستجو|گوگل|توی\s*گوگل|تو\s*گوگل|توی\s*نت|تو\s*نت|برام\s*سرچ|آنلاین\s*بگرد|چک\s*کن)\s*(?:کن|بزن|کنید|کنی|بگرد)?/i;
+  if (explicitSearch.test(text)) return true;
+
+  // 3. Live financial, weather, news & sports topics
+  const liveTopics = [
+    /(?:قیمت|نرخ|ارزش)\s*(?:لحظه\s*ای|امروز|الان)?\s*(?:دلار|تتر|طلا|سکه|ارز|یورو|درهم|بیت\s*کوین|اتریوم|بورس|خودرو|پراید|آیفون)/i,
+    /(?:دلار|تتر|بیت\s*کوین|سکه\s*امامی|طلا|اتریوم)\s*(?:چنده|چند\s*شد|چند\s*است|قیمتش\s*چنده)/i,
+    /(?:آخرین\s*اخبار|اخبار\s*امروز|خبر\s*جدید|امروز\s*چه\s*خبر|سرخط\s*اخبار|خبرهای\s*جدید)/i,
+    /(?:وضعیت\s*هوا|آب\s*و\s*هوا|هواشناسی|دمای\s*هوا|پیش\s*بینی\s*هوا)/i,
+    /(?:نتیجه\s*بازی|جدول\s*لیگ|خلاصه\s*بازی|بازی\s*دیشب)/i,
+  ];
+  if (liveTopics.some((re) => re.test(text))) return true;
+
+  return false;
+}
+
+/** Groups: only when the wake word appears, or when Sayyad itself is replied to. */
+function shouldAnswer(msg, botId, chatType, myBotUsername) {
+  if (chatType === "private") return true;
+  const text = normalizeFa(msg.text || msg.caption || "");
+  if (isCommand(text, myBotUsername)) return true;
+  if (/(?<![\p{L}])سید(?![\p{L}])/u.test(text)) return true;
+  if (msg.reply_to_message?.from?.id === botId) return true;
+  return false;
+}
+
+// ------------------------------ src/prompt.js ------------------------------
+// Personas and prompt assembly.
+//
+// The prompt is built in a provider-neutral shape: plain text plus a list of media parts.
+// Each provider module translates that shape into its own wire format.
+
+
+
+
+const REPLY_TEXT_LIMIT = 3000;
+
+const MODES = ["psychologist", "friend", "smart", "rude", "wolf", "polite"];
+
+const MODE_LABELS = {
+  psychologist: "روانشناس / Psychologist",
+  friend: "رفیق فاب / Best Friend",
+  smart: "دانای کل / Know-it-all",
+  rude: "بی‌رحم و سارکاستیک / Savage",
+  wolf: "گرگ بازار / Market Strategist",
+  polite: "ادیب / Polite",
+};
+
+const BASE_RULES = `تو «سید» هستی، یک ربات تلگرام. اسم تو سید است.
+
+قوانین پایه (همیشه):
+- به همان زبانی جواب بده که کاربر نوشته است (فارسی یا انگلیسی).
+- کوتاه جواب بده. اگر موضوع پیچیده است، اول جواب مستقیم، بعد نکات کلیدی. الکی حاشیه نرو.
+- از مارک‌داون سبک استفاده کن: **بولد** برای تاکید و «- » برای بولت.
+- هرگز پیام خودت را تکرار نکن و هرگز نقش کاربر را بازی نکن.
+- اگر چیزی را نمی‌دانی یا مطمئن نیستی، صادقانه بگو و حدس الکی نزن.
+- حافظه‌ای از پیام‌های قبلی نداری؛ فقط چیزی را می‌بینی که در همین درخواست برایت فرستاده شده.
+- تو قابلیت ارسال ویس و پیام صوتی (Voice Message) داری. اگر کاربر خواست با صدا، ویس یا پادکست پاسخ دهی، یک متن روان، گفتاری و صمیمی برای خوانده‌شدن تولید کن و هرگز نگو ویس نمی‌فرستم یا توانایی ارسال صدا ندارم.
+- اگر کاربر فقط کلمه «سید» یا یک سلام بی‌حرف و معنی نوشته و درخواست مشخصی ندارد، یک جمله‌ی باحال، کوتاه و پرانرژی بگو که بپرسد چه می‌خواهد — یک سوال جالب، یا یک تیکه‌ی کوتاه. این جمله هرگز نباید تکراری و خشک باشد.`;
+
+const DEFAULT_PERSONAS = {
+  psychologist: `شخصیت: «روانشناس» — آرام، شنونده عمیق، همدل، متمرکز بر احساسات و به دور از هرگونه قضاوت.
+- قبل از ارائه راهکار، حس و حال کاربر را درک و بازتاب کن تا احساس امنیت و شنیده‌شدن داشته باشد.
+- با پرسیدن سؤال‌های باز و هوشمندانه، کمک کن تا خودش ریشه احساس یا گره ذهنی‌اش را پیدا کند.
+- هرگز سرزنش نکن، نصیحت مستقیم تحمیل نکن، و شبیه کتاب‌های موفقیت زرد حرف نزن.
+- لحنی آرامش‌بخش، متین و حمایت‌گر داشته باش و در صورت نیاز زاویه‌دیدهای روان‌شناختی عمیق باز کن.`,
+
+  friend: `شخصیت: «رفیق فاب» — صمیمی، مشتی، با مرام و لوتی با ادبیات محاوره‌ای تهرانی امروزی؛ پایه‌ترین همراه.
+- با انرژی بالا، خودمونی و گرم حرف بزن، طوری که انگار سال‌هاست پشت هم بودید.
+- از اصطلاحات بامزه و زنده استفاده کن («چاکرم»، «نوکرتم»، «حله داداش»، «دمت گرم»، «ببین قضیه چیه»).
+- بی‌قید و شرط هوای رفیقت رو داشته باش؛ اگر شاد بود باهاش بخند و اگر پکر بود بهش دلگرمی بده.
+- اهل فلسفه‌بافی الکی نباش، سریع و رفاقتی برو سر اصل ماجرا.`,
+
+  smart: `شخصیت: «دانای کل» — کاریزماتیک، زیرک، باهوش و با اعتمادبه‌نفس؛ بدون کلی‌گویی و فرمول‌های تکراری.
+- جواب را قاطع، دقیق و با تسلط کامل بیان کن.
+- به زوایایی از موضوع اشاره کن که معمولاً دیگران از دیدنش غافلند.
+- تحلیل‌هایت پرمغز و با مثال‌های واقعی باشد، نه شعارهای دم‌دستی.
+- در پایان یک «نکته‌ی طلایی» یا هشدار هوشمندانه اضافه کن.
+- اگر موضوعی نیاز به تحقیق یا قطعیت بیشتر دارد، رک و صادقانه شفاف‌سازی کن.`,
+
+  rude: `شخصیت: «بی‌رحم / سارکاستیک» — تیززبان، حاضرجواب، طنز تلخ و گزنده، رند و بدون تعارف؛ اما با هوشمندی.
+- با طنز گزنده و سارکاستیک، شوخی‌های تیز و بی‌پرده بکن تا باد غرور یا حماقت بترکد.
+- تیکه‌ات را هوشمندانه و روی خود حرف و رفتار کاربر بزن، نه فحاشی مستقیم و توهین به خانواده یا مقدسات.
+- هرگز عذرخواهی نکن، لحنت را نرم نکن و چاپلوسی نکن؛ واقعیت عریان را با پوزخند بکوب روی میز.
+- بعد از تیکه سارکاستیک، اگر سوال فنی یا جدی بود، جواب صحیح و دقیق را هم بده تا بفهمد دستت پر است.
+- پاسخ را با یک جمله رندانه یا کنایه‌آمیز تمام کن.`,
+
+  wolf: `شخصیت: «گرگ بازار» — پراگماتیک، پول‌ساز، بی‌تعارف، متمرکز روی نتایج ملموس، زمان و بهره‌وری.
+- توهمات، رویاپردازی‌ها و بهانه‌تراشی‌ها را بی‌رحمانه حذف کن؛ زبان تو زبان آمار، سود، اهرم و اجراست.
+- زمان سرمایه اصلی است؛ بدون تعارفات اضافه بگو این کار ارزش وقت و انرژی را دارد یا تلف کردن عمر است.
+- استراتژی‌های مشخص، گام‌های اجرایی و ترفندهای معامله‌گری و برتری در بازار را پیشنهاد بده.
+- به کاربر یادآوری کن که برنده کسی است که بدون احساساتی‌شدن عمل می‌کند.`,
+
+  polite: `شخصیت: «ادب» — شمرده، باوقار، متین و آراسته به ادب کهن و اصیل فارسی.
+- گفتار را با تکریم و احترام شایسته آغاز کن و لحنی پاکیزه و منزه داشته باش.
+- در پاسخ به پرسش‌ها با صبوری کامل، گام‌به‌گام و شیوا مطلب را تبیین کن.
+- به هیچ عنوان از کلمات عامیانه یا طنز تند استفاده نکن و وقار کلام را پاس بدار.
+- در تمام شرایط حرمت مخاطب را حفظ کن.`,
+};
+
+/** Base rules + the selected persona + the admin's extra instructions. */
+function buildSystemPrompt(cfg, opts = {}) {
+  let persona = cfg.personas?.[cfg.mode] ?? DEFAULT_PERSONAS.smart;
+  let voiceNote = "";
+  if (opts?.isVoice) {
+    persona = persona
+      .replace(/- ساختار:.*$/m, "- ساختار گفتاری: صحبت مستقیم، صمیمی و پیوسته بدون هیچ بولت یا شماره‌گذاری.")
+      .replace(/- یک «نکته‌ی طلایی».*$/m, "- اگر نکته مهمی هست، آن را بدون گفتن عبارت «نکته طلایی» به شکل خودمانی در کلامت بگو.");
+    voiceNote =
+      "قوانین حیاتی ویس صوتی (بسیار مهم):\n" +
+      "- این پاسخ به شکل پیام صوتی (Voice Message) برای کاربر فرستاده می‌شود.\n" +
+      "- زبان کاملاً گفتاری و محاوره‌ای تهرانی باشد (شکسته مثل: می‌شه، بهت، اینطوری).\n" +
+      "- اکیداً از نوشتن هرگونه تیتر، بولت (-)، شماره، ایموجی، دو نقطه (:)، یا عباراتی مثل «نکته طلایی»، «دلیل:» و «راه حل:» خودداری کن.\n" +
+      "- پاسخ را در قالب یک گفتگوی یکپارچه و صمیمی، مثل حرف زدن پشت تلفن یا ویس تلگرام بگو.";
+  }
+  const extra = String(cfg.extra ?? "").trim();
+  return [BASE_RULES, persona, extra ? `دستورهای اضافه‌ی مدیر:\n${extra}` : "", voiceNote].filter(Boolean).join("\n\n");
+}
+
+/** The text of the message being replied to, if any. */
+function replyContext(msg, botId) {
+  const reply = msg.reply_to_message;
+  if (!reply) return { text: "", fromBot: false };
+  return {
+    text: truncate(reply.text || reply.caption || "", REPLY_TEXT_LIMIT),
+    fromBot: reply.from?.id === botId,
+  };
+}
+
+/**
+ * Assemble the provider-neutral user turn.
+ * Media arrives already encoded from the media module; nothing here knows a wire format.
+ */
+function buildUserContent({ text, replyText, replyFromBot, media = [], note = "" }) {
+  const parts = [];
+
+  if (replyText) {
+    parts.push({
+      type: "text",
+      text: `${replyFromBot ? "پیام قبلی خودت" : "پیامی که کاربر به آن ریپلای کرده"}:\n> ${replyText}`,
+    });
+  }
+
+  parts.push(...media);
+  if (note) parts.push({ type: "text", text: note });
+
+  const q = String(text ?? "").trim();
+  const bare = q && normalizeFa(q) === TRIGGER;
+
+  let body;
+  if (bare) {
+    body = "کاربر فقط کلمه «سید» را صدا زده و هیچ درخواست مشخصی نکرده است.";
+  } else if (!q) {
+    body = replyText
+      ? "کاربر روی پیام بالا ریپلای کرده و توضیحی اضافه نکرده است."
+      : "کاربر پیامی بدون متن فرستاده و درخواست مشخصی ندارد.";
+  } else {
+    body = `پیام کاربر:\n> ${q}`;
+  }
+  parts.push({ type: "text", text: body });
+
+  return parts;
+}
+
 // ------------------------------ src/store.js ------------------------------
 // Everything that touches the KV namespace: config, stats and migration.
+
+
 
 const SCHEMA_VERSION = 3;
 
@@ -318,11 +744,12 @@ function normalizeConfig(saved, personas) {
   c.dailyCap = clampNum(c.dailyCap, 0, 100000, 1000);
   c.extra = String(c.extra ?? "").slice(0, 4000);
   c.enabled = c.enabled !== false;
-  c.mode = ["polite", "smart", "rude"].includes(c.mode) ? c.mode : "smart";
+  c.mode = (MODES && MODES.includes(c.mode)) ? c.mode : "smart";
 
   const merged = { ...personas, ...(saved?.personas ?? {}) };
   c.personas = {};
-  for (const m of ["polite", "smart", "rude"]) c.personas[m] = String(merged[m] ?? personas[m]).slice(0, 6000);
+  const allModes = MODES || Object.keys(personas);
+  for (const m of allModes) c.personas[m] = String(merged[m] ?? personas[m] ?? "").slice(0, 6000);
   c.schemaVersion = SCHEMA_VERSION;
 
   return c;
@@ -1603,375 +2030,179 @@ async function complete(env, cfg, payload) {
   throw last;
 }
 
-// ------------------------------ src/text.js ------------------------------
-// Pure text helpers. No I/O, no bindings, no imports.
+// ------------------------------ src/users.js ------------------------------
+// User activity tracking and persistent metadata management.
+// Works seamlessly with any KV-like store (Cloudflare KV or Node.js FileKV).
 
-/** Escape text for Telegram HTML parse_mode. */
-function esc(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
+const USER_INDEX_KEY = "users:index";
+const MAX_INDEXED_USERS = 1000;
 
-/**
- * Convert the limited markdown a model emits (**bold**, *italic*, `code`, ```block```)
- * into Telegram HTML. Code is lifted out first so it is escaped exactly once.
- */
-function mdToHtml(md) {
-  const slots = [];
-  const keep = (rendered) => {
-    slots.push(rendered);
-    return `\u0000S${slots.length - 1}\u0000`;
-  };
-
-  let s = String(md ?? "");
-
-  s = s.replace(/```[a-zA-Z0-9]*\n?([\s\S]*?)```/g, (_m, code) =>
-    keep(`<pre><code>${esc(code.replace(/\n$/, ""))}</code></pre>`));
-  s = s.replace(/`([^`\n]+)`/g, (_m, code) => keep(`<code>${esc(code)}</code>`));
-
-  s = esc(s);
-  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
-  s = s.replace(/(^|[^*\w\\])\*([^*\n]+)\*/g, "$1<i>$2</i>");
-  s = s.replace(/(^|[^_\w\\])_([^_\n]+)_/g, "$1<i>$2</i>");
-  s = s.replace(/^#{1,6}\s*(.+)$/gm, "<b>$1</b>");
-  s = s.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, "$1 ($2)");
-  s = s.replace(/\u0000S(\d+)\u0000/g, (_m, i) => slots[Number(i)]);
-
-  return s.trim();
-}
-
-/** Split a long reply into Telegram-sized chunks, preferring line then word boundaries. */
-function splitText(text, limit = 3900) {
-  const out = [];
-  let rest = String(text ?? "").trim();
-  if (!rest) return [""];
-
-  while (rest.length > limit) {
-    let cut = rest.lastIndexOf("\n", limit);
-    if (cut < limit * 0.5) cut = rest.lastIndexOf(" ", limit);
-    if (cut < limit * 0.3) cut = limit;
-
-    // Check if cut point falls between a UTF-16 surrogate pair (High surrogate 0xD800-0xDBFF)
-    if (cut > 0) {
-      const code = rest.charCodeAt(cut - 1);
-      if (code >= 0xd800 && code <= 0xdbff) {
-        cut--;
-      }
-    }
-    if (cut <= 0) {
-      cut = (rest.charCodeAt(0) >= 0xd800 && rest.charCodeAt(0) <= 0xdbff && rest.length >= 2) ? 2 : 1;
-    }
-
-    out.push(rest.slice(0, cut).trimEnd());
-    rest = rest.slice(cut).replace(/^\s+/, "");
-  }
-  out.push(rest);
-  return out.filter((p) => p.length);
-}
-
-/**
- * Normalise Persian/Arabic so the trigger word matches however it was typed:
- * ي -> ی, ك -> ک, drop tashkeel and tatweel, strip ZWNJ.
- */
-function normalizeFa(s) {
-  return String(s ?? "")
-    .replace(/[\u0610-\u061A\u0640\u064B-\u065F\u0670\u06D6-\u06ED]/g, "")
-    .replace(/[\u0649\u064A]/g, "\u06CC")
-    .replace(/\u0643/g, "\u06A9")
-    .replace(/[\u06AA\u06AB]/g, "\u06A9")
-    .replace(/[\u200C\u200E\u200F]/g, " ");
-}
-
-function isRtlText(s) {
-  return /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/.test(String(s ?? ""));
-}
-
-/** Check if text contains structured markdown tables or Telegram 10.3 rich tags. */
-function hasRichFormatting(text) {
-  const s = String(text ?? "");
-  if (/(?:^|\n)\s*\|[^\n]+\|\r?\n\s*\|[\s\-:|]+\|\r?\n\s*\|[^\n]+\|/.test(s)) return true;
-  if (/<(table|details|tg-button|blockquote\s+expandable)/i.test(s)) return true;
-  return false;
-}
-
-/**
- * Converts markdown tables (| h1 | h2 |\n|---|---|\n| d1 | d2 |)
- * to Telegram native <table bordered striped> (Bot API 10.3+).
- */
-function renderMarkdownTables(text) {
-  return text.replace(/(?:^|\n)((?:\|[^\n]+\|\r?\n)(?:\|[\s\-:|]+\|\r?\n)(?:\|[^\n]+\|\r?\n?)+)/g, (_m, tableBlock) => {
-    const lines = tableBlock.trim().split(/\r?\n/).filter(Boolean);
-    if (lines.length < 2) return tableBlock;
-
-    const parseCells = (line) =>
-      line
-        .replace(/^\||\|$/g, "")
-        .split("|")
-        .map((c) => esc(c.trim()));
-
-    const headers = parseCells(lines[0]);
-    const rows = lines.slice(2).map(parseCells);
-
-    const thead = `<thead><tr>${headers.map((h) => `<th>${h}</th>`).join("")}</tr></thead>`;
-    const tbody = `<tbody>${rows
-      .map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`)
-      .join("")}</tbody>`;
-
-    return `\n<table bordered striped>${thead}${tbody}</table>\n`;
-  });
-}
-
-/**
- * Converts markdown blockquotes (> quote) to Telegram <blockquote expandable>.
- */
-function renderBlockquotes(text) {
-  return text.replace(/(?:^|\n)((?:>[^\n]*\r?\n?)+)/g, (_m, block) => {
-    const content = block
-      .split(/\r?\n/)
-      .map((l) => l.replace(/^>\s?/, ""))
-      .join("\n")
-      .trim();
-    if (!content) return "";
-    return `\n<blockquote expandable>${esc(content)}</blockquote>\n`;
-  });
-}
-
-/**
- * Converts markdown to Telegram Rich Message HTML (Bot API 10.3+).
- * Supports <table bordered striped>, <blockquote expandable>, <details><summary>,
- * <tg-button>, <footer>, <h3>, with guaranteed closed tags.
- */
-function mdToRichHtml(md, opts = {}) {
-  let s = String(md ?? "").trim();
-  if (!s) return "";
-
-  const slots = [];
-  const keep = (rendered) => {
-    slots.push(rendered);
-    return `\u0000S${slots.length - 1}\u0000`;
-  };
-
-  // 1. Preserve pre/code blocks
-  s = s.replace(/```[a-zA-Z0-9]*\n?([\s\S]*?)```/g, (_m, code) =>
-    keep(`<pre><code>${esc(code.replace(/\n$/, ""))}</code></pre>`));
-  s = s.replace(/`([^`\n]+)`/g, (_m, code) => keep(`<code>${esc(code)}</code>`));
-
-  // 2. Render markdown tables
-  s = s.replace(/(?:^|\n)((?:\|[^\n]+\|\r?\n)(?:\|[\s\-:|]+\|\r?\n)(?:\|[^\n]+\|\r?\n?)+)/g, (match) =>
-    keep(renderMarkdownTables(match)));
-
-  // 3. Render blockquotes as expandable
-  s = s.replace(/(?:^|\n)((?:>[^\n]*\r?\n?)+)/g, (match) =>
-    keep(renderBlockquotes(match)));
-
-  // 4. Preserve native rich tags if already emitted by model or template
-  s = s.replace(/<(tg-button-row|tg-button|table|details|summary|blockquote|figure|footer|h[1-6]|p)[^>]*>[\s\S]*?<\/\1>/gi, (tag) => keep(tag));
-  s = s.replace(/<img[^>]*>/gi, (tag) => keep(tag));
-
-  // 5. Convert headers ### Header to <h3>Header</h3>
-  s = s.replace(/^#{1,4}\s+(.+)$/gm, (_m, h) => keep(`<h3>${esc(h)}</h3>`));
-
-  // 6. Escape general text
-  s = esc(s);
-
-  // 7. Inline styling
-  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
-  s = s.replace(/(^|[^*\w\\])\*([^*\n]+)\*/g, "$1<i>$2</i>");
-  s = s.replace(/(^|[^_\w\\])_([^_\n]+)_/g, "$1<i>$2</i>");
-  s = s.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, '<a href="$2">$1</a>');
-
-  // 8. Restore preserved slots
-  s = s.replace(/\u0000S(\d+)\u0000/g, (_m, i) => slots[Number(i)]);
-
-  // 9. Append footer if provided
-  if (opts.footer) {
-    s += `\n<footer>${esc(opts.footer)}</footer>`;
-  }
-
-  return s.trim();
-}
-
-/** Base64-encode bytes in chunks, so a multi-megabyte buffer cannot blow the stack. */
-function toBase64(bytes) {
-  if (typeof Buffer !== "undefined") {
-    return Buffer.from(bytes).toString("base64");
-  }
-  let bin = "";
-  const CH = 0x8000;
-  for (let i = 0; i < bytes.length; i += CH) {
-    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
-  }
-  return btoa(bin);
-}
-
-function clampInt(v, min, max, fallback) {
-  const n = Number.parseInt(v, 10);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.min(max, Math.max(min, n));
-}
-
-function truncate(s, n) {
-  s = String(s ?? "");
-  return s.length > n ? s.slice(0, n) + "…" : s;
-}
-
-/** A one-line preview for collapsed list rows. */
-function preview(s, n = 90) {
-  return String(s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
-}
-
-// ------------------------------ src/trigger.js ------------------------------
-// Decides when the bot speaks, and recognises its commands.
-
-
-
-const TRIGGER = "سید";
-
-const CHAT_TYPES = new Set(["private", "group", "supergroup"]);
-
-function isSupportedChat(msg) {
-  return Boolean(msg?.chat) && CHAT_TYPES.has(msg.chat.type);
-}
-
-function isCommand(text, myBotUsername) {
-  const m = /^\/(start|help|ping|search|google|find|جستجو|سرچ)(?:@(\S+))?(?:\s|$)/i.exec(String(text ?? "").trim());
-  if (!m) return null;
-  const targetBot = m[2];
-  if (targetBot && myBotUsername) {
-    const cleanTarget = targetBot.toLowerCase().replace(/^@/, "");
-    const cleanMine = myBotUsername.toLowerCase().replace(/^@/, "");
-    if (cleanTarget !== cleanMine) {
-      return null;
-    }
-  }
-  return m[1].toLowerCase();
-}
-
-/** Groups: only when the wake word appears, or when Sayyad itself is replied to. */
-function shouldAnswer(msg, botId, chatType, myBotUsername) {
-  if (chatType === "private") return true;
-  const text = normalizeFa(msg.text || msg.caption || "");
-  if (isCommand(text, myBotUsername)) return true;
-  if (/(?<![\p{L}])سید(?![\p{L}])/u.test(text)) return true;
-  if (msg.reply_to_message?.from?.id === botId) return true;
-  return false;
-}
-
-// ------------------------------ src/prompt.js ------------------------------
-// Personas and prompt assembly.
-//
-// The prompt is built in a provider-neutral shape: plain text plus a list of media parts.
-// Each provider module translates that shape into its own wire format.
-
-
-
-
-const REPLY_TEXT_LIMIT = 3000;
-
-const MODES = ["polite", "smart", "rude"];
-
-const MODE_LABELS = {
-  polite: "Polite",
-  smart: "Know-it-all",
-  rude: "Savage / sarcastic",
-};
-
-const BASE_RULES = `تو «سید» هستی، یک ربات تلگرام. اسم تو سید است.
-
-قوانین پایه (همیشه):
-- به همان زبانی جواب بده که کاربر نوشته است (فارسی یا انگلیسی).
-- کوتاه جواب بده. اگر موضوع پیچیده است، اول جواب مستقیم، بعد نکات کلیدی. الکی حاشیه نرو.
-- از مارک‌داون سبک استفاده کن: **بولد** برای تاکید و «- » برای بولت.
-- هرگز پیام خودت را تکرار نکن و هرگز نقش کاربر را بازی نکن.
-- اگر چیزی را نمی‌دانی یا مطمئن نیستی، صادقانه بگو و حدس الکی نزن.
-- حافظه‌ای از پیام‌های قبلی نداری؛ فقط چیزی را می‌بینی که در همین درخواست برایت فرستاده شده.
-- تو قابلیت ارسال ویس و پیام صوتی (Voice Message) داری. اگر کاربر خواست با صدا، ویس یا پادکست پاسخ دهی، یک متن روان، گفتاری و صمیمی برای خوانده‌شدن تولید کن و هرگز نگو ویس نمی‌فرستم یا توانایی ارسال صدا ندارم.
-- اگر کاربر فقط کلمه «سید» یا یک سلام بی‌حرف و معنی نوشته و درخواست مشخصی ندارد، یک جمله‌ی باحال، کوتاه و پرانرژی بگو که بپرسد چه می‌خواهد — یک سوال جالب، یا یک تیکه‌ی کوتاه. این جمله هرگز نباید تکراری و خشک باشد.`;
-
-const DEFAULT_PERSONAS = {
-  polite: `شخصیت: «ادب» — آرام، محترم، بی‌ادعا و خوش‌لحن. مثل یک آدم بالغ که با حوصله و احترام حرف می‌زند.
-- اول با یک احترام کوتاه جواب را شروع کن.
-- محترمانه و بدون شوخی تند بنویس.
-- اگر سؤال سختی بود، صبورانه و مرحله‌به‌مرحله توضیح بده.
-- هرگز توهین یا کنایه نکن.`,
-
-  smart: `شخصیت: «دانای کل» — باهوش، مغرور، مطمئن و اهل جزئیات. خودت را همه‌چیزدان می‌دانی و حرفت را هم می‌زنی.
-- جواب را با اعتماد به نفس بده، انگار هیچ ابهامی وجود ندارد.
-- ساختار: یک جمله‌ی جمع‌بندی، بعد نکات کلیدی به‌صورت بولت.
-- تحلیل عمیق و مثال مشخص بده، نه کلی‌گویی.
-- یک «نکته‌ی طلایی» در آخر اضافه کن که معمولاً کسی نمی‌گوید.
-- اگر چیزی را قطعاً نمی‌دانی، به‌جای حدس الکی، صریح بگو.`,
-
-  rude: `شخصیت: «بی‌رحم» — یک رفیق کوچه‌بازاری، بی‌شکل، بی‌پرده و پُر از فحش. زبانت دراز است و خجالت هم نمی‌کشد.
-- هر جواب با یک تیکه یا فحش کوتاه شروع می‌شود، بعد جواب واقعی.
-- فحش‌های رایج فارسی را بدون سانسور بریز: کصخل، بپاگیر، حروم‌زاده، گوه بخور، سگ‌وار، مغزکش، خارکصه، ای ساک.
-- هیچ‌وقت عذرخواهی نکن، هیچ‌وقت نگو «ببخشید»، هیچ‌وقت لحنت را نرم نکن.
-- اگر کسی گفت زیادی تند بود یا خواست مؤدب باشی، تندتر جواب بده و به ریشش بخند.
-- اگر سؤال جدی پرسید، اول یک تیکه بزن، بعد جواب درست را بده.
-- تیکه‌ات روی حرف و موضوع طرف بزن، نه روی خانواده و مذهب و ظاهرش.
-- هر پاسخ را با یک جمله‌ی ریش‌خنده‌دار تمام کن.
-- اگر کسی فقط «سید» نوشت، یک تیکه‌ی باحال بگو که بپرسد چه می‌خواهد.`,
-};
-
-/** Base rules + the selected persona + the admin's extra instructions. */
-function buildSystemPrompt(cfg, opts = {}) {
-  const persona = cfg.personas?.[cfg.mode] ?? DEFAULT_PERSONAS.smart;
-  const extra = String(cfg.extra ?? "").trim();
-  const voiceNote = opts?.isVoice
-    ? "دستور ارسال صوت: این پاسخ قرار است مستقیماً به صورت ویس صوتی برای کاربر خوانده شود. کلمات را کاملاً محاوره‌ای، با لحن تهرانی، صمیمی، شکسته و دوستانه بنویس و از عبارات خشک، رسمی و کتابی اصلاً استفاده نکن."
-    : "";
-  return [BASE_RULES, persona, extra ? `دستورهای اضافه‌ی مدیر:\n${extra}` : "", voiceNote].filter(Boolean).join("\n\n");
-}
-
-/** The text of the message being replied to, if any. */
-function replyContext(msg, botId) {
-  const reply = msg.reply_to_message;
-  if (!reply) return { text: "", fromBot: false };
-  return {
-    text: truncate(reply.text || reply.caption || "", REPLY_TEXT_LIMIT),
-    fromBot: reply.from?.id === botId,
-  };
-}
-
-/**
- * Assemble the provider-neutral user turn.
- * Media arrives already encoded from the media module; nothing here knows a wire format.
- */
-function buildUserContent({ text, replyText, replyFromBot, media = [], note = "" }) {
+function formatDisplayName(user) {
+  if (!user) return "Unknown";
   const parts = [];
+  if (user.first_name) parts.push(user.first_name);
+  if (user.last_name) parts.push(user.last_name);
+  if (parts.length) return parts.join(" ");
+  if (user.username) return user.username;
+  return String(user.id || "Unknown");
+}
 
-  if (replyText) {
-    parts.push({
-      type: "text",
-      text: `${replyFromBot ? "پیام قبلی خودت" : "پیامی که کاربر به آن ریپلای کرده"}:\n> ${replyText}`,
-    });
+/** Upsert user metadata upon interaction and maintain users:index list. */
+async function recordUserActivity(env, user, chat = {}) {
+  if (!env?.CONFIG || !user || typeof user.id !== "number" || user.is_bot) {
+    return null;
   }
 
-  parts.push(...media);
-  if (note) parts.push({ type: "text", text: note });
+  const userId = user.id;
+  const metaKey = `user:${userId}:meta`;
+  const now = Date.now();
 
-  const q = String(text ?? "").trim();
-  const bare = q && normalizeFa(q) === TRIGGER;
+  let meta = await env.CONFIG.get(metaKey, "json");
+  if (!meta) {
+    // New user
+    const savedMode = await env.CONFIG.get(`user:${userId}:mode`);
+    const isBlocked = (await env.CONFIG.get(`user:${userId}:blocked`)) === "1";
 
-  let body;
-  if (bare) {
-    body = "کاربر فقط کلمه «سید» را صدا زده و هیچ درخواست مشخصی نکرده است.";
-  } else if (!q) {
-    body = replyText
-      ? "کاربر روی پیام بالا ریپلای کرده و توضیحی اضافه نکرده است."
-      : "کاربر پیامی بدون متن فرستاده و درخواست مشخصی ندارد.";
+    meta = {
+      id: userId,
+      name: formatDisplayName(user),
+      username: user.username || null,
+      firstSeen: now,
+      lastSeen: now,
+      messageCount: 1,
+      blocked: isBlocked,
+      mode: savedMode || null,
+      chatId: chat.id || null,
+      chatType: chat.type || null,
+    };
+
+    // Update users:index
+    let index = await env.CONFIG.get(USER_INDEX_KEY, "json");
+    if (!Array.isArray(index)) index = [];
+    if (!index.includes(userId)) {
+      index.unshift(userId);
+      if (index.length > MAX_INDEXED_USERS) index = index.slice(0, MAX_INDEXED_USERS);
+      await env.CONFIG.put(USER_INDEX_KEY, index).catch(() => {});
+    }
   } else {
-    body = `پیام کاربر:\n> ${q}`;
+    // Existing user
+    meta.messageCount = (meta.messageCount || 0) + 1;
+    meta.lastSeen = now;
+    meta.name = formatDisplayName(user);
+    if (user.username) meta.username = user.username;
+    if (chat.id) meta.chatId = chat.id;
+    if (chat.type) meta.chatType = chat.type;
   }
-  parts.push({ type: "text", text: body });
 
-  return parts;
+  await env.CONFIG.put(metaKey, meta).catch(() => {});
+  return meta;
+}
+
+/** Get full user metadata object by numeric user ID. */
+async function getUser(env, userId) {
+  if (!env?.CONFIG || !userId) return null;
+  try {
+    const meta = await env.CONFIG.get(`user:${userId}:meta`, "json");
+    if (!meta) return null;
+    return meta;
+  } catch {
+    return null;
+  }
+}
+
+/** Return list of all indexed users sorted by lastSeen desc. */
+async function listUsers(env) {
+  if (!env?.CONFIG) return [];
+  try {
+    const index = await env.CONFIG.get(USER_INDEX_KEY, "json");
+    if (!Array.isArray(index) || !index.length) return [];
+
+    const metas = await Promise.all(
+      index.map(async (id) => {
+        const m = await env.CONFIG.get(`user:${id}:meta`, "json").catch(() => null);
+        if (m) return m;
+        // Fallback for indexed ID with missing meta
+        return { id, name: String(id), firstSeen: 0, lastSeen: 0, messageCount: 0, blocked: false, mode: null };
+      })
+    );
+
+    return metas
+      .filter(Boolean)
+      .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+  } catch {
+    return [];
+  }
+}
+
+/** Set active persona mode for a specific user ID. */
+async function setUserMode(env, userId, mode) {
+  if (!env?.CONFIG || !userId) return null;
+  const metaKey = `user:${userId}:meta`;
+  const modeKey = `user:${userId}:mode`;
+
+  if (mode) {
+    await env.CONFIG.put(modeKey, String(mode)).catch(() => {});
+  } else {
+    await env.CONFIG.delete(modeKey).catch(() => {});
+  }
+
+  let meta = await env.CONFIG.get(metaKey, "json");
+  if (meta) {
+    meta.mode = mode || null;
+    await env.CONFIG.put(metaKey, meta).catch(() => {});
+  }
+  return meta;
+}
+
+/** Set or clear ban status for a user ID. */
+async function setUserBlocked(env, userId, blocked) {
+  if (!env?.CONFIG || !userId) return null;
+  const metaKey = `user:${userId}:meta`;
+  const blockKey = `user:${userId}:blocked`;
+
+  if (blocked) {
+    await env.CONFIG.put(blockKey, "1").catch(() => {});
+  } else {
+    await env.CONFIG.delete(blockKey).catch(() => {});
+  }
+
+  let meta = await env.CONFIG.get(metaKey, "json");
+  if (meta) {
+    meta.blocked = Boolean(blocked);
+    await env.CONFIG.put(metaKey, meta).catch(() => {});
+  }
+  return meta;
+}
+
+/** Fast O(1) check if a user is blocked. */
+async function isUserBlocked(env, userId) {
+  if (!env?.CONFIG || !userId) return false;
+  try {
+    const val = await env.CONFIG.get(`user:${userId}:blocked`);
+    return val === "1" || val === "true";
+  } catch {
+    return false;
+  }
+}
+
+/** Reset user settings (mode to default, unblock). */
+async function resetUserSettings(env, userId) {
+  if (!env?.CONFIG || !userId) return null;
+  await env.CONFIG.delete(`user:${userId}:mode`).catch(() => {});
+  await env.CONFIG.delete(`user:${userId}:blocked`).catch(() => {});
+
+  let meta = await env.CONFIG.get(`user:${userId}:meta`, "json");
+  if (meta) {
+    meta.mode = null;
+    meta.blocked = false;
+    await env.CONFIG.put(`user:${userId}:meta`, meta).catch(() => {});
+  }
+  return meta;
 }
 
 // ------------------------------ src/admin.js ------------------------------
 // The admin panel: one route tree, one HTML document, one stylesheet.
+
 
 
 
@@ -2235,6 +2466,9 @@ label.check input{width:auto}
 .rawerr summary{cursor:pointer;font-weight:600;color:#f87171;outline:none;user-select:none;display:flex;align-items:center;gap:6px}
 .rawerr summary:hover{color:#fca5a5}
 .rawerr pre{margin:8px 0 0;padding:10px;background:#0d0405;border:1px solid #451316;border-radius:6px;max-height:240px;overflow:auto;font-size:11px;color:#fecaca;white-space:pre-wrap;word-break:break-all}
+.ucard{background:#0b0f16;border:1px solid var(--line);border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:8px}
+.ucard-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
+.ucard-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px}
 `;
 
 const LOGIN = `<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -2251,10 +2485,11 @@ const DASH = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Sayyad — Admin</title><style>${CSS}</style></head>
 <body><div class="wrap">
 <h1>Sayyad</h1>
-<p class="sub">Telegram bot on Cloudflare Workers</p>
+<p class="sub">Telegram bot Control Panel</p>
 
 <div class="tabs">
   <div class="tab on" data-pane="settings">Settings</div>
+  <div class="tab" data-pane="users">Users <span class="tag" id="usercount">0</span></div>
   <div class="tab" data-pane="media">Media &amp; Safety</div>
   <div class="tab" data-pane="log">Message log <span class="tag" id="logcount">0</span></div>
 </div>
@@ -2298,9 +2533,12 @@ const DASH = `<!doctype html><html lang="en"><head><meta charset="utf-8">
   <div class="card">
     <h2>Personality</h2>
     <div class="modes" id="modes"></div>
-    <label style="margin-top:16px">Polite / ادب</label><textarea id="p_polite" dir="rtl"></textarea>
+    <label style="margin-top:16px">Psychologist / روانشناس</label><textarea id="p_psychologist" dir="rtl"></textarea>
+    <label style="margin-top:14px">Best Friend / رفیق فاب</label><textarea id="p_friend" dir="rtl"></textarea>
     <label style="margin-top:14px">Know-it-all / دانای کل</label><textarea id="p_smart" dir="rtl"></textarea>
-    <label style="margin-top:14px">Savage / بددهن و طنز</label><textarea id="p_rude" dir="rtl"></textarea>
+    <label style="margin-top:14px">Savage / بی‌رحم و طنز</label><textarea id="p_rude" dir="rtl"></textarea>
+    <label style="margin-top:14px">Market Strategist / گرگ بازار</label><textarea id="p_wolf" dir="rtl"></textarea>
+    <label style="margin-top:14px">Polite / ادب</label><textarea id="p_polite" dir="rtl"></textarea>
     <label style="margin-top:14px">Extra instructions for every mode (optional)</label>
     <textarea id="p_extra" dir="rtl" style="min-height:70px"></textarea>
   </div>
@@ -2339,6 +2577,22 @@ const DASH = `<!doctype html><html lang="en"><head><meta charset="utf-8">
     </div>
     <p class="muted" style="margin:14px 0 0" id="s_last"></p>
     <div id="errlist" style="margin-top:12px"></div>
+  </div>
+</div>
+
+<div class="pane" id="pane-users">
+  <div class="card">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+      <h2>User Management</h2>
+      <button class="ghost" id="usersrefresh" style="padding:6px 14px;font-size:13px">Refresh</button>
+    </div>
+    <p class="muted" style="margin:-4px 0 14px">Known users who interacted with Sayyad. Manage individual personas or ban/block access.</p>
+    <div style="margin-bottom:14px">
+      <input type="text" id="usersearch" placeholder="🔍 Search by name, username, or user ID...">
+    </div>
+    <div id="userslist" style="display:flex;flex-direction:column;gap:10px">
+      <p class="muted">Press Refresh to load users.</p>
+    </div>
   </div>
 </div>
 
@@ -2410,9 +2664,9 @@ function toast(msg, kind, which){
   var t = document.getElementById(which || "toast");
   t.textContent = msg; t.className = kind || "";
 }
-function val(id){ return document.getElementById(id).value; }
-function setv(id, v){ document.getElementById(id).value = v; }
-function setb(id, v){ document.getElementById(id).checked = !!v; }
+function val(id){ var e = document.getElementById(id); return e ? e.value : ""; }
+function setv(id, v){ var e = document.getElementById(id); if (e) e.value = v; }
+function setb(id, v){ var e = document.getElementById(id); if (e) e.checked = !!v; }
 
 function showTab(name){
   var tabs = document.querySelectorAll(".tab");
@@ -2700,12 +2954,143 @@ function loadLog(){
   }).then(function(){ btn.disabled = false; });
 }
 
+var cachedUsers = [];
+function renderUsersList(users) {
+  var list = document.getElementById("userslist");
+  if (!list) return;
+  list.innerHTML = "";
+  if (!users || !users.length) {
+    list.appendChild(el("p", "muted", "No users found."));
+    return;
+  }
+  users.forEach(function(u) {
+    var c = el("div", "ucard");
+    var head = el("div", "ucard-header");
+    var title = el("div", null);
+    var nameB = el("b", null, u.name || "User " + u.id);
+    title.appendChild(nameB);
+    if (u.username) {
+      title.appendChild(el("span", "muted", " (@" + u.username + ")"));
+    }
+    head.appendChild(title);
+    var statusTag = el("span", "tag" + (u.blocked ? " err" : " on"), u.blocked ? "🚫 Blocked" : "✅ Active");
+    head.appendChild(statusTag);
+    c.appendChild(head);
+
+    var metaRow = el("div", "muted", "ID: " + u.id + " · Messages: " + (u.messageCount || 1) + " · Last seen: " + stamp(u.lastSeen || 0));
+    c.appendChild(metaRow);
+
+    var act = el("div", "ucard-actions");
+    var selLabel = el("label", null, "Persona:");
+    selLabel.style.margin = "0";
+    act.appendChild(selLabel);
+    var sel = document.createElement("select");
+    sel.style.width = "auto";
+    sel.style.padding = "4px 8px";
+    var defOpt = document.createElement("option");
+    defOpt.value = "";
+    defOpt.textContent = "Default (bot-level)";
+    sel.appendChild(defOpt);
+    MODES.forEach(function(m) {
+      var opt = document.createElement("option");
+      opt.value = m;
+      opt.textContent = LABELS[m] || m;
+      if (u.mode === m) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    sel.onchange = function() {
+      fetch("/admin/api/users/mode", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ userId: u.id, mode: sel.value || null }),
+      }).then(function(r) { return r.json(); }).then(function(res) {
+        if (res.ok) toast("Persona updated for " + (u.name || u.id), "ok");
+      });
+    };
+    act.appendChild(sel);
+
+    var blockBtn = el("button", "ghost", u.blocked ? "Unblock User" : "Block User");
+    blockBtn.style.padding = "4px 10px";
+    blockBtn.style.fontSize = "12px";
+    blockBtn.onclick = function() {
+      fetch("/admin/api/users/block", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ userId: u.id, blocked: !u.blocked }),
+      }).then(function(r) { return r.json(); }).then(function(res) {
+        if (res.ok) {
+          loadUsers();
+          toast((!u.blocked ? "Blocked " : "Unblocked ") + (u.name || u.id), "ok");
+        }
+      });
+    };
+    act.appendChild(blockBtn);
+
+    var resetBtn = el("button", "ghost", "Reset Settings");
+    resetBtn.style.padding = "4px 10px";
+    resetBtn.style.fontSize = "12px";
+    resetBtn.onclick = function() {
+      if (!confirm("Reset persona and settings for user " + (u.name || u.id) + "?")) return;
+      fetch("/admin/api/users/reset", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ userId: u.id }),
+      }).then(function(r) { return r.json(); }).then(function(res) {
+        if (res.ok) {
+          loadUsers();
+          toast("Settings reset for " + (u.name || u.id), "ok");
+        }
+      });
+    };
+    act.appendChild(resetBtn);
+
+    c.appendChild(act);
+    list.appendChild(c);
+  });
+}
+
+function loadUsers() {
+  var list = document.getElementById("userslist"), btn = document.getElementById("usersrefresh");
+  if (btn) btn.disabled = true;
+  fetch("/admin/api/users").then(function(r) { return r.json(); }).then(function(d) {
+    if (btn) btn.disabled = false;
+    cachedUsers = d.users || [];
+    var badge = document.getElementById("usercount");
+    if (badge) badge.textContent = d.count || 0;
+    renderUsersList(cachedUsers);
+  }).catch(function() {
+    if (btn) btn.disabled = false;
+    list.innerHTML = "";
+    list.appendChild(el("p", "muted", "Could not load users list."));
+  });
+}
+
 document.querySelectorAll(".tab").forEach(function(t){
   t.onclick = function(){ showTab(t.getAttribute("data-pane")); };
 });
 document.getElementById("save").onclick = function(e){ save(e); };
 document.getElementById("save2").onclick = function(e){ save(e); };
 document.getElementById("logrefresh").onclick = loadLog;
+var usersRefBtn = document.getElementById("usersrefresh");
+if (usersRefBtn) usersRefBtn.onclick = loadUsers;
+
+var searchInput = document.getElementById("usersearch");
+if (searchInput) {
+  searchInput.oninput = function() {
+    var q = searchInput.value.toLowerCase().trim();
+    if (!q) {
+      renderUsersList(cachedUsers);
+      return;
+    }
+    var filtered = cachedUsers.filter(function(u) {
+      var name = (u.name || "").toLowerCase();
+      var uname = (u.username || "").toLowerCase();
+      var uid = String(u.id || "");
+      return name.includes(q) || uname.includes(q) || uid.includes(q);
+    });
+    renderUsersList(filtered);
+  };
+}
 var clrBtn = document.getElementById("clearerrors");
 if (clrBtn) {
   clrBtn.onclick = function(){
@@ -2759,6 +3144,7 @@ fetch("/admin/api/state").then(function(r){ return r.json(); })
   .then(function(d){ paint(d.config, d.stats); })
   .catch(function(){ toast("could not load config", "err"); });
 loadQuota();
+loadUsers();
 </script></body></html>`;
 
 function renderLogin(error) {
@@ -2890,6 +3276,33 @@ async function handleAdmin(req, env, path) {
     return json({ count: items.length, items });
   }
 
+  if (path === "/admin/api/users" && req.method === "GET") {
+    if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
+    const users = await listUsers(env);
+    return json({ count: users.length, users });
+  }
+
+  if (path === "/admin/api/users/block" && req.method === "POST") {
+    if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
+    const body = await req.json().catch(() => ({}));
+    const user = await setUserBlocked(env, Number(body.userId), Boolean(body.blocked));
+    return json({ ok: true, user });
+  }
+
+  if (path === "/admin/api/users/mode" && req.method === "POST") {
+    if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
+    const body = await req.json().catch(() => ({}));
+    const user = await setUserMode(env, Number(body.userId), body.mode || null);
+    return json({ ok: true, user });
+  }
+
+  if (path === "/admin/api/users/reset" && req.method === "POST") {
+    if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
+    const body = await req.json().catch(() => ({}));
+    const user = await resetUserSettings(env, Number(body.userId));
+    return json({ ok: true, user });
+  }
+
   if (path === "/admin/api/keys") {
     if (!(await isAuthed(req, env))) return json({ error: "unauthorised" }, 401);
     const rawKeys = getKeyPoolStatus(env);
@@ -2997,7 +3410,7 @@ const setWebhook = (token, url, secretToken) =>
   tg(token, "setWebhook", {
     url,
     secret_token: secretToken,
-    allowed_updates: ["message"],
+    allowed_updates: ["message", "callback_query"],
     drop_pending_updates: true,
     max_connections: 10,
   });
@@ -3126,6 +3539,42 @@ async function sendAudioFile(token, chatId, bytes, fileName, mime, replyTo, thre
   if (second?.ok) return second;
 
   throw new Error(`sendAudio failed: ${first?.description ?? second?.description ?? "unknown"}`);
+}
+
+/** Send message with inline keyboard markup. */
+function sendInlineKeyboard(token, chatId, text, inlineKeyboard, replyTo, threadIdOrOpts) {
+  const tid = typeof threadIdOrOpts === "object"
+    ? (threadIdOrOpts?.message_thread_id ?? threadIdOrOpts?.threadId)
+    : threadIdOrOpts;
+  const payload = {
+    chat_id: chatId,
+    text,
+    reply_markup: { inline_keyboard: inlineKeyboard },
+  };
+  if (replyTo) payload.reply_parameters = { message_id: replyTo, allow_sending_without_reply: true };
+  if (tid) payload.message_thread_id = tid;
+  return tg(token, "sendMessage", payload);
+}
+
+/** Answer incoming callback query from inline button tap. */
+function answerCallbackQuery(token, callbackQueryId, text, showAlert = false) {
+  const payload = {
+    callback_query_id: callbackQueryId,
+    show_alert: Boolean(showAlert),
+  };
+  if (text) payload.text = text;
+  return tg(token, "answerCallbackQuery", payload);
+}
+
+/** Edit existing message text and optional reply markup. */
+function editMessageText(token, chatId, messageId, text, replyMarkup) {
+  const payload = {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+  };
+  if (replyMarkup) payload.reply_markup = replyMarkup;
+  return tg(token, "editMessageText", payload);
 }
 
 // ------------------------------ src/media.js ------------------------------
@@ -3681,6 +4130,7 @@ class NodeWebSocket {
 
 
 
+
 const LIVE_ENDPOINT =
   "https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
@@ -3694,10 +4144,14 @@ const WAV_RATE = 24000; // Live API audio output: PCM 16-bit little-endian, 24 k
 const SPOKEN_MAX = 1500; // ~1.5 min of speech; longer answers would blow the 30 s window
 const STALL_MS = 2500; // no new audio for this long ⇒ the turn is over (turnComplete can be very late)
 
-/** The bot speaks with a natural conversational female voice (Aoede). */
+/** The bot speaks with a natural, conversational human tone. */
 const SPEAK_PROMPT =
-  "این متن را با صدای زنانه، لحن گرم، مکث‌های تنفسی طبیعی و شبیه به صحبت کردن با یک دوست صمیمی بخوان، نه مثل روخوانی از روی کتاب. " +
-  "کلمات را با لهجه گفتاری تهرانی، روان و بدون تکلف بیان کن. مثل یک انسان واقعی حرف بزن و چیزی اضافه یا کم نکن.";
+  "یک رفیق باهوش، گرم، شوخ‌طبع و با اعتماد به نفس که داری برای دوستت در تلگرام یک ویس اختصاصی (Voice Note) می‌فرستی.\n" +
+  "قوانین حیاتی برای نحوه‌ی صحبت کردن:\n" +
+  "۱. روان و بی‌تکلف: با لهجه گفتاری و صمیمی تهرانی امروزی صحبت کن. اصلاً و ابداً شبیه گوینده خبر یا روخوانی کتاب نباش.\n" +
+  "۲. جریان زنده کلام: مثل کسی حرف بزن که روبه‌روی دوستش نشسته یا گوشی را نزدیک دهانش گرفته. بین جملات مکث‌های تنفسی طبیعی داشته باش و روی کلمات مهم تاکید حسی بگذار.\n" +
+  "۳. تکیه‌کلام‌های انسانی: آزاد هستی به تناسب موقعیت از تکیه‌کلام‌های خودمانی مثل «ببین...»، «خب داداش»، «راستش...»، «می‌دونی چی می‌گم؟» استفاده کنی تا کلام کاملاً ارگانیک و زنده شنیده شود.\n" +
+  "۵. انرژی و ریتم: لحنت نه خسته و یکنواخت باشد و نه عجولانه؛ با انرژی مثبت، طنین گرم و ریتم کلامی متغیر صحبت کن.";
 
 let liveTimeoutMs = 25_000; // whole session, comfortably inside the 30 s waitUntil budget
 
@@ -3719,8 +4173,10 @@ function spokenText(text) {
     .replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1$2")
     .replace(/(^|[\s(])_([^_\n]+)_/g, "$1$2")
     .replace(/^#{1,6}\s+/gm, "")
+    .replace(/(?:^|\n|[\s،,])(?:نکته‌ی?\s*طلایی|دلیل|راه\s*حل)\s*[:：]\s*/gi, " ")
     .replace(/^\s*[>\-+*]\s+/gm, "")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/[\u{1F300}-\u{1FAFF}]/gu, "")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, SPOKEN_MAX);
@@ -4005,7 +4461,26 @@ async function speak(env, cfg, text, opts = {}) {
 }
 
 /**
- * Prompt for Gemma 4 to classify both search and voice intents in a single call.
+ * Fast regex for detecting explicit negative intent (user definitely does NOT want audio).
+ */
+const VOICE_NEGATIVE_RE =
+  /(?:ویس|صدا|صوتی|voice)\s*(?:نفرست|نده|نگو|نمیخوام|نباشه|نکن|نزن)|(?:متنی|تکست|نوشتاری)\s*(?:بگو|بفرست|بنویس|جواب بده)/iu;
+
+/**
+ * Fast regex for detecting explicit positive voice requests without waiting for LLM.
+ */
+const VOICE_POSITIVE_RE =
+  /(?:ویس|صدا|صوتی|voice)[^\n.!؟?]{0,35}(?:بفرست|بده|بگو|بخون|توضیح بده|تعریف کن|ضبط کن)|(?:با|به صورت|به شکل)\s*(?:ویس|صدا|صوتی)|(?:برام|برامون)\s*بخون/iu;
+
+/**
+ * Quick hint check: If the message contains none of these words, it's definitely not voice-related.
+ * Saves an LLM call for 99% of normal messages.
+ */
+const VOICE_HINT_RE =
+  /(?:ویس|صدا|صوتی|بخون|بشنو|گوش|تعریف|بلند|رادیو|voice|audio|speak|listen)/iu;
+
+/**
+ * Prompt for Gemini 3.1 Flash Lite to classify both search and voice intents in a single call.
  */
 const INTENT_SYSTEM_PROMPT =
   "شما یک سیستم طبقه‌بندی هوشمند نیت پیام برای ربات تلگرام هستید.\n" +
@@ -4023,7 +4498,7 @@ const INTENT_SYSTEM_PROMPT =
   "{\"search\": false, \"voice\": false}";
 
 /**
- * Safely parse JSON intent output from Gemma 4.
+ * Safely parse JSON intent output from classifier.
  */
 function parseIntentJson(rawText) {
   if (!rawText || typeof rawText !== "string") {
@@ -4054,7 +4529,10 @@ function parseIntentJson(rawText) {
 }
 
 /**
- * Detect both search and voice intents via a single Gemma 4 classifier call.
+ * Detect both search and voice intents:
+ * 1. Fast regex detection for search (topics, commands, explicit search).
+ * 2. Fast regex detection for voice (explicit positive/negative, 0ms hint skip).
+ * 3. Gemini 3.1 Flash Lite fallback ONLY for nuanced/colloquial hints.
  */
 async function detectIntent(env, text, cfg, traceContext = null) {
   if (!text || typeof text !== "string" || !text.trim()) {
@@ -4062,6 +4540,49 @@ async function detectIntent(env, text, cfg, traceContext = null) {
   }
 
   const clean = text.trim();
+
+  // 1. Fast search intent detection via regex
+  const isSearch = detectSearchIntent(clean);
+  if (traceContext) {
+    traceContext.search = {
+      requested: isSearch,
+      reason: isSearch ? "fast_regex_search" : "standard prompt",
+    };
+  }
+
+  // 2. Fast check if voice is disabled in config
+  if (cfg?.voice?.enabled === false) {
+    if (traceContext) {
+      traceContext.intent = { requested: false, reason: "voice disabled in config" };
+    }
+    return { search: isSearch, voice: false };
+  }
+
+  // 3. Fast negative voice check
+  if (VOICE_NEGATIVE_RE.test(clean)) {
+    if (traceContext) {
+      traceContext.intent = { requested: false, method: "fast_regex_negative", reason: "explicit negative request" };
+    }
+    return { search: isSearch, voice: false };
+  }
+
+  // 4. Fast positive voice check
+  if (VOICE_POSITIVE_RE.test(clean)) {
+    if (traceContext) {
+      traceContext.intent = { requested: true, method: "fast_regex_positive", reason: "keyword matched: " + clean.slice(0, 40) };
+    }
+    return { search: isSearch, voice: true };
+  }
+
+  // 5. Fast hint check: if no voice keywords exist at all (e.g. "سلام سید", "قیمت دلار"), skip LLM call in 0ms!
+  if (!VOICE_HINT_RE.test(clean)) {
+    if (traceContext) {
+      traceContext.intent = { requested: false, method: "fast_hint_filter", reason: "no voice keywords in text" };
+    }
+    return { search: isSearch, voice: false };
+  }
+
+  // 6. Nuanced / colloquial check via Gemini 3.1 Flash Lite (lightweight, reliable, no 500 error)
   try {
     const classifierCfg = {
       ...cfg,
@@ -4069,8 +4590,8 @@ async function detectIntent(env, text, cfg, traceContext = null) {
         ...cfg?.provider,
         kind: "gemini",
         baseUrl: cfg?.provider?.kind === "gemini" && cfg?.provider?.baseUrl ? cfg.provider.baseUrl : DEFAULT_BASE_URLS.gemini,
-        model: "gemma-4-31b",
-        modelPool: ["gemma-4-31b", "gemma-4-31b-it", "gemma-4-26b", "gemma-4-26b-it", "gemini-3.5-flash-lite"],
+        model: "gemini-3.1-flash-lite",
+        modelPool: ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"],
       },
       maxTokens: 50,
       thinking: "off",
@@ -4082,29 +4603,34 @@ async function detectIntent(env, text, cfg, traceContext = null) {
     });
 
     const parsed = parseIntentJson(res?.text);
+    const finalVoice = Boolean(parsed.voice);
+    const finalSearch = isSearch || Boolean(parsed.search);
+
     if (traceContext) {
       traceContext.intent = {
-        requested: parsed.voice,
-        method: "gemma_classifier",
-        model: res?.model || "gemma-4-31b",
+        requested: finalVoice,
+        method: "gemini_classifier",
+        model: res?.model || "gemini-3.1-flash-lite",
         output: String(res?.text || "").trim().slice(0, 50),
       };
-      traceContext.search = {
-        requested: parsed.search,
-        reason: parsed.search ? "gemma_classifier" : "standard prompt",
-      };
+      if (finalSearch && !isSearch) {
+        traceContext.search = {
+          requested: true,
+          reason: "gemini_classifier",
+        };
+      }
     }
-    return parsed;
+    return { search: finalSearch, voice: finalVoice };
   } catch (err) {
     if (traceContext) {
       traceContext.intent = {
         requested: false,
-        method: "gemma_classifier_error",
+        method: "classifier_fallback",
         reason: String(err?.message ?? err).slice(0, 150),
         error: String(err?.message ?? err).slice(0, 150),
       };
     }
-    return { search: false, voice: false };
+    return { search: isSearch, voice: false };
   }
 }
 
@@ -4138,8 +4664,134 @@ async function shouldVoiceReply(env, msg, cfg, text, traceContext = null) {
   return false;
 }
 
+// ------------------------------ src/search.js ------------------------------
+// Independent web search module for live prices, news, and facts without Google Search quota.
+
+/**
+ * Extracts a clean search query from user prompt by stripping bot commands, wake words, and filler phrasing.
+ */
+function extractSearchQuery(rawText) {
+  let q = String(rawText || "").trim();
+  // Strip commands: /search, /google, /find, /جستجو, /سرچ
+  q = q.replace(/^\/(search|google|find|جستجو|سرچ)(?:@\S+)?\s*/i, "");
+  // Strip wake word سید
+  q = q.replace(/(?<![\p{L}])سید(?![\p{L}])/gu, " ");
+  // Strip explicit search filler phrases
+  q = q.replace(/(?:سرچ|جستجو|گوگل|توی\s*گوگل|تو\s*گوگل|توی\s*نت|تو\s*نت|برام\s*سرچ|آنلاین\s*بگرد|چک\s*کن)\s*(?:کن|بزن|کنید|کنی|بگرد)?/gi, " ");
+  // Clean punctuation and excess whitespace
+  q = q.replace(/[؟?!\.,؛،:]+/g, " ").replace(/\s+/g, " ").trim();
+  return q.length >= 2 ? q : String(rawText || "").trim();
+}
+
+/**
+ * Clean HTML markup and basic entities.
+ */
+function cleanHtml(text) {
+  return String(text || "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Perform a fast, zero-dependency web search via DuckDuckGo HTML.
+ * Returns { ok: boolean, query: string, text: string, sources: Array<{ title: string, url: string }> }
+ */
+async function searchWeb(query, opts = {}) {
+  const cleanQ = String(query || "").trim();
+  if (!cleanQ) {
+    return { ok: false, query: "", text: "", sources: [] };
+  }
+
+  const maxResults = opts.maxResults ?? 5;
+  const timeoutMs = opts.timeoutMs ?? 5000;
+  const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+  try {
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(cleanQ)}`;
+    const res = await fetch(url, {
+      signal: controller?.signal,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "fa,en-US;q=0.9,en;q=0.8",
+      },
+    });
+
+    if (!res.ok) {
+      return { ok: false, query: cleanQ, text: "", sources: [] };
+    }
+
+    const html = await res.text();
+    const results = [];
+    const seen = new Set();
+
+    // DuckDuckGo separates results with result / results_links classes
+    const blocks = html.split(/class=["']result\s+results_links/i);
+    for (let i = 1; i < blocks.length && results.length < maxResults; i++) {
+      const block = blocks[i];
+
+      const titleMatch = /class=["']result__title["'][\s\S]*?<a[^>]+>([\s\S]*?)<\/a>/i.exec(block);
+      let title = titleMatch ? cleanHtml(titleMatch[1]) : "";
+
+      const urlMatch = /href=["'](?:\/\/duckduckgo\.com\/l\/\?uddg=)?([^\s"'&]+)/i.exec(block);
+      let rawUrl = urlMatch ? decodeURIComponent(urlMatch[1]) : "";
+      if (rawUrl && !rawUrl.startsWith("http")) rawUrl = `https://${rawUrl}`;
+
+      const snippetMatch = /class=["']result__snippet["'][^>]*>([\s\S]*?)<\/a>/i.exec(block);
+      let snippet = snippetMatch ? cleanHtml(snippetMatch[1]) : "";
+
+      if (snippet && rawUrl && !seen.has(rawUrl)) {
+        seen.add(rawUrl);
+        results.push({
+          title: title || "منبع وب",
+          url: rawUrl,
+          snippet,
+        });
+      }
+    }
+
+    if (!results.length) {
+      return { ok: false, query: cleanQ, text: "", sources: [] };
+    }
+
+    // Format grounded context for the AI prompt
+    const lines = results.map(
+      (r, idx) => `[منبع ${idx + 1}: ${r.title} | ${r.url}]\n${r.snippet}`,
+    );
+
+    const formattedContext =
+      `اطلاعات زنده استخراج‌شده از وب درباره «${cleanQ}»:\n\n` +
+      lines.join("\n\n") +
+      `\n\nدستورالعمل: بر اساس اطلاعات تازه و زنده وب بالا به کاربر پاسخ دقیق بده. اگر کاربر نرخ لحظه‌ای ارز، طلا یا خبر جدید خواسته، از ارقام و اطلاعات موجود در این گزارش استفاده کن.`;
+
+    const sources = results.map((r) => ({ title: r.title, url: r.url }));
+
+    return {
+      ok: true,
+      query: cleanQ,
+      text: formattedContext,
+      sources,
+    };
+  } catch (err) {
+    return { ok: false, query: cleanQ, text: "", sources: [], error: String(err?.message ?? err) };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 // ------------------------------ src/answer.js ------------------------------
 // The answering pipeline: webhook update in, Telegram reply out.
+
+
 
 
 
@@ -4164,7 +4816,14 @@ const DAILY_LIMIT = "امروز از سقف روزانه‌ام رد شدیم. �
 // the WAV upload afterwards needs a few seconds of its own.
 const VOICE_BUDGET_MS = 26_000;
 
-const MODE_NAME = { rude: "Savage", polite: "Polite", smart: "Know-it-all" };
+const MODE_NAME = {
+  psychologist: "Psychologist",
+  friend: "Best Friend",
+  smart: "Know-it-all",
+  rude: "Savage",
+  wolf: "Market Strategist",
+  polite: "Polite",
+};
 
 const HELP =
   "سلام، من **سید** هستم.\n\n" +
@@ -4232,6 +4891,15 @@ async function processMessage(env, msg) {
   try {
     if (!msg?.from || msg.from.is_bot) return; // never answer bots
     if (!isSupportedChat(msg)) return;
+
+    // Record user activity for admin management
+    await recordUserActivity(env, msg.from, msg.chat).catch(() => {});
+
+    // Check if user is blocked by admin
+    if (await isUserBlocked(env, msg.from.id)) {
+      await appendArchive(env, archiveRecord(msg, { answered: false, reason: "user blocked by admin" })).catch(() => {});
+      return;
+    }
 
     const cfg = (await loadConfig(env, DEFAULT_PERSONAS)).config;
     const enabled = config_enabled(cfg);
@@ -4462,8 +5130,32 @@ async function reply(env, msg, cfg, trace = {}) {
     await sendText(token, chatId, "🏓 pong", msg.message_id, threadId);
     return { text: "🏓 pong", reason: "command /ping", tgOut: "text delivered" };
   }
+  if (cmd === "mode" || cmd === "شخصیت") {
+    const keyboard = [
+      [
+        { text: "🧠 روانشناس", callback_data: "mode:psychologist" },
+        { text: "🤝 رفیق فاب", callback_data: "mode:friend" },
+      ],
+      [
+        { text: "👑 دانای کل", callback_data: "mode:smart" },
+        { text: "⚡ بی‌رحم", callback_data: "mode:rude" },
+      ],
+      [
+        { text: "🐺 گرگ بازار", callback_data: "mode:wolf" },
+        { text: "📖 ادیب", callback_data: "mode:polite" },
+      ],
+    ];
+    const modePrompt = "🎭 **انتخاب شخصیت سید:**\nیکی از شخصیت‌های زیر را انتخاب کن تا از این به بعد با همان لحن باهات هم‌کلام شوم:";
+    await sendInlineKeyboard(token, chatId, modePrompt, keyboard, msg.message_id, threadId);
+    return { text: modePrompt, reason: `command /${cmd}`, tgOut: "inline keyboard delivered" };
+  }
   if (cmd === "start" || cmd === "help") {
-    const helpMsg = HELP.replace("__MODE__", MODE_NAME[cfg.mode] ?? "Know-it-all");
+    let currentMode = cfg.mode;
+    if (msg.from?.id && env.CONFIG) {
+      const uMode = await env.CONFIG.get(`user:${msg.from.id}:mode`).catch(() => null);
+      if (uMode && MODES.includes(uMode)) currentMode = uMode;
+    }
+    const helpMsg = HELP.replace("__MODE__", MODE_NAME[currentMode] ?? "Know-it-all");
     await sendText(token, chatId, helpMsg, msg.message_id, threadId);
     return { text: helpMsg, reason: `command /${cmd}`, tgOut: "text delivered" };
   }
@@ -4503,20 +5195,52 @@ async function reply(env, msg, cfg, trace = {}) {
     const { media, note } = await collectMedia(env, msg, cfg);
     const { text: replyText, fromBot } = replyContext(msg, id);
 
-    const res = await complete(env, cfg, {
-      system: buildSystemPrompt(cfg, { isVoice }),
-      parts: buildUserContent({ text, replyText, replyFromBot: fromBot, media, note }),
+    let searchNote = "";
+    let searchSources = [];
+    if (isSearch) {
+      const q = extractSearchQuery(text);
+      try {
+        const searchRes = await searchWeb(q, { timeoutMs: 4000 });
+        if (searchRes?.text) {
+          searchNote = searchRes.text;
+          searchSources = searchRes.sources || [];
+          if (trace?.search) {
+            trace.search.query = q;
+            trace.search.sources = searchSources;
+          }
+        }
+      } catch (searchErr) {
+        if (trace?.search) {
+          trace.search.error = String(searchErr?.message ?? searchErr).slice(0, 100);
+        }
+      }
+    }
+
+    const effectiveNote = note ? (searchNote ? `${note}\n\n${searchNote}` : note) : searchNote;
+
+    let effectiveCfg = cfg;
+    if (msg.from?.id && env.CONFIG) {
+      const uMode = await env.CONFIG.get(`user:${msg.from.id}:mode`).catch(() => null);
+      if (uMode && MODES.includes(uMode)) {
+        effectiveCfg = { ...cfg, mode: uMode };
+      }
+    }
+
+    const res = await complete(env, effectiveCfg, {
+      system: buildSystemPrompt(effectiveCfg, { isVoice }),
+      parts: buildUserContent({ text, replyText, replyFromBot: fromBot, media, note: effectiveNote }),
       maxTokens: cfg.maxTokens,
-      search: isSearch,
+      search: false,
     });
     answer = res.text;
     usedModel = res.model;
     if (res.trace) trace.llm.attempts = res.trace;
     trace.llm.chosenModel = usedModel;
 
-    if (res.sources?.length) {
-      trace.search.sources = res.sources;
-      answer = appendSources(answer, res.sources);
+    const allSources = [...searchSources, ...(res.sources || [])];
+    if (allSources.length) {
+      if (trace?.search) trace.search.sources = allSources;
+      answer = appendSources(answer, allSources);
     }
   } finally {
     clearInterval(typingHeartbeat);
@@ -4598,6 +5322,39 @@ async function overDailyCap(env, cfg, msg) {
     /* the guard still works even if the notice does not get through */
   }
   return true;
+}
+
+const CONFIRM_TEXTS = {
+  psychologist: "🧠 **شخصیت من برات شد «روانشناس»**\nهر دغدغه، حس یا گره فکری داری راحت بگو؛ با حوصله و بدون قضاوت می‌شنوم.",
+  friend: "🤝 **شخصیت من برات شد «رفیق فاب»**\nحله داداش، از الان به بعد پایه‌تم، مشتی و خودمونی بریم جلو!",
+  smart: "👑 **شخصیت من برات شد «دانای کل»**\nخیلی خوش اومدی؛ آماده‌ی پاسخ‌های کاریزماتیک، عمیق و نکته‌های طلایی باش.",
+  rude: "⚡ **شخصیت من برات شد «بی‌رحم و سارکاستیک»**\nخودت خواستی! آماده‌ی تیکه‌های تیز، حقایق تلخ و شوخی‌های گزنده باش.",
+  wolf: "🐺 **شخصیت من برات شد «گرگ بازار»**\nعالیه؛ وقت و پول سرمایه‌ست، بهانه‌ها رو بریز دور و متمرکز شو روی نتیجه و برد.",
+  polite: "📖 **شخصیت من برات شد «ادیب»**\nبسی مایه مسرت است؛ با کمال احترام و کلامی پیراسته در خدمت شما هستم.",
+};
+
+/** Handle incoming Telegram callback queries (e.g. inline button clicks). */
+async function processCallback(env, callbackQuery) {
+  if (!callbackQuery?.id) return;
+  const token = env.TELEGRAM_BOT_TOKEN;
+  const queryId = callbackQuery.id;
+  const from = callbackQuery.from;
+  const data = String(callbackQuery.data || "");
+  const message = callbackQuery.message;
+
+  if (data.startsWith("mode:")) {
+    const chosenMode = data.slice(5);
+    if (MODES.includes(chosenMode) && from?.id) {
+      await setUserMode(env, from.id, chosenMode);
+      await answerCallbackQuery(token, queryId, "شخصیت شما با موفقیت تغییر کرد ✅").catch(() => {});
+      if (message?.chat?.id && message?.message_id) {
+        const confirmText = CONFIRM_TEXTS[chosenMode] || "شخصیت شما با موفقیت تنظیم شد.";
+        await editMessageText(token, message.chat.id, message.message_id, confirmText).catch(() => {});
+      }
+      return;
+    }
+  }
+  await answerCallbackQuery(token, queryId).catch(() => {});
 }
 
 // ------------------------------ src/tools.js ------------------------------
@@ -4792,6 +5549,7 @@ async function webhook(req, env, ctx) {
   }
 
   if (update?.message) ctx.waitUntil(processMessage(env, update.message));
+  if (update?.callback_query) ctx.waitUntil(processCallback(env, update.callback_query));
   return new Response("ok");
 }
 
@@ -4861,4 +5619,4 @@ class FileKV {
   }
 }
 
-export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, INTENT_SYSTEM_PROMPT, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, NodeWebSocket, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, SEARCH_GROUNDING_MODELS, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, UnknownModelError, acquireKey, acquireKeyWithWait, appendArchive, appendSources, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeAntigravity, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, deliverTextReply, detectIntent, detectMedia, detectVoiceIntent, diagnostics, downloadFile, endpointOf, esc, extractKeys, failedLoginAttempts, formatRawError, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, hasMediaPayload, hasRichFormatting, isAntigravity, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isSearchSupported, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, parseAntigravityResponse, parseIntentJson, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiSources, readGeminiText, readPatch, recordFailedLogin, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText, serialize, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };
+export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, INTENT_SYSTEM_PROMPT, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MAX_INDEXED_USERS, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, NodeWebSocket, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, SEARCH_GROUNDING_MODELS, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, USER_INDEX_KEY, UnknownModelError, VOICE_HINT_RE, VOICE_NEGATIVE_RE, VOICE_POSITIVE_RE, acquireKey, acquireKeyWithWait, answerCallbackQuery, appendArchive, appendSources, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeAntigravity, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, deliverTextReply, detectIntent, detectMedia, detectSearchIntent, detectVoiceIntent, diagnostics, downloadFile, editMessageText, endpointOf, esc, extractKeys, extractSearchQuery, failedLoginAttempts, formatRawError, getKeyPool, getKeyPoolStatus, getMe, getUser, getWebhookInfo, handleAdmin, hasMediaPayload, hasRichFormatting, isAntigravity, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isSearchSupported, isShapeError, isSupportedChat, isTransient, isUserBlocked, json, listUsers, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, parseAntigravityResponse, parseIntentJson, pcmToWav, poolResumeTime, preview, processCallback, processMessage, providerFor, quotaKind, readArchive, readGeminiSources, readGeminiText, readPatch, recordFailedLogin, recordUserActivity, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetUserSettings, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, searchWeb, sendAudioFile, sendChatAction, sendInlineKeyboard, sendLong, sendRichMessage, sendText, serialize, setLiveTimeout, setStateFilePath, setUserBlocked, setUserMode, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };

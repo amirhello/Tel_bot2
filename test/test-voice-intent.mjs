@@ -17,59 +17,107 @@ await t("detectIntent returns false on empty or whitespace text", async () => {
   assert.deepEqual(await detectIntent(env(), null, c), { search: false, voice: false });
 });
 
-await t("detectIntent calls Gemma once and parses search and voice flags from JSON", async () => {
-  let gemmaPrompt = "";
+await t("detectIntent fast regex detects search keywords in 0ms without fetch", async () => {
+  let fetchCalled = false;
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (url, init) => {
-    const body = JSON.parse(init.body);
-    gemmaPrompt = body.contents?.[0]?.parts?.[1]?.text || body.contents?.[0]?.parts?.[0]?.text || "";
-    return json({
-      candidates: [{ content: { parts: [{ text: JSON.stringify({ search: true, voice: false }) }] } }],
-    });
+  globalThis.fetch = async () => {
+    fetchCalled = true;
+    return json({ candidates: [] });
   };
 
   try {
     const c = cfg();
     const res = await detectIntent(env({ GEMINI_API_KEY: "test_key" }), "قیمت دلار چنده؟", c);
     assert.deepEqual(res, { search: true, voice: false });
-    assert.equal(gemmaPrompt, "قیمت دلار چنده؟");
+    assert.equal(fetchCalled, false, "Should not make network call for regex-matched search");
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-await t("detectIntent correctly parses voice=true when user asks for audio", async () => {
+await t("detectIntent fast regex detects voice requests in 0ms without fetch", async () => {
+  let fetchCalled = false;
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => json({
-    candidates: [{ content: { parts: [{ text: JSON.stringify({ search: false, voice: true }) }] } }],
-  });
+  globalThis.fetch = async () => {
+    fetchCalled = true;
+    return json({ candidates: [] });
+  };
 
   try {
     const c = cfg();
     const res = await detectIntent(env({ GEMINI_API_KEY: "test_key" }), "برام با ویس بگو", c);
     assert.deepEqual(res, { search: false, voice: true });
+    assert.equal(fetchCalled, false, "Should not make network call for explicit voice request");
     assert.equal(await detectVoiceIntent(env({ GEMINI_API_KEY: "test_key" }), "برام با ویس بگو", c), true);
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-await t("detectIntent correctly parses combined search=true and voice=true", async () => {
+await t("detectIntent fast regex detects explicit negative voice requests", async () => {
+  let fetchCalled = false;
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => json({
-    candidates: [{ content: { parts: [{ text: JSON.stringify({ search: true, voice: true }) }] } }],
-  });
+  globalThis.fetch = async () => {
+    fetchCalled = true;
+    return json({ candidates: [] });
+  };
 
   try {
     const c = cfg();
-    const res = await detectIntent(env({ GEMINI_API_KEY: "test_key" }), "آخرین اخبار زلزله رو با ویس بگو", c);
-    assert.deepEqual(res, { search: true, voice: true });
+    const res = await detectIntent(env({ GEMINI_API_KEY: "test_key" }), "ویس نفرست فقط متنی بگو", c);
+    assert.deepEqual(res, { search: false, voice: false });
+    assert.equal(fetchCalled, false, "Should not make network call for negative voice request");
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-await t("detectIntent falls back safely to false/false on error", async () => {
+await t("detectIntent skips ordinary messages without voice/search keywords in 0ms", async () => {
+  let fetchCalled = false;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalled = true;
+    return json({ candidates: [] });
+  };
+
+  try {
+    const c = cfg();
+    const res = await detectIntent(env({ GEMINI_API_KEY: "test_key" }), "سلام سید چطوری؟", c);
+    assert.deepEqual(res, { search: false, voice: false });
+    assert.equal(fetchCalled, false, "Should skip LLM call entirely for ordinary chatter");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+await t("detectIntent falls back to Gemini 3.1 Flash Lite only for nuanced colloquial voice hints", async () => {
+  let classifierPrompt = "";
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    classifierPrompt = body.contents?.[0]?.parts?.[0]?.text || "";
+    return json({
+      candidates: [{ content: { parts: [{ text: JSON.stringify({ search: false, voice: true }) }] } }],
+    });
+  };
+
+  try {
+    const c = cfg();
+    const res = await detectIntent(env({ GEMINI_API_KEY: "test_key" }), "حوصله خوندن ندارم برام تعریف کن", c);
+    assert.deepEqual(res, { search: false, voice: true });
+    assert.equal(classifierPrompt, "حوصله خوندن ندارم برام تعریف کن");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+await t("detectIntent correctly parses combined search=true and voice=true", async () => {
+  const c = cfg();
+  const res = await detectIntent(env({ GEMINI_API_KEY: "test_key" }), "آخرین اخبار زلزله رو با ویس بگو", c);
+  assert.deepEqual(res, { search: true, voice: true });
+});
+
+await t("detectIntent falls back safely to false/false on classifier error", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => {
     throw new Error("Network error");
@@ -77,7 +125,7 @@ await t("detectIntent falls back safely to false/false on error", async () => {
 
   try {
     const c = cfg();
-    const res = await detectIntent(env({ GEMINI_API_KEY: "test_key" }), "سلام", c);
+    const res = await detectIntent(env({ GEMINI_API_KEY: "test_key" }), "حوصله خوندن ندارم برام تعریف کن", c);
     assert.deepEqual(res, { search: false, voice: false });
   } finally {
     globalThis.fetch = originalFetch;

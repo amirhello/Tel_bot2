@@ -12,6 +12,7 @@ import { complete } from "./llm.js";
 import { NodeWebSocket } from "./nodeWs.js";
 import { acquireKeyWithWait, extractKeys } from "./keyPool.js";
 import { DEFAULT_BASE_URLS } from "./store.js";
+import { detectSearchIntent } from "./trigger.js";
 
 const LIVE_ENDPOINT =
   "https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
@@ -26,10 +27,14 @@ const WAV_RATE = 24000; // Live API audio output: PCM 16-bit little-endian, 24 k
 const SPOKEN_MAX = 1500; // ~1.5 min of speech; longer answers would blow the 30 s window
 const STALL_MS = 2500; // no new audio for this long ⇒ the turn is over (turnComplete can be very late)
 
-/** The bot speaks with a natural conversational female voice (Aoede). */
+/** The bot speaks with a natural, conversational human tone. */
 const SPEAK_PROMPT =
-  "این متن را با صدای زنانه، لحن گرم، مکث‌های تنفسی طبیعی و شبیه به صحبت کردن با یک دوست صمیمی بخوان، نه مثل روخوانی از روی کتاب. " +
-  "کلمات را با لهجه گفتاری تهرانی، روان و بدون تکلف بیان کن. مثل یک انسان واقعی حرف بزن و چیزی اضافه یا کم نکن.";
+  "یک رفیق باهوش، گرم، شوخ‌طبع و با اعتماد به نفس که داری برای دوستت در تلگرام یک ویس اختصاصی (Voice Note) می‌فرستی.\n" +
+  "قوانین حیاتی برای نحوه‌ی صحبت کردن:\n" +
+  "۱. روان و بی‌تکلف: با لهجه گفتاری و صمیمی تهرانی امروزی صحبت کن. اصلاً و ابداً شبیه گوینده خبر یا روخوانی کتاب نباش.\n" +
+  "۲. جریان زنده کلام: مثل کسی حرف بزن که روبه‌روی دوستش نشسته یا گوشی را نزدیک دهانش گرفته. بین جملات مکث‌های تنفسی طبیعی داشته باش و روی کلمات مهم تاکید حسی بگذار.\n" +
+  "۳. تکیه‌کلام‌های انسانی: آزاد هستی به تناسب موقعیت از تکیه‌کلام‌های خودمانی مثل «ببین...»، «خب داداش»، «راستش...»، «می‌دونی چی می‌گم؟» استفاده کنی تا کلام کاملاً ارگانیک و زنده شنیده شود.\n" +
+  "۵. انرژی و ریتم: لحنت نه خسته و یکنواخت باشد و نه عجولانه؛ با انرژی مثبت، طنین گرم و ریتم کلامی متغیر صحبت کن.";
 
 let liveTimeoutMs = 25_000; // whole session, comfortably inside the 30 s waitUntil budget
 
@@ -51,8 +56,10 @@ export function spokenText(text) {
     .replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1$2")
     .replace(/(^|[\s(])_([^_\n]+)_/g, "$1$2")
     .replace(/^#{1,6}\s+/gm, "")
+    .replace(/(?:^|\n|[\s،,])(?:نکته‌ی?\s*طلایی|دلیل|راه\s*حل)\s*[:：]\s*/gi, " ")
     .replace(/^\s*[>\-+*]\s+/gm, "")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/[\u{1F300}-\u{1FAFF}]/gu, "")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, SPOKEN_MAX);
@@ -337,7 +344,26 @@ export async function speak(env, cfg, text, opts = {}) {
 }
 
 /**
- * Prompt for Gemma 4 to classify both search and voice intents in a single call.
+ * Fast regex for detecting explicit negative intent (user definitely does NOT want audio).
+ */
+export const VOICE_NEGATIVE_RE =
+  /(?:ویس|صدا|صوتی|voice)\s*(?:نفرست|نده|نگو|نمیخوام|نباشه|نکن|نزن)|(?:متنی|تکست|نوشتاری)\s*(?:بگو|بفرست|بنویس|جواب بده)/iu;
+
+/**
+ * Fast regex for detecting explicit positive voice requests without waiting for LLM.
+ */
+export const VOICE_POSITIVE_RE =
+  /(?:ویس|صدا|صوتی|voice)[^\n.!؟?]{0,35}(?:بفرست|بده|بگو|بخون|توضیح بده|تعریف کن|ضبط کن)|(?:با|به صورت|به شکل)\s*(?:ویس|صدا|صوتی)|(?:برام|برامون)\s*بخون/iu;
+
+/**
+ * Quick hint check: If the message contains none of these words, it's definitely not voice-related.
+ * Saves an LLM call for 99% of normal messages.
+ */
+export const VOICE_HINT_RE =
+  /(?:ویس|صدا|صوتی|بخون|بشنو|گوش|تعریف|بلند|رادیو|voice|audio|speak|listen)/iu;
+
+/**
+ * Prompt for Gemini 3.1 Flash Lite to classify both search and voice intents in a single call.
  */
 export const INTENT_SYSTEM_PROMPT =
   "شما یک سیستم طبقه‌بندی هوشمند نیت پیام برای ربات تلگرام هستید.\n" +
@@ -355,7 +381,7 @@ export const INTENT_SYSTEM_PROMPT =
   "{\"search\": false, \"voice\": false}";
 
 /**
- * Safely parse JSON intent output from Gemma 4.
+ * Safely parse JSON intent output from classifier.
  */
 export function parseIntentJson(rawText) {
   if (!rawText || typeof rawText !== "string") {
@@ -386,7 +412,10 @@ export function parseIntentJson(rawText) {
 }
 
 /**
- * Detect both search and voice intents via a single Gemma 4 classifier call.
+ * Detect both search and voice intents:
+ * 1. Fast regex detection for search (topics, commands, explicit search).
+ * 2. Fast regex detection for voice (explicit positive/negative, 0ms hint skip).
+ * 3. Gemini 3.1 Flash Lite fallback ONLY for nuanced/colloquial hints.
  */
 export async function detectIntent(env, text, cfg, traceContext = null) {
   if (!text || typeof text !== "string" || !text.trim()) {
@@ -394,6 +423,49 @@ export async function detectIntent(env, text, cfg, traceContext = null) {
   }
 
   const clean = text.trim();
+
+  // 1. Fast search intent detection via regex
+  const isSearch = detectSearchIntent(clean);
+  if (traceContext) {
+    traceContext.search = {
+      requested: isSearch,
+      reason: isSearch ? "fast_regex_search" : "standard prompt",
+    };
+  }
+
+  // 2. Fast check if voice is disabled in config
+  if (cfg?.voice?.enabled === false) {
+    if (traceContext) {
+      traceContext.intent = { requested: false, reason: "voice disabled in config" };
+    }
+    return { search: isSearch, voice: false };
+  }
+
+  // 3. Fast negative voice check
+  if (VOICE_NEGATIVE_RE.test(clean)) {
+    if (traceContext) {
+      traceContext.intent = { requested: false, method: "fast_regex_negative", reason: "explicit negative request" };
+    }
+    return { search: isSearch, voice: false };
+  }
+
+  // 4. Fast positive voice check
+  if (VOICE_POSITIVE_RE.test(clean)) {
+    if (traceContext) {
+      traceContext.intent = { requested: true, method: "fast_regex_positive", reason: "keyword matched: " + clean.slice(0, 40) };
+    }
+    return { search: isSearch, voice: true };
+  }
+
+  // 5. Fast hint check: if no voice keywords exist at all (e.g. "سلام سید", "قیمت دلار"), skip LLM call in 0ms!
+  if (!VOICE_HINT_RE.test(clean)) {
+    if (traceContext) {
+      traceContext.intent = { requested: false, method: "fast_hint_filter", reason: "no voice keywords in text" };
+    }
+    return { search: isSearch, voice: false };
+  }
+
+  // 6. Nuanced / colloquial check via Gemini 3.1 Flash Lite (lightweight, reliable, no 500 error)
   try {
     const classifierCfg = {
       ...cfg,
@@ -401,8 +473,8 @@ export async function detectIntent(env, text, cfg, traceContext = null) {
         ...cfg?.provider,
         kind: "gemini",
         baseUrl: cfg?.provider?.kind === "gemini" && cfg?.provider?.baseUrl ? cfg.provider.baseUrl : DEFAULT_BASE_URLS.gemini,
-        model: "gemma-4-31b",
-        modelPool: ["gemma-4-31b", "gemma-4-31b-it", "gemma-4-26b", "gemma-4-26b-it", "gemini-3.5-flash-lite"],
+        model: "gemini-3.1-flash-lite",
+        modelPool: ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"],
       },
       maxTokens: 50,
       thinking: "off",
@@ -414,29 +486,34 @@ export async function detectIntent(env, text, cfg, traceContext = null) {
     });
 
     const parsed = parseIntentJson(res?.text);
+    const finalVoice = Boolean(parsed.voice);
+    const finalSearch = isSearch || Boolean(parsed.search);
+
     if (traceContext) {
       traceContext.intent = {
-        requested: parsed.voice,
-        method: "gemma_classifier",
-        model: res?.model || "gemma-4-31b",
+        requested: finalVoice,
+        method: "gemini_classifier",
+        model: res?.model || "gemini-3.1-flash-lite",
         output: String(res?.text || "").trim().slice(0, 50),
       };
-      traceContext.search = {
-        requested: parsed.search,
-        reason: parsed.search ? "gemma_classifier" : "standard prompt",
-      };
+      if (finalSearch && !isSearch) {
+        traceContext.search = {
+          requested: true,
+          reason: "gemini_classifier",
+        };
+      }
     }
-    return parsed;
+    return { search: finalSearch, voice: finalVoice };
   } catch (err) {
     if (traceContext) {
       traceContext.intent = {
         requested: false,
-        method: "gemma_classifier_error",
+        method: "classifier_fallback",
         reason: String(err?.message ?? err).slice(0, 150),
         error: String(err?.message ?? err).slice(0, 150),
       };
     }
-    return { search: false, voice: false };
+    return { search: isSearch, voice: false };
   }
 }
 

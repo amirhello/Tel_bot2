@@ -1,5 +1,7 @@
 // Everything that touches the KV namespace: config, stats and migration.
 
+import { MODES } from "./prompt.js";
+
 export const SCHEMA_VERSION = 3;
 
 export const CONFIG_KEY = "config:v2";
@@ -137,11 +139,12 @@ export function normalizeConfig(saved, personas) {
   c.dailyCap = clampNum(c.dailyCap, 0, 100000, 1000);
   c.extra = String(c.extra ?? "").slice(0, 4000);
   c.enabled = c.enabled !== false;
-  c.mode = ["polite", "smart", "rude"].includes(c.mode) ? c.mode : "smart";
+  c.mode = (MODES && MODES.includes(c.mode)) ? c.mode : "smart";
 
   const merged = { ...personas, ...(saved?.personas ?? {}) };
   c.personas = {};
-  for (const m of ["polite", "smart", "rude"]) c.personas[m] = String(merged[m] ?? personas[m]).slice(0, 6000);
+  const allModes = MODES || Object.keys(personas);
+  for (const m of allModes) c.personas[m] = String(merged[m] ?? personas[m] ?? "").slice(0, 6000);
   c.schemaVersion = SCHEMA_VERSION;
 
   return c;
