@@ -43,11 +43,11 @@ export const DEFAULT_MODEL_POOL = [
   "gemini-3.1-flash-lite",
   "gemma-4-31b",
   "gemma-4-26b",
+  "Antigravity",
+  "gemini-3.8-flash",
+  "gemini-3.6-flash",
   "gemini-2.5-flash-lite",
   "gemini-2.5-flash",
-  "gemini-3.6-flash",
-  "gemini-3.8-flash",
-  "Antigravity",
 ];
 
 /* ------------------------------------------------------------------ config */

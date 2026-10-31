@@ -224,11 +224,11 @@ const DEFAULT_MODEL_POOL = [
   "gemini-3.1-flash-lite",
   "gemma-4-31b",
   "gemma-4-26b",
+  "Antigravity",
+  "gemini-3.8-flash",
+  "gemini-3.6-flash",
   "gemini-2.5-flash-lite",
   "gemini-2.5-flash",
-  "gemini-3.6-flash",
-  "gemini-3.8-flash",
-  "Antigravity",
 ];
 
 /* ------------------------------------------------------------------ config */
@@ -960,6 +960,12 @@ function thinkingConfig(cfg) {
 }
 
 const SEARCH_GROUNDING_MODELS = [
+  "antigravity",
+  "antigravity-preview-09-2026",
+  "gemini-3.8-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-3.6-flash",
+  "gemini-3.1-flash-lite",
   "gemini-2.5-flash",
   "gemini-2.5-flash-lite",
   "gemini-2.0-flash",
@@ -967,7 +973,11 @@ const SEARCH_GROUNDING_MODELS = [
 
 function isSearchSupported(model) {
   const m = String(model || "").toLowerCase();
-  return SEARCH_GROUNDING_MODELS.some((sm) => m.includes(sm));
+  return SEARCH_GROUNDING_MODELS.some((sm) => m.includes(sm.toLowerCase()));
+}
+
+function isAntigravity(model) {
+  return String(model || "").toLowerCase().includes("antigravity");
 }
 
 function safetySettings(cfg) {
@@ -991,6 +1001,7 @@ function buildGeminiBody(cfg, { system, parts, maxTokens, search }, shape = {}) 
   const wantSearch = (search || cfg?.search) && !shape.noTools && isSearchSupported(model);
   if (wantSearch) {
     body.tools = [{ googleSearch: {} }];
+    delete body.generationConfig.thinkingConfig;
   }
 
   return body;
@@ -1057,11 +1068,95 @@ function shapes(cfg, search) {
   return list;
 }
 
-async function completeGemini(env, cfg, { system, parts, maxTokens, search }) {
+/** Extract answer text, search queries and source citations from Antigravity Interactions response. */
+function parseAntigravityResponse(data, model = "Antigravity") {
+  const steps = Array.isArray(data?.steps) ? data.steps : [];
+  let text = typeof data?.output_text === "string" ? data.output_text : "";
+  const queries = [];
+  const sources = [];
+  const seen = new Set();
+
+  for (const step of steps) {
+    if (step.type === "google_search_call" && Array.isArray(step.arguments?.queries)) {
+      queries.push(...step.arguments.queries);
+    }
+    if (step.type === "model_output" && Array.isArray(step.content)) {
+      for (const block of step.content) {
+        if (block.type === "text" && block.text) {
+          if (!text) text += block.text;
+          else if (!text.includes(block.text)) text += "\n" + block.text;
+        }
+        if (Array.isArray(block.annotations)) {
+          for (const ann of block.annotations) {
+            if (ann.type === "url_citation" && ann.url && !seen.has(ann.url)) {
+              seen.add(ann.url);
+              sources.push({ title: ann.title || "منبع وب", url: ann.url });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return { text: text.trim(), queries, sources: sources.slice(0, 5), model };
+}
+
+async function completeAntigravity(env, cfg, { system, parts }) {
+  const apiKey = cfg?.apiKey || env.GEMINI_API_KEY;
+  if (!apiKey) throw new ApiError("GEMINI_API_KEY secret is not set", 500);
+
+  const url = `${cfg.provider.baseUrl}/interactions`;
+  const textParts = (parts || []).filter((p) => p && p.type === "text").map((p) => p.text).join("\n");
+  const fullInput = system ? `${system}\n\n${textParts}` : textParts;
+
+  const payload = {
+    agent: "antigravity-preview-09-2026",
+    input: fullInput,
+    tools: [
+      { type: "google_search" },
+      { type: "url_context" },
+    ],
+  };
+
+  const data = await callJson(url, {
+    headers: { "x-goog-api-key": apiKey, "content-type": "application/json" },
+    body: payload,
+    retryOn: retryableForGemini,
+  });
+
+  const parsed = parseAntigravityResponse(data, cfg.provider?.model || "Antigravity");
+  if (!parsed.text) throw new ApiError("Antigravity returned no text", 200);
+  return parsed;
+}
+
+async function completeGemini(env, cfg, payload) {
   const apiKey = cfg?.apiKey || env.GEMINI_API_KEY;
   if (!apiKey) throw new ApiError("GEMINI_API_KEY secret is not set", 500);
 
   const model = cfg.provider.model;
+  if (isAntigravity(model)) {
+    try {
+      return await completeAntigravity(env, cfg, payload);
+    } catch (e) {
+      if (e instanceof ApiError) {
+        e.model = model;
+        e.url = `${cfg.provider.baseUrl}/interactions`;
+      }
+      if (e.status === 404) throw new UnknownModelError(model, `${model}: ${e.message}`);
+      const isQuota =
+        (e.status === 429 || e.status === 503) &&
+        (quotaKind(e.message) !== "other" || HIGH_DEMAND_RE.test(e.message));
+      if (isQuota) {
+        if (quotaKind(e.message) === "day") {
+          throw new DailyQuotaError(model, `${model}: ${e.message}`);
+        }
+        throw new MinuteQuotaError(model, `${model}: ${e.message}`);
+      }
+      throw e;
+    }
+  }
+
+  const { system, parts, maxTokens, search } = payload;
   const url = `${cfg.provider.baseUrl}/models/${encodeURIComponent(model)}:generateContent`;
   let last = new ApiError("model returned an empty answer");
 
@@ -1275,7 +1370,11 @@ async function runGeminiPool(env, cfg, payload) {
   const wantSearch = Boolean(payload?.search || cfg?.search);
   if (wantSearch) {
     const searchModels = pool.filter(isSearchSupported);
-    searchModels.sort((a, b) => (b.includes("2.5-flash") && !b.includes("lite") ? 1 : 0) - (a.includes("2.5-flash") && !a.includes("lite") ? 1 : 0));
+    searchModels.sort((a, b) => {
+      const aAnti = a.toLowerCase().includes("antigravity") ? 1 : 0;
+      const bAnti = b.toLowerCase().includes("antigravity") ? 1 : 0;
+      return bAnti - aAnti;
+    });
     const nonSearchModels = pool.filter((m) => !isSearchSupported(m));
     pool = [...searchModels, ...nonSearchModels];
   }
@@ -4745,4 +4844,4 @@ class FileKV {
   }
 }
 
-export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, NodeWebSocket, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, SEARCH_GROUNDING_MODELS, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, UnknownModelError, VOICE_POSITIVE_RE, acquireKey, acquireKeyWithWait, appendArchive, appendSources, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, deliverTextReply, detectMedia, detectSearchIntent, detectVoiceIntent, diagnostics, downloadFile, endpointOf, esc, extractKeys, failedLoginAttempts, formatRawError, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, hasMediaPayload, hasRichFormatting, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isSearchSupported, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiSources, readGeminiText, readPatch, recordFailedLogin, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText, serialize, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };
+export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, NodeWebSocket, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, SEARCH_GROUNDING_MODELS, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, UnknownModelError, VOICE_POSITIVE_RE, acquireKey, acquireKeyWithWait, appendArchive, appendSources, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeAntigravity, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, deliverTextReply, detectMedia, detectSearchIntent, detectVoiceIntent, diagnostics, downloadFile, endpointOf, esc, extractKeys, failedLoginAttempts, formatRawError, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, hasMediaPayload, hasRichFormatting, isAntigravity, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isSearchSupported, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, parseAntigravityResponse, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiSources, readGeminiText, readPatch, recordFailedLogin, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText, serialize, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };

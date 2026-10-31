@@ -91,7 +91,11 @@ async function runGeminiPool(env, cfg, payload) {
   const wantSearch = Boolean(payload?.search || cfg?.search);
   if (wantSearch) {
     const searchModels = pool.filter(isSearchSupported);
-    searchModels.sort((a, b) => (b.includes("2.5-flash") && !b.includes("lite") ? 1 : 0) - (a.includes("2.5-flash") && !a.includes("lite") ? 1 : 0));
+    searchModels.sort((a, b) => {
+      const aAnti = a.toLowerCase().includes("antigravity") ? 1 : 0;
+      const bAnti = b.toLowerCase().includes("antigravity") ? 1 : 0;
+      return bAnti - aAnti;
+    });
     const nonSearchModels = pool.filter((m) => !isSearchSupported(m));
     pool = [...searchModels, ...nonSearchModels];
   }

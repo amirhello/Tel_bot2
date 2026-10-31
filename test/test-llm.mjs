@@ -14,6 +14,8 @@ import {
   readGeminiText,
   readGeminiSources,
   isSearchSupported,
+  isAntigravity,
+  parseAntigravityResponse,
   thinkingConfig,
   safetySettings,
   completeGemini,
@@ -355,20 +357,30 @@ await t("BUG-01: individual key DailyQuotaError does not immediately park model 
 });
 
 await t("isSearchSupported identifies search-capable models", () => {
+  assert.equal(isSearchSupported("antigravity"), true);
+  assert.equal(isSearchSupported("Antigravity"), true);
+  assert.equal(isSearchSupported("antigravity-preview-09-2026"), true);
+  assert.equal(isSearchSupported("gemini-3.8-flash"), true);
+  assert.equal(isSearchSupported("gemini-3.5-flash-lite"), true);
   assert.equal(isSearchSupported("gemini-2.5-flash"), true);
   assert.equal(isSearchSupported("gemini-2.5-flash-lite"), true);
   assert.equal(isSearchSupported("gemini-2.0-flash"), true);
-  assert.equal(isSearchSupported("gemini-3.5-flash-lite"), false);
-  assert.equal(isSearchSupported("gemini-3.8-flash"), false);
   assert.equal(isSearchSupported("gemma-4-31b"), false);
+  assert.equal(isSearchSupported("gemma-4-26b"), false);
+});
+
+await t("isAntigravity identifies Antigravity models correctly", () => {
+  assert.equal(isAntigravity("Antigravity"), true);
+  assert.equal(isAntigravity("antigravity-preview-09-2026"), true);
+  assert.equal(isAntigravity("gemini-3.5-flash-lite"), false);
 });
 
 await t("buildGeminiBody adds googleSearch tool only for search-supported models", () => {
-  const searchCfg = cfg({ provider: { kind: "gemini", model: "gemini-2.5-flash" } });
+  const searchCfg = cfg({ provider: { kind: "gemini", model: "gemini-3.8-flash" } });
   const bodyWithSearch = buildGeminiBody(searchCfg, { system: "SYS", parts: [{ type: "text", text: "Q" }], search: true });
   assert.deepEqual(bodyWithSearch.tools, [{ googleSearch: {} }]);
 
-  const nonSearchCfg = cfg({ provider: { kind: "gemini", model: "gemini-3.5-flash-lite" } });
+  const nonSearchCfg = cfg({ provider: { kind: "gemini", model: "gemma-4-31b" } });
   const bodyWithoutSearch = buildGeminiBody(nonSearchCfg, { system: "SYS", parts: [{ type: "text", text: "Q" }], search: true });
   assert.equal(bodyWithoutSearch.tools, undefined);
 });
@@ -412,6 +424,41 @@ await t("appendSources formats search citations as clean markdown footnotes", ()
 
   assert.equal(appendSources("متن عادی", []), "متن عادی");
   assert.equal(appendSources("متن عادی", null), "متن عادی");
+});
+
+await t("parseAntigravityResponse extracts text, search queries and url citations", () => {
+  const fakeInteractionsData = {
+    steps: [
+      {
+        type: "google_search_call",
+        arguments: { queries: ["قیمت دلار امروز", "نرخ ارز"] },
+      },
+      {
+        type: "model_output",
+        content: [
+          {
+            type: "text",
+            text: "بر اساس آخرین داده‌های بازار، قیمت دلار ۶۸ هزار تومان است.",
+            annotations: [
+              { type: "url_citation", url: "https://tgju.org/dollar", title: "شبکه اطلاع رسانی طلا و ارز" },
+              { type: "url_citation", url: "https://tgju.org/dollar", title: "duplicate" },
+              { type: "url_citation", url: "https://irna.ir/news/1", title: "خبرگزاری ایرنا" },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  const parsed = parseAntigravityResponse(fakeInteractionsData, "Antigravity");
+  assert.equal(parsed.text, "بر اساس آخرین داده‌های بازار، قیمت دلار ۶۸ هزار تومان است.");
+  assert.deepEqual(parsed.queries, ["قیمت دلار امروز", "نرخ ارز"]);
+  assert.equal(parsed.sources.length, 2);
+  assert.equal(parsed.sources[0].title, "شبکه اطلاع رسانی طلا و ارز");
+  assert.equal(parsed.sources[0].url, "https://tgju.org/dollar");
+  assert.equal(parsed.sources[1].title, "خبرگزاری ایرنا");
+  assert.equal(parsed.sources[1].url, "https://irna.ir/news/1");
+  assert.equal(parsed.model, "Antigravity");
 });
 
 done();
