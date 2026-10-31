@@ -337,65 +337,63 @@ export async function speak(env, cfg, text, opts = {}) {
 }
 
 /**
- * Fast regex for detecting explicit negative intent (user definitely does NOT want audio).
+ * Prompt for Gemma 4 to classify both search and voice intents in a single call.
  */
-const VOICE_NEGATIVE_RE =
-  /(?:ویس|صدا|صوتی|voice)\s*(?:نفرست|نده|نگو|نمیخوام|نباشه|نکن|نزن)|(?:متنی|تکست|نوشتاری)\s*(?:بگو|بفرست|بنویس|جواب بده)/iu;
+export const INTENT_SYSTEM_PROMPT =
+  "شما یک سیستم طبقه‌بندی هوشمند نیت پیام برای ربات تلگرام هستید.\n" +
+  "وظیفه شما تحلیل پیام ورودی کاربر و تعیین دو فیلد بولین (\"search\" و \"voice\") در قالب یک خروجی JSON است.\n\n" +
+  "قوانین تشخیص:\n" +
+  "۱. فیلد \"search\":\n" +
+  "- true: اگر پاسخ به پیام کاربر نیازمند اطلاعات لحظه‌ای و زنده باشد (مثل نرخ دلار، طلا، ارز، رمزارز، قیمت اجناس، وضعیت آب‌وهوا، اخبار روز، نتایج مسابقات ورزشی، رخدادهای تازه) یا کاربر صریحاً خواسته باشد مطلبی در اینترنت سرچ/گوگل شود.\n" +
+  "- false: برای سوالات عمومی، برنامه‌نویسی، شعر، احوال‌پرسی، ترجمه، تاریخ و مسائلی که نیازی به وب‌سرچ زنده ندارند.\n\n" +
+  "۲. فیلد \"voice\":\n" +
+  "- true: اگر کاربر خواسته باشد پاسخ به صورت صوتی، ویس یا با صدا فرستاده شود یا متن برایش خوانده شود (چه صریح بگوید «ویس بده»، «با صدا بگو» و چه عامیانه مثل «برام بخون»، «حوصله خوندن ندارم»، «صداتو بشنوم»).\n" +
+  "- false: اگر پیام متنی عادی باشد یا کاربر خواسته باشد متنی بنویسی.\n\n" +
+  "قالب خروجی:\n" +
+  "پاسخ شما فقط و فقط باید یک شیء JSON معتبر، بدون هیچ کلمه، توضیح اضافه یا بلاک متنی باشد.\n" +
+  "دقیقاً در این قالب:\n" +
+  "{\"search\": false, \"voice\": false}";
 
 /**
- * Fast regex for detecting explicit positive voice requests without waiting for LLM.
+ * Safely parse JSON intent output from Gemma 4.
  */
-export const VOICE_POSITIVE_RE =
-  /(?:ویس|صدا|صوتی|voice)[^\n.!؟?]{0,35}(?:بفرست|بده|بگو|بخون|توضیح بده|تعریف کن|ضبط کن)|(?:با|به صورت|به شکل)\s*(?:ویس|صدا|صوتی)|(?:برام|برامون)\s*بخون/iu;
-
-/**
- * Quick hint check: If the message contains none of these words, it's definitely not voice-related.
- * Saves an LLM call for 99% of normal messages.
- */
-const VOICE_HINT_RE =
-  /(?:ویس|صدا|صوتی|بخون|بشنو|گوش|تعریف|بلند|رادیو|voice|audio|speak|listen)/iu;
-
-/**
- * Prompt for Gemma 4 to classify colloquial/indirect voice requests.
- */
-const INTENT_SYSTEM_PROMPT =
-  "وظیفه شما فقط و فقط تشخیص این است که آیا کاربر در متن پیام، درخواست پاسخ صوتی یا ویس کرده است یا خیر.\n" +
-  "اگر کاربر حتی به صورت غیرمستقیم (مثلاً: «حوصله خوندن ندارم برام تعریف کن»، «تو ماشینم بگو بشنوم»، «بلند بگو») خواسته پاسخ به شکل صدا/ویس باشد، فقط بنویس: YES\n" +
-  "اگر پیام یک متن معمولی است یا کاربر گفته ویس نفرست، فقط بنویس: NO\n" +
-  "هیچ توضیح اضافه‌ای نده. پاسخ فقط یک کلمه باشد: YES یا NO";
-
-/**
- * Detect if user message is asking for a voice reply.
- * Uses fast regex for clear cases, and Gemma 4 for colloquial/nuanced Persian requests.
- */
-export async function detectVoiceIntent(env, text, cfg, traceContext = null) {
-  if (cfg?.voice?.enabled === false) {
-    if (traceContext) traceContext.intent = { requested: false, reason: "voice disabled in config" };
-    return false;
+export function parseIntentJson(rawText) {
+  if (!rawText || typeof rawText !== "string") {
+    return { search: false, voice: false };
   }
-  if (!text || typeof text !== "string") return false;
+  const clean = rawText.trim();
+  if (/^YES$/i.test(clean)) {
+    return { search: false, voice: true };
+  }
+  if (/^NO$/i.test(clean)) {
+    return { search: false, voice: false };
+  }
+  const unquoted = clean.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  try {
+    const parsed = JSON.parse(unquoted);
+    return {
+      search: Boolean(parsed.search),
+      voice: Boolean(parsed.voice),
+    };
+  } catch {
+    const searchMatch = /"search"\s*:\s*(true|false)/i.exec(clean);
+    const voiceMatch = /"voice"\s*:\s*(true|false)/i.exec(clean);
+    return {
+      search: searchMatch ? searchMatch[1].toLowerCase() === "true" : false,
+      voice: voiceMatch ? voiceMatch[1].toLowerCase() === "true" : false,
+    };
+  }
+}
+
+/**
+ * Detect both search and voice intents via a single Gemma 4 classifier call.
+ */
+export async function detectIntent(env, text, cfg, traceContext = null) {
+  if (!text || typeof text !== "string" || !text.trim()) {
+    return { search: false, voice: false };
+  }
+
   const clean = text.trim();
-  if (!clean) return false;
-
-  // 1. If text has no hint of voice/audio words at all, skip immediately without LLM call
-  if (!VOICE_HINT_RE.test(clean)) {
-    if (traceContext) traceContext.intent = { requested: false, method: "fast_hint_filter", reason: "no voice keywords in text" };
-    return false;
-  }
-
-  // 2. Fast negative check
-  if (VOICE_NEGATIVE_RE.test(clean)) {
-    if (traceContext) traceContext.intent = { requested: false, method: "fast_regex_negative", reason: "explicit negative request" };
-    return false;
-  }
-
-  // 3. Fast positive check
-  if (VOICE_POSITIVE_RE.test(clean)) {
-    if (traceContext) traceContext.intent = { requested: true, method: "fast_regex_positive", reason: "keyword matched: " + clean.slice(0, 40) };
-    return true;
-  }
-
-  // 4. Nuanced / colloquial check via Gemma 4
   try {
     const classifierCfg = {
       ...cfg,
@@ -406,7 +404,7 @@ export async function detectVoiceIntent(env, text, cfg, traceContext = null) {
         model: "gemma-4-31b",
         modelPool: ["gemma-4-31b", "gemma-4-26b"],
       },
-      maxTokens: 5,
+      maxTokens: 50,
       thinking: "off",
     };
 
@@ -415,17 +413,20 @@ export async function detectVoiceIntent(env, text, cfg, traceContext = null) {
       parts: [{ type: "text", text: clean }],
     });
 
-    const out = String(res?.text || "").trim().toUpperCase();
-    const isYes = out.includes("YES");
+    const parsed = parseIntentJson(res?.text);
     if (traceContext) {
       traceContext.intent = {
-        requested: isYes,
+        requested: parsed.voice,
         method: "gemma_classifier",
         model: res?.model || "gemma-4-31b",
-        output: out.slice(0, 30),
+        output: String(res?.text || "").trim().slice(0, 50),
+      };
+      traceContext.search = {
+        requested: parsed.search,
+        reason: parsed.search ? "gemma_classifier" : "standard prompt",
       };
     }
-    return isYes;
+    return parsed;
   } catch (err) {
     if (traceContext) {
       traceContext.intent = {
@@ -434,14 +435,24 @@ export async function detectVoiceIntent(env, text, cfg, traceContext = null) {
         error: String(err?.message ?? err).slice(0, 100),
       };
     }
+    return { search: false, voice: false };
+  }
+}
+
+/** Backward compatibility wrapper for voice-only callers. */
+export async function detectVoiceIntent(env, text, cfg, traceContext = null) {
+  if (cfg?.voice?.enabled === false) {
+    if (traceContext) traceContext.intent = { requested: false, reason: "voice disabled in config" };
     return false;
   }
+  const res = await detectIntent(env, text, cfg, traceContext);
+  return res.voice;
 }
 
 /**
  * Determines whether a message should be answered with voice:
  * 1. If incoming message is an audio/voice note.
- * 2. If incoming text asks for a voice response (intent detected).
+ * 2. If incoming text asks for a voice response (intent detected via Gemma).
  */
 export async function shouldVoiceReply(env, msg, cfg, text, traceContext = null) {
   if (cfg?.voice?.enabled === false) {
@@ -457,4 +468,3 @@ export async function shouldVoiceReply(env, msg, cfg, text, traceContext = null)
   }
   return false;
 }
-

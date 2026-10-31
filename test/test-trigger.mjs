@@ -1,6 +1,6 @@
 import { assert, t, done, M } from "./harness.mjs";
 
-const { shouldAnswer, isCommand, isSupportedChat, detectSearchIntent, TRIGGER } = M;
+const { shouldAnswer, isCommand, isSupportedChat, TRIGGER } = M;
 const BOT = 777;
 
 const group = (over) => ({ chat: { id: -1001, type: "supergroup" }, reply_to_message: undefined, ...over });
@@ -60,28 +60,6 @@ await t("only chat types the bot can live in are accepted", () => {
   }
   assert.equal(isSupportedChat({ chat: { type: "channel" } }), false);
   assert.equal(isSupportedChat(null), false);
-});
-
-await t("detectSearchIntent detects commands, phrasing, and live topics", () => {
-  assert.equal(detectSearchIntent("/search نرخ طلا"), true);
-  assert.equal(detectSearchIntent("/google آخرین اخبار"), true);
-  assert.equal(detectSearchIntent("/سرچ آب و هوا"), true);
-  assert.equal(detectSearchIntent("/find بیت کوین"), true);
-  assert.equal(detectSearchIntent("/search@ai_seyed_bot قیمت تتر"), true);
-
-  assert.equal(detectSearchIntent("سید توی اینترنت برام سرچ کن جدیدترین خبرها"), true);
-  assert.equal(detectSearchIntent("تو نت سرچ کن ببین قیمت دلار چنده"), true);
-  assert.equal(detectSearchIntent("سید قیمت طلا چنده؟"), true);
-  assert.equal(detectSearchIntent("ارزش بیت‌کوین الان چند شد؟"), true);
-  assert.equal(detectSearchIntent("قیمت تتر"), true);
-  assert.equal(detectSearchIntent("آخرین اخبار ایران"), true);
-  assert.equal(detectSearchIntent("وضعیت آب و هوا تهران فردا"), true);
-  assert.equal(detectSearchIntent("نتیجه بازی رئال مادرید دیشب"), true);
-
-  assert.equal(detectSearchIntent("سلام سید چطوری؟"), false);
-  assert.equal(detectSearchIntent("یه شعر در مورد دوستی بگو"), false);
-  assert.equal(detectSearchIntent("کد پایتون برای مرتب سازی آرایه بنویس"), false);
-  assert.equal(detectSearchIntent(""), false);
 });
 
 done();

@@ -36,6 +36,10 @@ globalThis.fetch = async (url, init) => {
   }
   if (u.includes("/file/bot")) return new Response(new Uint8Array(64).fill(3), { status: 200 });
 
+  if (u.includes("gemma")) {
+    return json({ candidates: [{ content: { parts: [{ text: JSON.stringify({ search: false, voice: false }) }] } }], usageMetadata: { totalTokenCount: 5 } });
+  }
+
   model.push(String(url));
   lastModelBody = JSON.parse(init.body);
   // a factory, not a Response: a Response body can only be read once, and the client

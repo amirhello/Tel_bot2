@@ -5,7 +5,7 @@ import {
   setLiveTimeout,
   speak,
   detectVoiceIntent,
-  VOICE_POSITIVE_RE,
+  parseIntentJson,
 } from "../src/voice.js";
 import { DEFAULT_BASE_URLS } from "../src/store.js";
 import { clearKeyPoolCache } from "../src/keyPool.js";
@@ -518,22 +518,13 @@ await t("speak falls back across models and records key error on quota limit (42
   }
 });
 
-await t("VOICE_POSITIVE_RE matches voice requests and obeys character limit without false-positives across sentences", () => {
-  // Positive matches
-  assert.ok(VOICE_POSITIVE_RE.test("لطفاً برام با ویس بگو"));
-  assert.ok(VOICE_POSITIVE_RE.test("ویس بفرست"));
-  assert.ok(VOICE_POSITIVE_RE.test("صدا بفرست برام"));
-  assert.ok(VOICE_POSITIVE_RE.test("به صورت صوتی بگو"));
-  assert.ok(VOICE_POSITIVE_RE.test("برامون بخون"));
-  assert.ok(VOICE_POSITIVE_RE.test("voice بده"));
-
-  // Negative / punctuation boundaries (should NOT match across sentences)
-  assert.equal(VOICE_POSITIVE_RE.test("این یک ویس بود. حالا متن را بفرست"), false);
-  assert.equal(VOICE_POSITIVE_RE.test("صدای پرنده ها زیباست! یک داستان بگو"), false);
-
-  // Negative / distance > 35 chars
-  const longGap = "ویس " + "این متن بسیار طولانی است و فاصله زیادی بین کلمات ایجاد میکند " + "بفرست";
-  assert.equal(VOICE_POSITIVE_RE.test(longGap), false);
+await t("parseIntentJson correctly parses Gemma JSON intent output", () => {
+  assert.deepEqual(parseIntentJson('{"search": true, "voice": false}'), { search: true, voice: false });
+  assert.deepEqual(parseIntentJson('{"search": false, "voice": true}'), { search: false, voice: true });
+  assert.deepEqual(parseIntentJson('```json\n{"search": true, "voice": true}\n```'), { search: true, voice: true });
+  assert.deepEqual(parseIntentJson('Random text {"search": true, "voice": false}'), { search: true, voice: false });
+  assert.deepEqual(parseIntentJson('invalid text'), { search: false, voice: false });
+  assert.deepEqual(parseIntentJson(''), { search: false, voice: false });
 });
 
 await t("speak falls back across models on connection drops, socket hang ups, and no-audio errors", async () => {

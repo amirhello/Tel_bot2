@@ -5,10 +5,10 @@ import { PoolExhausted, complete } from "./llm.js";
 import { collectMedia } from "./media.js";
 import { DEFAULT_PERSONAS, buildSystemPrompt, buildUserContent, replyContext } from "./prompt.js";
 import { botId, botUsername, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText } from "./telegram.js";
-import { isCommand, isSupportedChat, shouldAnswer, detectSearchIntent } from "./trigger.js";
+import { isCommand, isSupportedChat, shouldAnswer } from "./trigger.js";
 import { hasRichFormatting, isRtlText, mdToRichHtml } from "./text.js";
 import { bumpStats, loadConfig, loadStats, usedToday } from "./store.js";
-import { shouldVoiceReply, speak } from "./voice.js";
+import { detectIntent, shouldVoiceReply, speak } from "./voice.js";
 const ERRORS = [
   "الان یه کم درگیرم. یه بار دیگه بفرست، شاید سر جا شد.",
   "یه چیزی قاطی شد. دوباره بزن، درستش می‌کنم.",
@@ -333,11 +333,20 @@ async function reply(env, msg, cfg, trace = {}) {
     return { text: DAILY_LIMIT, reason: "daily cap reached", tgOut: "daily cap guard" };
   }
 
-  const isVoice = await shouldVoiceReply(env, msg, cfg, text, trace);
-  const actionKind = isVoice ? "upload_voice" : "typing";
+  let isVoice = Boolean(msg?.voice && cfg?.media?.audio?.enabled !== false && cfg?.voice?.enabled !== false);
+  let isSearch = false;
 
-  const isSearch = detectSearchIntent(text);
-  trace.search = { requested: isSearch, reason: isSearch ? "search intent detected" : "standard prompt" };
+  if (text) {
+    const intent = await detectIntent(env, text, cfg, trace);
+    if (!isVoice && cfg?.voice?.enabled !== false) {
+      isVoice = Boolean(intent.voice);
+    }
+    isSearch = Boolean(intent.search);
+  } else if (isVoice) {
+    if (trace) trace.intent = { requested: true, method: "incoming_voice", reason: "user sent voice note" };
+  }
+
+  const actionKind = isVoice ? "upload_voice" : "typing";
 
   await sendChatAction(token, chatId, actionKind, threadId).catch(() => {});
   await bumpStats(env, { requests: 1, lastUsed: new Date().toISOString() });

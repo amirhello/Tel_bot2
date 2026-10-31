@@ -1825,36 +1825,6 @@ function isCommand(text, myBotUsername) {
   return m[1].toLowerCase();
 }
 
-/**
- * Detects whether the user is asking for real-time information or web search.
- * Triggers on commands, explicit search phrasing, and live topics (rates, weather, news, sports).
- */
-function detectSearchIntent(rawText) {
-  const raw = String(rawText || "").trim();
-  if (!raw) return false;
-
-  // 1. Explicit search commands
-  if (/^\/(search|google|find|جستجو|سرچ)(?:@\S+)?(?:\s|$)/i.test(raw)) return true;
-
-  const text = normalizeFa(raw);
-
-  // 2. Explicit search requests in natural language
-  const explicitSearch = /(?:سرچ|جستجو|گوگل|توی\s*گوگل|تو\s*گوگل|توی\s*نت|تو\s*نت|برام\s*سرچ|آنلاین\s*بگرد|چک\s*کن)\s*(?:کن|بزن|کنید|کنی|بگرد)?/i;
-  if (explicitSearch.test(text)) return true;
-
-  // 3. Live financial, weather, news & sports topics
-  const liveTopics = [
-    /(?:قیمت|نرخ|ارزش)\s*(?:لحظه\s*ای|امروز|الان)?\s*(?:دلار|تتر|طلا|سکه|ارز|یورو|درهم|بیت\s*کوین|اتریوم|بورس|خودرو|پراید|آیفون)/i,
-    /(?:دلار|تتر|بیت\s*کوین|سکه\s*امامی|طلا|اتریوم)\s*(?:چنده|چند\s*شد|چند\s*است|قیمتش\s*چنده)/i,
-    /(?:آخرین\s*اخبار|اخبار\s*امروز|خبر\s*جدید|امروز\s*چه\s*خبر|سرخط\s*اخبار|خبرهای\s*جدید)/i,
-    /(?:وضعیت\s*هوا|آب\s*و\s*هوا|هواشناسی|دمای\s*هوا|پیش\s*بینی\s*هوا)/i,
-    /(?:نتیجه\s*بازی|جدول\s*لیگ|خلاصه\s*بازی|بازی\s*دیشب)/i,
-  ];
-  if (liveTopics.some((re) => re.test(text))) return true;
-
-  return false;
-}
-
 /** Groups: only when the wake word appears, or when Sayyad itself is replied to. */
 function shouldAnswer(msg, botId, chatType, myBotUsername) {
   if (chatType === "private") return true;
@@ -4009,65 +3979,63 @@ async function speak(env, cfg, text, opts = {}) {
 }
 
 /**
- * Fast regex for detecting explicit negative intent (user definitely does NOT want audio).
- */
-const VOICE_NEGATIVE_RE =
-  /(?:ویس|صدا|صوتی|voice)\s*(?:نفرست|نده|نگو|نمیخوام|نباشه|نکن|نزن)|(?:متنی|تکست|نوشتاری)\s*(?:بگو|بفرست|بنویس|جواب بده)/iu;
-
-/**
- * Fast regex for detecting explicit positive voice requests without waiting for LLM.
- */
-const VOICE_POSITIVE_RE =
-  /(?:ویس|صدا|صوتی|voice)[^\n.!؟?]{0,35}(?:بفرست|بده|بگو|بخون|توضیح بده|تعریف کن|ضبط کن)|(?:با|به صورت|به شکل)\s*(?:ویس|صدا|صوتی)|(?:برام|برامون)\s*بخون/iu;
-
-/**
- * Quick hint check: If the message contains none of these words, it's definitely not voice-related.
- * Saves an LLM call for 99% of normal messages.
- */
-const VOICE_HINT_RE =
-  /(?:ویس|صدا|صوتی|بخون|بشنو|گوش|تعریف|بلند|رادیو|voice|audio|speak|listen)/iu;
-
-/**
- * Prompt for Gemma 4 to classify colloquial/indirect voice requests.
+ * Prompt for Gemma 4 to classify both search and voice intents in a single call.
  */
 const INTENT_SYSTEM_PROMPT =
-  "وظیفه شما فقط و فقط تشخیص این است که آیا کاربر در متن پیام، درخواست پاسخ صوتی یا ویس کرده است یا خیر.\n" +
-  "اگر کاربر حتی به صورت غیرمستقیم (مثلاً: «حوصله خوندن ندارم برام تعریف کن»، «تو ماشینم بگو بشنوم»، «بلند بگو») خواسته پاسخ به شکل صدا/ویس باشد، فقط بنویس: YES\n" +
-  "اگر پیام یک متن معمولی است یا کاربر گفته ویس نفرست، فقط بنویس: NO\n" +
-  "هیچ توضیح اضافه‌ای نده. پاسخ فقط یک کلمه باشد: YES یا NO";
+  "شما یک سیستم طبقه‌بندی هوشمند نیت پیام برای ربات تلگرام هستید.\n" +
+  "وظیفه شما تحلیل پیام ورودی کاربر و تعیین دو فیلد بولین (\"search\" و \"voice\") در قالب یک خروجی JSON است.\n\n" +
+  "قوانین تشخیص:\n" +
+  "۱. فیلد \"search\":\n" +
+  "- true: اگر پاسخ به پیام کاربر نیازمند اطلاعات لحظه‌ای و زنده باشد (مثل نرخ دلار، طلا، ارز، رمزارز، قیمت اجناس، وضعیت آب‌وهوا، اخبار روز، نتایج مسابقات ورزشی، رخدادهای تازه) یا کاربر صریحاً خواسته باشد مطلبی در اینترنت سرچ/گوگل شود.\n" +
+  "- false: برای سوالات عمومی، برنامه‌نویسی، شعر، احوال‌پرسی، ترجمه، تاریخ و مسائلی که نیازی به وب‌سرچ زنده ندارند.\n\n" +
+  "۲. فیلد \"voice\":\n" +
+  "- true: اگر کاربر خواسته باشد پاسخ به صورت صوتی، ویس یا با صدا فرستاده شود یا متن برایش خوانده شود (چه صریح بگوید «ویس بده»، «با صدا بگو» و چه عامیانه مثل «برام بخون»، «حوصله خوندن ندارم»، «صداتو بشنوم»).\n" +
+  "- false: اگر پیام متنی عادی باشد یا کاربر خواسته باشد متنی بنویسی.\n\n" +
+  "قالب خروجی:\n" +
+  "پاسخ شما فقط و فقط باید یک شیء JSON معتبر، بدون هیچ کلمه، توضیح اضافه یا بلاک متنی باشد.\n" +
+  "دقیقاً در این قالب:\n" +
+  "{\"search\": false, \"voice\": false}";
 
 /**
- * Detect if user message is asking for a voice reply.
- * Uses fast regex for clear cases, and Gemma 4 for colloquial/nuanced Persian requests.
+ * Safely parse JSON intent output from Gemma 4.
  */
-async function detectVoiceIntent(env, text, cfg, traceContext = null) {
-  if (cfg?.voice?.enabled === false) {
-    if (traceContext) traceContext.intent = { requested: false, reason: "voice disabled in config" };
-    return false;
+function parseIntentJson(rawText) {
+  if (!rawText || typeof rawText !== "string") {
+    return { search: false, voice: false };
   }
-  if (!text || typeof text !== "string") return false;
+  const clean = rawText.trim();
+  if (/^YES$/i.test(clean)) {
+    return { search: false, voice: true };
+  }
+  if (/^NO$/i.test(clean)) {
+    return { search: false, voice: false };
+  }
+  const unquoted = clean.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  try {
+    const parsed = JSON.parse(unquoted);
+    return {
+      search: Boolean(parsed.search),
+      voice: Boolean(parsed.voice),
+    };
+  } catch {
+    const searchMatch = /"search"\s*:\s*(true|false)/i.exec(clean);
+    const voiceMatch = /"voice"\s*:\s*(true|false)/i.exec(clean);
+    return {
+      search: searchMatch ? searchMatch[1].toLowerCase() === "true" : false,
+      voice: voiceMatch ? voiceMatch[1].toLowerCase() === "true" : false,
+    };
+  }
+}
+
+/**
+ * Detect both search and voice intents via a single Gemma 4 classifier call.
+ */
+async function detectIntent(env, text, cfg, traceContext = null) {
+  if (!text || typeof text !== "string" || !text.trim()) {
+    return { search: false, voice: false };
+  }
+
   const clean = text.trim();
-  if (!clean) return false;
-
-  // 1. If text has no hint of voice/audio words at all, skip immediately without LLM call
-  if (!VOICE_HINT_RE.test(clean)) {
-    if (traceContext) traceContext.intent = { requested: false, method: "fast_hint_filter", reason: "no voice keywords in text" };
-    return false;
-  }
-
-  // 2. Fast negative check
-  if (VOICE_NEGATIVE_RE.test(clean)) {
-    if (traceContext) traceContext.intent = { requested: false, method: "fast_regex_negative", reason: "explicit negative request" };
-    return false;
-  }
-
-  // 3. Fast positive check
-  if (VOICE_POSITIVE_RE.test(clean)) {
-    if (traceContext) traceContext.intent = { requested: true, method: "fast_regex_positive", reason: "keyword matched: " + clean.slice(0, 40) };
-    return true;
-  }
-
-  // 4. Nuanced / colloquial check via Gemma 4
   try {
     const classifierCfg = {
       ...cfg,
@@ -4078,7 +4046,7 @@ async function detectVoiceIntent(env, text, cfg, traceContext = null) {
         model: "gemma-4-31b",
         modelPool: ["gemma-4-31b", "gemma-4-26b"],
       },
-      maxTokens: 5,
+      maxTokens: 50,
       thinking: "off",
     };
 
@@ -4087,17 +4055,20 @@ async function detectVoiceIntent(env, text, cfg, traceContext = null) {
       parts: [{ type: "text", text: clean }],
     });
 
-    const out = String(res?.text || "").trim().toUpperCase();
-    const isYes = out.includes("YES");
+    const parsed = parseIntentJson(res?.text);
     if (traceContext) {
       traceContext.intent = {
-        requested: isYes,
+        requested: parsed.voice,
         method: "gemma_classifier",
         model: res?.model || "gemma-4-31b",
-        output: out.slice(0, 30),
+        output: String(res?.text || "").trim().slice(0, 50),
+      };
+      traceContext.search = {
+        requested: parsed.search,
+        reason: parsed.search ? "gemma_classifier" : "standard prompt",
       };
     }
-    return isYes;
+    return parsed;
   } catch (err) {
     if (traceContext) {
       traceContext.intent = {
@@ -4106,14 +4077,24 @@ async function detectVoiceIntent(env, text, cfg, traceContext = null) {
         error: String(err?.message ?? err).slice(0, 100),
       };
     }
+    return { search: false, voice: false };
+  }
+}
+
+/** Backward compatibility wrapper for voice-only callers. */
+async function detectVoiceIntent(env, text, cfg, traceContext = null) {
+  if (cfg?.voice?.enabled === false) {
+    if (traceContext) traceContext.intent = { requested: false, reason: "voice disabled in config" };
     return false;
   }
+  const res = await detectIntent(env, text, cfg, traceContext);
+  return res.voice;
 }
 
 /**
  * Determines whether a message should be answered with voice:
  * 1. If incoming message is an audio/voice note.
- * 2. If incoming text asks for a voice response (intent detected).
+ * 2. If incoming text asks for a voice response (intent detected via Gemma).
  */
 async function shouldVoiceReply(env, msg, cfg, text, traceContext = null) {
   if (cfg?.voice?.enabled === false) {
@@ -4466,11 +4447,20 @@ async function reply(env, msg, cfg, trace = {}) {
     return { text: DAILY_LIMIT, reason: "daily cap reached", tgOut: "daily cap guard" };
   }
 
-  const isVoice = await shouldVoiceReply(env, msg, cfg, text, trace);
-  const actionKind = isVoice ? "upload_voice" : "typing";
+  let isVoice = Boolean(msg?.voice && cfg?.media?.audio?.enabled !== false && cfg?.voice?.enabled !== false);
+  let isSearch = false;
 
-  const isSearch = detectSearchIntent(text);
-  trace.search = { requested: isSearch, reason: isSearch ? "search intent detected" : "standard prompt" };
+  if (text) {
+    const intent = await detectIntent(env, text, cfg, trace);
+    if (!isVoice && cfg?.voice?.enabled !== false) {
+      isVoice = Boolean(intent.voice);
+    }
+    isSearch = Boolean(intent.search);
+  } else if (isVoice) {
+    if (trace) trace.intent = { requested: true, method: "incoming_voice", reason: "user sent voice note" };
+  }
+
+  const actionKind = isVoice ? "upload_voice" : "typing";
 
   await sendChatAction(token, chatId, actionKind, threadId).catch(() => {});
   await bumpStats(env, { requests: 1, lastUsed: new Date().toISOString() });
@@ -4844,4 +4834,4 @@ class FileKV {
   }
 }
 
-export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, NodeWebSocket, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, SEARCH_GROUNDING_MODELS, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, UnknownModelError, VOICE_POSITIVE_RE, acquireKey, acquireKeyWithWait, appendArchive, appendSources, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeAntigravity, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, deliverTextReply, detectMedia, detectSearchIntent, detectVoiceIntent, diagnostics, downloadFile, endpointOf, esc, extractKeys, failedLoginAttempts, formatRawError, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, hasMediaPayload, hasRichFormatting, isAntigravity, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isSearchSupported, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, parseAntigravityResponse, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiSources, readGeminiText, readPatch, recordFailedLogin, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText, serialize, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };
+export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, INTENT_SYSTEM_PROMPT, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, NodeWebSocket, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, SEARCH_GROUNDING_MODELS, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, UnknownModelError, acquireKey, acquireKeyWithWait, appendArchive, appendSources, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeAntigravity, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, deliverTextReply, detectIntent, detectMedia, detectVoiceIntent, diagnostics, downloadFile, endpointOf, esc, extractKeys, failedLoginAttempts, formatRawError, getKeyPool, getKeyPoolStatus, getMe, getWebhookInfo, handleAdmin, hasMediaPayload, hasRichFormatting, isAntigravity, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isSearchSupported, isShapeError, isSupportedChat, isTransient, json, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, parseAntigravityResponse, parseIntentJson, pcmToWav, poolResumeTime, preview, processMessage, providerFor, quotaKind, readArchive, readGeminiSources, readGeminiText, readPatch, recordFailedLogin, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, sendAudioFile, sendChatAction, sendLong, sendRichMessage, sendText, serialize, setLiveTimeout, setStateFilePath, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };
