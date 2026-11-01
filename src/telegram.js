@@ -101,9 +101,21 @@ export async function sendRichMessage(token, chatId, html, replyTo, isRtl = true
   };
 
   try {
-    return await tg(token, "sendRichMessage", payload);
+    const res = await tg(token, "sendRichMessage", payload);
+    if (res?.ok) return res;
+    // Retry once on transient network or 5xx server errors
+    if (!res || res.error_code >= 500 || res.error === "invalid_json") {
+      await new Promise((r) => setTimeout(r, 1200));
+      return await tg(token, "sendRichMessage", payload);
+    }
+    return res;
   } catch {
-    return null;
+    try {
+      await new Promise((r) => setTimeout(r, 1200));
+      return await tg(token, "sendRichMessage", payload);
+    } catch {
+      return null;
+    }
   }
 }
 

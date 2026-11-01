@@ -731,10 +731,13 @@ function logCard(it){
     if (it.trace.delivery) {
       var dLine = el("div", "traceline");
       dLine.appendChild(el("b", null, "• Telegram Delivery: "));
-      var dKind = it.trace.delivery.kind === "voice" ? "🎙️ Voice Audio File (WAV)"
+      var isRich = it.trace.delivery.kind === "rich_message";
+      var isVoice = it.trace.delivery.kind === "voice";
+      var dKind = isVoice ? "🎙️ Voice Audio File (WAV)"
                 : it.trace.delivery.kind === "text_fallback" ? "⚠️ Text Fallback (Voice failed)"
+                : isRich ? "✨ Rich Message (Bot API 10.3)"
                 : "💬 Standard Text";
-      dLine.appendChild(el("span", "tag" + (it.trace.delivery.kind === "voice" ? " on" : ""), dKind));
+      dLine.appendChild(el("span", "tag" + (isVoice || isRich ? " on" : ""), dKind));
       if (it.trace.delivery.reason) {
         dLine.appendChild(document.createTextNode(" (" + it.trace.delivery.reason + ")"));
       }

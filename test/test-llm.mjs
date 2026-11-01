@@ -420,7 +420,7 @@ await t("readGeminiSources parses groundingMetadata into clean sources", () => {
   assert.equal(sources[2].title, "example.com");
 });
 
-await t("appendSources formats search citations as clean markdown footnotes", () => {
+await t("appendSources formats search citations as clean Bot API 10.3 rich elements", () => {
   const answer = "قیمت امروز ۶۵ هزار تومان است.";
   const sources = [
     { title: "سایت طلا و ارز", url: "https://tgju.org" },
@@ -428,9 +428,10 @@ await t("appendSources formats search citations as clean markdown footnotes", ()
   ];
   const formatted = appendSources(answer, sources);
   assert.ok(formatted.startsWith("قیمت امروز ۶۵ هزار تومان است."));
-  assert.ok(formatted.includes("🌐 **منابع سرچ:**"));
-  assert.ok(formatted.includes("• [سایت طلا و ارز](https://tgju.org)"));
-  assert.ok(formatted.includes("• [ایسنا](https://isna.ir)"));
+  assert.ok(formatted.includes("<details><summary>🌐 منابع معتبر جستجو (۲)</summary>"));
+  assert.ok(formatted.includes('<a href="https://tgju.org">سایت طلا و ارز</a>'));
+  assert.ok(formatted.includes('<a href="https://isna.ir">ایسنا</a>'));
+  assert.ok(formatted.includes("</details>"));
 
   assert.equal(appendSources("متن عادی", []), "متن عادی");
   assert.equal(appendSources("متن عادی", null), "متن عادی");

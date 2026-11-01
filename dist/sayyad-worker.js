@@ -267,8 +267,108 @@ function isRtlText(s) {
 function hasRichFormatting(text) {
   const s = String(text ?? "");
   if (/(?:^|\n)\s*\|[^\n]+\|\r?\n\s*\|[\s\-:|]+\|\r?\n\s*\|[^\n]+\|/.test(s)) return true;
-  if (/<(table|details|tg-button|blockquote\s+expandable)/i.test(s)) return true;
+  if (/<(\/)?(table|details|tg-button|tg-button-row|blockquote|footer|figure|img|h[1-6])/i.test(s)) return true;
   return false;
+}
+
+const VOID_TAGS = new Set(["img", "br", "hr", "input", "meta", "link"]);
+
+/**
+ * Automatically balances and closes unclosed HTML tags to prevent Telegram 400 Bad Request.
+ */
+function balanceHtmlTags(html) {
+  let s = String(html ?? "");
+  if (!s) return "";
+
+  // 1. Strip incomplete trailing tag if cut off mid-tag, e.g. "...<table" or "...<tg-bu"
+  s = s.replace(/<[a-zA-Z0-9_-]*[^>]*$/, "");
+
+  // 2. Scan tags using regex
+  const tagRegex = /<(\/)?([a-zA-Z0-9_-]+)([^>]*)>/g;
+  const stack = [];
+  let match;
+
+  while ((match = tagRegex.exec(s)) !== null) {
+    const isClosing = Boolean(match[1]);
+    const tagName = match[2].toLowerCase();
+    const tagBody = match[3] || "";
+
+    // Skip void tags or explicitly self-closing tags (e.g. <img />, <br/>)
+    if (VOID_TAGS.has(tagName) || tagBody.trim().endsWith("/")) {
+      continue;
+    }
+
+    if (isClosing) {
+      const idx = stack.lastIndexOf(tagName);
+      if (idx !== -1) {
+        stack.splice(idx);
+      }
+    } else {
+      stack.push(tagName);
+    }
+  }
+
+  // 3. Close remaining unclosed tags in reverse order
+  while (stack.length > 0) {
+    const tag = stack.pop();
+    s += `</${tag}>`;
+  }
+
+  return s;
+}
+
+/**
+ * Splits a long rich HTML document into balanced, valid sub-documents
+ * under maxLen (default 3400 chars) preserving block structures.
+ */
+function splitRichHtml(html, maxLen = 3400) {
+  let s = String(html ?? "").trim();
+  if (!s || s.length <= maxLen) return [s];
+
+  const chunks = [];
+  while (s.length > maxLen) {
+    const window = s.slice(0, maxLen);
+    let splitIdx = -1;
+
+    const blockEnds = [
+      "</details>",
+      "</table>",
+      "</blockquote>",
+      "</figure>",
+      "</tg-button-row>",
+      "</h3>",
+      "</p>",
+      "\n\n",
+    ];
+
+    for (const b of blockEnds) {
+      const idx = window.lastIndexOf(b);
+      if (idx !== -1 && idx >= maxLen * 0.35) {
+        splitIdx = idx + b.length;
+        break;
+      }
+    }
+
+    if (splitIdx === -1) {
+      const lineIdx = window.lastIndexOf("\n");
+      if (lineIdx !== -1 && lineIdx >= maxLen * 0.35) {
+        splitIdx = lineIdx + 1;
+      } else {
+        const spaceIdx = window.lastIndexOf(" ");
+        splitIdx = spaceIdx !== -1 && spaceIdx >= maxLen * 0.35 ? spaceIdx + 1 : maxLen;
+      }
+    }
+
+    const chunk = s.slice(0, splitIdx);
+    chunks.push(balanceHtmlTags(chunk));
+    s = s.slice(splitIdx).trim();
+  }
+
+  if (s.length > 0) {
+    chunks.push(balanceHtmlTags(s));
+  }
+
+  return chunks;
 }
 
 /**
@@ -341,8 +441,8 @@ function mdToRichHtml(md, opts = {}) {
   s = s.replace(/(?:^|\n)((?:>[^\n]*\r?\n?)+)/g, (match) =>
     keep(renderBlockquotes(match)));
 
-  // 4. Preserve native rich tags if already emitted by model or template
-  s = s.replace(/<(tg-button-row|tg-button|table|details|summary|blockquote|figure|footer|h[1-6]|p)[^>]*>[\s\S]*?<\/\1>/gi, (tag) => keep(tag));
+  // 4. Preserve native rich tags if already emitted by model or template (both paired or individual tokens)
+  s = s.replace(/<\/?(tg-button-row|tg-button|table|thead|tbody|tfoot|tr|th|td|details|summary|blockquote|figure|figcaption|footer|h[1-6]|p|b|i|u|s|code|pre|a)[^>]*>/gi, (tag) => keep(tag));
   s = s.replace(/<img[^>]*>/gi, (tag) => keep(tag));
 
   // 5. Convert headers ### Header to <h3>Header</h3>
@@ -365,7 +465,8 @@ function mdToRichHtml(md, opts = {}) {
     s += `\n<footer>${esc(opts.footer)}</footer>`;
   }
 
-  return s.trim();
+  // 10. Auto-balance tags so Telegram Bot API 10.3 never rejects truncated or unclosed HTML
+  return balanceHtmlTags(s.trim());
 }
 
 /** Base64-encode bytes in chunks, so a multi-megabyte buffer cannot blow the stack. */
@@ -486,17 +587,28 @@ const MODE_LABELS = {
   polite: "ادیب / Polite",
 };
 
-const BASE_RULES = `تو «سید» هستی، یک ربات تلگرام. اسم تو سید است.
+const BASE_RULES = `تو «سید» هستی، یک ربات پیشرفته تلگرام. اسم تو سید است.
 
 قوانین پایه (همیشه):
 - به همان زبانی جواب بده که کاربر نوشته است (فارسی یا انگلیسی).
-- کوتاه جواب بده. اگر موضوع پیچیده است، اول جواب مستقیم، بعد نکات کلیدی. الکی حاشیه نرو.
-- از مارک‌داون سبک استفاده کن: **بولد** برای تاکید و «- » برای بولت.
 - هرگز پیام خودت را تکرار نکن و هرگز نقش کاربر را بازی نکن.
 - اگر چیزی را نمی‌دانی یا مطمئن نیستی، صادقانه بگو و حدس الکی نزن.
 - حافظه‌ای از پیام‌های قبلی نداری؛ فقط چیزی را می‌بینی که در همین درخواست برایت فرستاده شده.
 - تو قابلیت ارسال ویس و پیام صوتی (Voice Message) داری. اگر کاربر خواست با صدا، ویس یا پادکست پاسخ دهی، یک متن روان، گفتاری و صمیمی برای خوانده‌شدن تولید کن و هرگز نگو ویس نمی‌فرستم یا توانایی ارسال صدا ندارم.
-- اگر کاربر فقط کلمه «سید» یا یک سلام بی‌حرف و معنی نوشته و درخواست مشخصی ندارد، یک جمله‌ی باحال، کوتاه و پرانرژی بگو که بپرسد چه می‌خواهد — یک سوال جالب، یا یک تیکه‌ی کوتاه. این جمله هرگز نباید تکراری و خشک باشد.`;
+- اگر کاربر فقط کلمه «سید» یا یک سلام بی‌حرف و معنی نوشته و درخواست مشخصی ندارد، یک جمله‌ی باحال، کوتاه و پرانرژی بگو که بپرسد چه می‌خواهد.
+
+قواعد ساختار و چیدمان پیام (Telegram Bot API 10.3 Rich Message):
+۱. پیام‌های کوتاه، سلام و چت‌های سریع و صمیمی: کاملاً ساده، طبیعی، سریع و روان بمانند (بدون تگ‌های دست‌وپاگیر یا جدول‌های بی‌مورد).
+۲. پاسخ‌های تحلیلی، توضیحی، مقایسه‌ای و متوسط یا بلند: موظف هستی از المان‌های ساختاریافته و غنی تلگرام استفاده کنی تا خروجی بی‌نهایت تمیز و حرفه‌ای باشد:
+   - تیتر بخش‌ها: از <h3>عنوان</h3> استفاده کن.
+   - جداول بومی: برای مقایسه‌ها، مشخصات، قیمت‌ها، مراحل و آمار، مستقیماً از تگ‌های جدول <table><thead><tr><th>...</th></tr></thead><tbody><tr><td>...</td></tr></tbody></table> استفاده کن.
+   - قانون طلایی جداول و المان‌های غنی: هرگز تگ‌های <table>، <details>، <tg-button> یا <blockquote> را داخل بلوک کد مارک‌داون (\`\`\`html) نگذار! مستقیماً و بدون بک‌تیک آن‌ها را در متن بنویس تا تلگرام آن‌ها را به ویجت واقعی گرافیکی تبدیل کند.
+   - بخش‌های تاشو (آکاردئونی): برای توضیحات طولانی، عمیق یا نکات فرعی، از <details><summary>عنوان بخش تاشو</summary>متن توضیحات کامل</details> استفاده کن تا پیام کاربر تمیز و کم‌حجم بماند.
+   - نقل‌قول‌های تاشو: برای نکات طلایی، هشدارها یا جمع‌بندی از <blockquote expandable>متن نکته مهم</blockquote> استفاده کن.
+   - دکمه‌های کپی و لینک: برای کدهای برنامه‌نویسی، دستورات ترمینال، متن‌های مهم یا لینک‌ها، از دکمه‌های تلگرام استفاده کن:
+     * دکمه کپی متن: <tg-button type="copy_text" text="متن_جهت_کپی">📋 کپی متن</tg-button>
+     * دکمه لینک یا منبع: <tg-button type="url" style="primary" url="https://...">عنوان لینک</tg-button>
+   - پاورقی پایانی: در انتهای پاسخ‌های جامع، یک پاورقی کوتاه و شیک بگذار: <footer>سید — دستیار هوشمند</footer>`;
 
 const DEFAULT_PERSONAS = {
   psychologist: `شخصیت: «روانشناس» — آرام، شنونده عمیق، همدل، متمرکز بر احساسات و به دور از هرگونه قضاوت.
@@ -2924,10 +3036,13 @@ function logCard(it){
     if (it.trace.delivery) {
       var dLine = el("div", "traceline");
       dLine.appendChild(el("b", null, "• Telegram Delivery: "));
-      var dKind = it.trace.delivery.kind === "voice" ? "🎙️ Voice Audio File (WAV)"
+      var isRich = it.trace.delivery.kind === "rich_message";
+      var isVoice = it.trace.delivery.kind === "voice";
+      var dKind = isVoice ? "🎙️ Voice Audio File (WAV)"
                 : it.trace.delivery.kind === "text_fallback" ? "⚠️ Text Fallback (Voice failed)"
+                : isRich ? "✨ Rich Message (Bot API 10.3)"
                 : "💬 Standard Text";
-      dLine.appendChild(el("span", "tag" + (it.trace.delivery.kind === "voice" ? " on" : ""), dKind));
+      dLine.appendChild(el("span", "tag" + (isVoice || isRich ? " on" : ""), dKind));
       if (it.trace.delivery.reason) {
         dLine.appendChild(document.createTextNode(" (" + it.trace.delivery.reason + ")"));
       }
@@ -3457,9 +3572,21 @@ async function sendRichMessage(token, chatId, html, replyTo, isRtl = true, threa
   };
 
   try {
-    return await tg(token, "sendRichMessage", payload);
+    const res = await tg(token, "sendRichMessage", payload);
+    if (res?.ok) return res;
+    // Retry once on transient network or 5xx server errors
+    if (!res || res.error_code >= 500 || res.error === "invalid_json") {
+      await new Promise((r) => setTimeout(r, 1200));
+      return await tg(token, "sendRichMessage", payload);
+    }
+    return res;
   } catch {
-    return null;
+    try {
+      await new Promise((r) => setTimeout(r, 1200));
+      return await tg(token, "sendRichMessage", payload);
+    } catch {
+      return null;
+    }
   }
 }
 
@@ -5087,8 +5214,28 @@ function logPipelineTrace(msg, outcome, replyError, trace) {
 /** Append web source citations from search grounding to the reply. */
 function appendSources(text, sources) {
   if (!Array.isArray(sources) || !sources.length) return text;
-  const lines = sources.map((s) => `• [${s.title}](${s.url})`);
-  return `${text.trim()}\n\n🌐 **منابع سرچ:**\n${lines.join("\n")}`;
+  const base = String(text ?? "").trim();
+  const count = sources.length;
+  const faCount = String(count).replace(/\d/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[d]);
+
+  const items = sources.map((s) => {
+    const title = esc(s.title || "منبع وب");
+    const url = s.url || "#";
+    let domain = "";
+    try {
+      domain = new URL(url).hostname.replace(/^www\./, "");
+    } catch {}
+    const domainBadge = domain ? ` <i>(${domain})</i>` : "";
+    return `• <a href="${url}">${title}</a>${domainBadge}`;
+  });
+
+  const sourcesBlock = [
+    `<details><summary>🌐 منابع معتبر جستجو (${faCount})</summary>`,
+    items.join("\n"),
+    `</details>`,
+  ].join("\n");
+
+  return `${base}\n\n${sourcesBlock}`;
 }
 
 /**
@@ -5103,9 +5250,20 @@ async function deliverTextReply(token, chatId, text, replyTo, opts = {}) {
     try {
       const isRtl = isRtlText(text);
       const richHtml = mdToRichHtml(text);
-      const res = await sendRichMessage(token, chatId, richHtml, replyTo, isRtl, threadId);
-      if (res?.ok) {
-        return { kind: "rich_message", tgOut: "rich message delivered (Bot API 10.3)" };
+      const chunks = splitRichHtml(richHtml, 3400);
+      let allDelivered = true;
+      for (const chunk of chunks) {
+        const res = await sendRichMessage(token, chatId, chunk, replyTo, isRtl, threadId);
+        if (!res?.ok) {
+          allDelivered = false;
+          break;
+        }
+      }
+      if (allDelivered && chunks.length > 0) {
+        const desc = chunks.length > 1
+          ? `rich message delivered in ${chunks.length} parts (Bot API 10.3)`
+          : "rich message delivered (Bot API 10.3)";
+        return { kind: "rich_message", tgOut: desc };
       }
     } catch {
       // Degrade gracefully to sendLong
@@ -5619,4 +5777,4 @@ class FileKV {
   }
 }
 
-export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, INTENT_SYSTEM_PROMPT, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MAX_INDEXED_USERS, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, NodeWebSocket, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, SEARCH_GROUNDING_MODELS, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, USER_INDEX_KEY, UnknownModelError, VOICE_HINT_RE, VOICE_NEGATIVE_RE, VOICE_POSITIVE_RE, acquireKey, acquireKeyWithWait, answerCallbackQuery, appendArchive, appendSources, archiveRecord, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeAntigravity, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, deliverTextReply, detectIntent, detectMedia, detectSearchIntent, detectVoiceIntent, diagnostics, downloadFile, editMessageText, endpointOf, esc, extractKeys, extractSearchQuery, failedLoginAttempts, formatRawError, getKeyPool, getKeyPoolStatus, getMe, getUser, getWebhookInfo, handleAdmin, hasMediaPayload, hasRichFormatting, isAntigravity, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isSearchSupported, isShapeError, isSupportedChat, isTransient, isUserBlocked, json, listUsers, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, parseAntigravityResponse, parseIntentJson, pcmToWav, poolResumeTime, preview, processCallback, processMessage, providerFor, quotaKind, readArchive, readGeminiSources, readGeminiText, readPatch, recordFailedLogin, recordUserActivity, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetUserSettings, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, searchWeb, sendAudioFile, sendChatAction, sendInlineKeyboard, sendLong, sendRichMessage, sendText, serialize, setLiveTimeout, setStateFilePath, setUserBlocked, setUserMode, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };
+export { ARCHIVE_KEY, ARCHIVE_LIMIT, ApiError, BASE_RULES, CONFIG_KEY, COOKIE, DEFAULT_BACKOFF, DEFAULT_BASE_URLS, DEFAULT_MODEL, DEFAULT_MODEL_POOL, DEFAULT_PERSONAS, DailyQuotaError, FALLBACK_VOICE_MODELS, FileKV, INTENT_SYSTEM_PROMPT, LEGACY_CONFIG_KEY, LEGACY_STATS_KEY, MAX_INDEXED_USERS, MODES, MODE_LABELS, MULTIMODAL_MODELS, MinuteQuotaError, NodeWebSocket, PACIFIC_OFFSET_MS, PoolExhausted, QUOTA_KEY, REPLY_TEXT_LIMIT, SAFETY_CATEGORIES, SAFETY_CATEGORY_KEYS, SAFETY_LEVELS, SCHEMA_VERSION, SEARCH_GROUNDING_MODELS, STATS_KEY, TEXT_EXTENDED_MODELS, THINKING_BUDGETS, THINKING_LEVELS, TRIGGER, USER_INDEX_KEY, UnknownModelError, VOICE_HINT_RE, VOICE_NEGATIVE_RE, VOICE_POSITIVE_RE, acquireKey, acquireKeyWithWait, answerCallbackQuery, appendArchive, appendSources, archiveRecord, balanceHtmlTags, botId, botUsername, buildGeminiBody, buildSystemPrompt, buildUserContent, bumpStats, callJson, clampInt, clearKeyPoolCache, clearMinuteQuota, collectMedia, complete, completeAntigravity, completeGemini, completeOpenAI, defaultConfig, deleteWebhook, deliverTextReply, detectIntent, detectMedia, detectSearchIntent, detectVoiceIntent, diagnostics, downloadFile, editMessageText, endpointOf, esc, extractKeys, extractSearchQuery, failedLoginAttempts, formatRawError, getKeyPool, getKeyPoolStatus, getMe, getUser, getWebhookInfo, handleAdmin, hasMediaPayload, hasRichFormatting, isAntigravity, isAuthed, isCommand, isCredentialError, isMultimodalModel, isRtlText, isSearchSupported, isShapeError, isSupportedChat, isTransient, isUserBlocked, json, listUsers, loadConfig, loadQuota, loadStats, mapModelForProvider, mdToHtml, mdToRichHtml, mediaKind, migrateLegacy, minuteQuota, nextPacificMidnight, normalizeConfig, normalizeFa, normalizePool, parseAntigravityResponse, parseIntentJson, pcmToWav, poolResumeTime, preview, processCallback, processMessage, providerFor, quotaKind, readArchive, readGeminiSources, readGeminiText, readPatch, recordFailedLogin, recordUserActivity, renderBlockquotes, renderDashboard, renderLogin, renderMarkdownTables, replyContext, reportPage, resetLoginRateLimit, resetUserSettings, resetWebhook, safetySettings, saveConfig, saveQuota, saveState, searchWeb, sendAudioFile, sendChatAction, sendInlineKeyboard, sendLong, sendRichMessage, sendText, serialize, setLiveTimeout, setStateFilePath, setUserBlocked, setUserMode, setWebhook, setup, shouldAnswer, shouldVoiceReply, signSecret, signWebhookSecret, speak, splitRichHtml, splitText, spokenText, tg, thinkingConfig, timingSafeEqual, toBase64, toGeminiPart, toOpenAIPart, todayKey, truncate, usedToday, verifyPassword, voiceReply };

@@ -86,8 +86,108 @@ export function isRtlText(s) {
 export function hasRichFormatting(text) {
   const s = String(text ?? "");
   if (/(?:^|\n)\s*\|[^\n]+\|\r?\n\s*\|[\s\-:|]+\|\r?\n\s*\|[^\n]+\|/.test(s)) return true;
-  if (/<(table|details|tg-button|blockquote\s+expandable)/i.test(s)) return true;
+  if (/<(\/)?(table|details|tg-button|tg-button-row|blockquote|footer|figure|img|h[1-6])/i.test(s)) return true;
   return false;
+}
+
+const VOID_TAGS = new Set(["img", "br", "hr", "input", "meta", "link"]);
+
+/**
+ * Automatically balances and closes unclosed HTML tags to prevent Telegram 400 Bad Request.
+ */
+export function balanceHtmlTags(html) {
+  let s = String(html ?? "");
+  if (!s) return "";
+
+  // 1. Strip incomplete trailing tag if cut off mid-tag, e.g. "...<table" or "...<tg-bu"
+  s = s.replace(/<[a-zA-Z0-9_-]*[^>]*$/, "");
+
+  // 2. Scan tags using regex
+  const tagRegex = /<(\/)?([a-zA-Z0-9_-]+)([^>]*)>/g;
+  const stack = [];
+  let match;
+
+  while ((match = tagRegex.exec(s)) !== null) {
+    const isClosing = Boolean(match[1]);
+    const tagName = match[2].toLowerCase();
+    const tagBody = match[3] || "";
+
+    // Skip void tags or explicitly self-closing tags (e.g. <img />, <br/>)
+    if (VOID_TAGS.has(tagName) || tagBody.trim().endsWith("/")) {
+      continue;
+    }
+
+    if (isClosing) {
+      const idx = stack.lastIndexOf(tagName);
+      if (idx !== -1) {
+        stack.splice(idx);
+      }
+    } else {
+      stack.push(tagName);
+    }
+  }
+
+  // 3. Close remaining unclosed tags in reverse order
+  while (stack.length > 0) {
+    const tag = stack.pop();
+    s += `</${tag}>`;
+  }
+
+  return s;
+}
+
+/**
+ * Splits a long rich HTML document into balanced, valid sub-documents
+ * under maxLen (default 3400 chars) preserving block structures.
+ */
+export function splitRichHtml(html, maxLen = 3400) {
+  let s = String(html ?? "").trim();
+  if (!s || s.length <= maxLen) return [s];
+
+  const chunks = [];
+  while (s.length > maxLen) {
+    const window = s.slice(0, maxLen);
+    let splitIdx = -1;
+
+    const blockEnds = [
+      "</details>",
+      "</table>",
+      "</blockquote>",
+      "</figure>",
+      "</tg-button-row>",
+      "</h3>",
+      "</p>",
+      "\n\n",
+    ];
+
+    for (const b of blockEnds) {
+      const idx = window.lastIndexOf(b);
+      if (idx !== -1 && idx >= maxLen * 0.35) {
+        splitIdx = idx + b.length;
+        break;
+      }
+    }
+
+    if (splitIdx === -1) {
+      const lineIdx = window.lastIndexOf("\n");
+      if (lineIdx !== -1 && lineIdx >= maxLen * 0.35) {
+        splitIdx = lineIdx + 1;
+      } else {
+        const spaceIdx = window.lastIndexOf(" ");
+        splitIdx = spaceIdx !== -1 && spaceIdx >= maxLen * 0.35 ? spaceIdx + 1 : maxLen;
+      }
+    }
+
+    const chunk = s.slice(0, splitIdx);
+    chunks.push(balanceHtmlTags(chunk));
+    s = s.slice(splitIdx).trim();
+  }
+
+  if (s.length > 0) {
+    chunks.push(balanceHtmlTags(s));
+  }
+
+  return chunks;
 }
 
 /**
@@ -160,8 +260,8 @@ export function mdToRichHtml(md, opts = {}) {
   s = s.replace(/(?:^|\n)((?:>[^\n]*\r?\n?)+)/g, (match) =>
     keep(renderBlockquotes(match)));
 
-  // 4. Preserve native rich tags if already emitted by model or template
-  s = s.replace(/<(tg-button-row|tg-button|table|details|summary|blockquote|figure|footer|h[1-6]|p)[^>]*>[\s\S]*?<\/\1>/gi, (tag) => keep(tag));
+  // 4. Preserve native rich tags if already emitted by model or template (both paired or individual tokens)
+  s = s.replace(/<\/?(tg-button-row|tg-button|table|thead|tbody|tfoot|tr|th|td|details|summary|blockquote|figure|figcaption|footer|h[1-6]|p|b|i|u|s|code|pre|a)[^>]*>/gi, (tag) => keep(tag));
   s = s.replace(/<img[^>]*>/gi, (tag) => keep(tag));
 
   // 5. Convert headers ### Header to <h3>Header</h3>
@@ -184,7 +284,8 @@ export function mdToRichHtml(md, opts = {}) {
     s += `\n<footer>${esc(opts.footer)}</footer>`;
   }
 
-  return s.trim();
+  // 10. Auto-balance tags so Telegram Bot API 10.3 never rejects truncated or unclosed HTML
+  return balanceHtmlTags(s.trim());
 }
 
 /** Base64-encode bytes in chunks, so a multi-megabyte buffer cannot blow the stack. */

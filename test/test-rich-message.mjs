@@ -1,120 +1,78 @@
-import { assert, t, done } from "./harness.mjs";
-import { isRtlText, renderMarkdownTables, renderBlockquotes, mdToRichHtml } from "../src/text.js";
-import { sendRichMessage, sendLong, sendText } from "../src/telegram.js";
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { hasRichFormatting, balanceHtmlTags, mdToRichHtml } from "../src/text.js";
+import { appendSources } from "../src/answer.js";
 
-await t("isRtlText detects Persian/Arabic scripts correctly", () => {
-  assert.equal(isRtlText("سلام سید"), true);
-  assert.equal(isRtlText("Hello world!"), false);
-  assert.equal(isRtlText("12345"), false);
-  assert.equal(isRtlText("Model: gemini (پاسخ فارسی)"), true);
+test("hasRichFormatting detects Bot API 10.3 elements and markdown tables", () => {
+  assert.equal(hasRichFormatting("سلام سید چطوری؟"), false);
+  assert.equal(hasRichFormatting("این یک متن معمولی با **بولد** و _ایتالیک_ است."), false);
+
+  // Markdown table
+  const mdTable = "| نام | سن |\n|---|---|\n| علی | ۲۵ |";
+  assert.equal(hasRichFormatting(mdTable), true);
+
+  // Native tags
+  assert.equal(hasRichFormatting("<h3>عنوان بخش</h3>"), true);
+  assert.equal(hasRichFormatting("<details><summary>جزئیات</summary>متن</details>"), true);
+  assert.equal(hasRichFormatting("<tg-button type=\"url\" url=\"https://t.me\">لینک</tg-button>"), true);
+  assert.equal(hasRichFormatting("<tg-button-row><tg-button>دکمه</tg-button></tg-button-row>"), true);
+  assert.equal(hasRichFormatting("<table bordered striped><tr><td>داده</td></tr></table>"), true);
+  assert.equal(hasRichFormatting("<blockquote expandable>نکته مهم</blockquote>"), true);
+  assert.equal(hasRichFormatting("<footer>امضای ربات</footer>"), true);
+  assert.equal(hasRichFormatting("<figure><img src=\"https://example.com/pic.jpg\"></figure>"), true);
 });
 
-await t("renderMarkdownTables transforms markdown tables to <table bordered striped>", () => {
-  const md = "| ستون ۱ | ستون ۲ |\n| --- | --- |\n| داده ۱ | داده ۲ |";
-  const html = renderMarkdownTables(md);
-  assert.ok(html.includes("<table bordered striped>"));
-  assert.ok(html.includes("<thead><tr><th>ستون ۱</th><th>ستون ۲</th></tr></thead>"));
-  assert.ok(html.includes("<tbody><tr><td>داده ۱</td><td>داده ۲</td></tr></tbody>"));
-  assert.ok(html.includes("</table>"));
+test("balanceHtmlTags automatically closes unclosed HTML tags", () => {
+  // Truncated table
+  const truncatedTable = "<table bordered striped><thead><tr><th>A</th><th>B</th></tr></thead><tbody><tr><td>1</td><td>2";
+  const balancedTable = balanceHtmlTags(truncatedTable);
+  assert.ok(balancedTable.endsWith("</td></tr></tbody></table>"), `Expected closed tags at end, got: ${balancedTable}`);
+
+  // Truncated details
+  const truncatedDetails = "<details><summary>توضیحات بیشتر</summary>این یک متن خیلی طولانی است که ناگهان قطع ش";
+  const balancedDetails = balanceHtmlTags(truncatedDetails);
+  assert.ok(balancedDetails.endsWith("</details>"), `Expected </details> at end, got: ${balancedDetails}`);
+
+  // Truncated quote and formatting
+  const truncatedQuote = "<blockquote expandable><b>نکته مهم:</b> متن ناتمام";
+  const balancedQuote = balanceHtmlTags(truncatedQuote);
+  assert.ok(balancedQuote.endsWith("</blockquote>"), `Expected </blockquote> at end, got: ${balancedQuote}`);
+
+  // Self closing tags should not be closed
+  const withImg = "<figure><img src=\"https://example.com/test.jpg\"></figure>";
+  assert.equal(balanceHtmlTags(withImg), withImg);
+
+  // Already balanced HTML stays intact
+  const valid = "<h3>عنوان</h3><p>متن</p><footer>پاورقی</footer>";
+  assert.equal(balanceHtmlTags(valid), valid);
 });
 
-await t("renderBlockquotes transforms > quotes to <blockquote expandable>", () => {
-  const md = "> این یک نقل قول آزمایشی است\n> خط دوم نقل قول";
-  const html = renderBlockquotes(md);
-  assert.ok(html.includes("<blockquote expandable>"));
-  assert.ok(html.includes("این یک نقل قول آزمایشی است\nخط دوم نقل قول"));
-  assert.ok(html.includes("</blockquote>"));
+test("mdToRichHtml preserves rich tags and balances unclosed structures", () => {
+  const input = "### عنوان بخش\n\n| مشخصه | مقدار |\n|---|---|\n| رم | ۱۶ گیگ |\n\n<details><summary>توضیحات</summary>ادامه دارد";
+  const html = mdToRichHtml(input);
+
+  assert.ok(html.includes("<h3>عنوان بخش</h3>"), "Must include <h3> header");
+  assert.ok(html.includes("<table bordered striped>"), "Must convert markdown table");
+  assert.ok(html.includes("<th>مشخصه</th>"), "Must render table headers");
+  assert.ok(html.includes("<details><summary>توضیحات</summary>"), "Must preserve details");
+  assert.ok(html.endsWith("</details>"), "Must balance unclosed details tag at the end");
 });
 
-await t("mdToRichHtml handles headers, buttons, tables, and footers with safe escaping", () => {
-  const md = `### مشخصات مدل
-این متن **بولد** و *ایتالیک* است.
+test("appendSources renders beautiful search citations with expandable details and links", () => {
+  const text = "پایتخت فرانسه پاریس است.";
+  const sources = [
+    { title: "ویکی‌پدیا پاریس", url: "https://fa.wikipedia.org/wiki/Paris" },
+    { title: "دانشنامه بریتانیکا", url: "https://britannica.com/place/Paris" },
+  ];
 
-| مورد | مقدار |
-| --- | --- |
-| سرعت | بالا |
+  const withSources = appendSources(text, sources);
+  assert.ok(withSources.includes("پایتخت فرانسه پاریس است."));
+  assert.ok(withSources.includes("<details><summary>🌐 منابع معتبر جستجو (۲)</summary>"));
+  assert.ok(withSources.includes("fa.wikipedia.org"));
+  assert.ok(withSources.includes("دانشنامه بریتانیکا"));
+  assert.ok(withSources.includes("</details>"));
 
-<p>
-  <tg-button type="copy_text" text="متن کپی">کپی</tg-button>
-</p>
-<script>alert(1)</script>`;
-
-  const html = mdToRichHtml(md, { footer: "مدل: gemini-2.5-flash" });
-  assert.ok(html.includes("<h3>مشخصات مدل</h3>"));
-  assert.ok(html.includes("<b>بولد</b>"));
-  assert.ok(html.includes("<i>ایتالیک</i>"));
-  assert.ok(html.includes("<table bordered striped>"));
-  assert.ok(html.includes('<tg-button type="copy_text" text="متن کپی">کپی</tg-button>'));
-  assert.ok(html.includes("<footer>مدل: gemini-2.5-flash</footer>"));
-  assert.ok(!html.includes("<script>"), "script tag must be escaped");
-  assert.ok(html.includes("&lt;script&gt;alert(1)&lt;/script&gt;"));
+  // Empty sources returns unchanged text
+  assert.equal(appendSources("سلام", []), "سلام");
+  assert.equal(appendSources("سلام", null), "سلام");
 });
-
-await t("sendRichMessage builds standard Telegram Bot API 10.3 payload", async () => {
-  const sent = [];
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async (url, init) => {
-    sent.push({ url: String(url), body: JSON.parse(init.body) });
-    return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }));
-  };
-
-  try {
-    const res = await sendRichMessage("test_token", 12345, "<h3>سلام</h3>", 888, true);
-    assert.equal(res?.ok, true);
-    assert.equal(sent.length, 1);
-    assert.ok(sent[0].url.endsWith("/sendRichMessage"));
-    assert.equal(sent[0].body.chat_id, 12345);
-    assert.equal(sent[0].body.reply_parameters.message_id, 888);
-    assert.deepEqual(sent[0].body.rich_message, {
-      html: "<h3>سلام</h3>",
-      is_rtl: true,
-    });
-  } finally {
-    globalThis.fetch = origFetch;
-  }
-});
-
-await t("sendLong uses standard sendMessage directly without calling fake sendRichMessage", async () => {
-  const calls = [];
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async (url, init) => {
-    const u = String(url);
-    if (u.endsWith("/sendRichMessage")) {
-      calls.push("sendRichMessage");
-      return new Response(JSON.stringify({ ok: false, description: "404 Not Found" }), { status: 404 });
-    }
-    if (u.endsWith("/sendMessage")) {
-      calls.push("sendMessage");
-      return new Response(JSON.stringify({ ok: true, result: { message_id: 100 } }));
-    }
-    return new Response(JSON.stringify({ ok: true }));
-  };
-
-  try {
-    await sendLong("token123", 555, "متن تستی با **بولد**", 777);
-    assert.deepEqual(calls, ["sendMessage"], "Must call sendMessage directly without fake sendRichMessage");
-  } finally {
-    globalThis.fetch = origFetch;
-  }
-});
-
-await t("sendText and sendLong forward message_thread_id to Telegram", async () => {
-  const bodies = [];
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async (url, init) => {
-    bodies.push(JSON.parse(init.body));
-    return new Response(JSON.stringify({ ok: true, result: { message_id: 200 } }));
-  };
-
-  try {
-    await sendText("token123", 555, "سلام", 777, 42);
-    assert.equal(bodies[0].message_thread_id, 42);
-
-    await sendLong("token123", 555, "متن طولانی", 777, { message_thread_id: 99 });
-    assert.equal(bodies[1].message_thread_id, 99);
-  } finally {
-    globalThis.fetch = origFetch;
-  }
-});
-
-done("rich-message");

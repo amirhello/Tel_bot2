@@ -17,7 +17,7 @@ import {
   editMessageText,
 } from "./telegram.js";
 import { isCommand, isSupportedChat, shouldAnswer } from "./trigger.js";
-import { hasRichFormatting, isRtlText, mdToRichHtml } from "./text.js";
+import { esc, hasRichFormatting, isRtlText, mdToRichHtml, splitRichHtml } from "./text.js";
 import { bumpStats, loadConfig, loadStats, usedToday } from "./store.js";
 import { detectIntent, shouldVoiceReply, speak } from "./voice.js";
 import { extractSearchQuery, searchWeb } from "./search.js";
@@ -307,8 +307,28 @@ function logPipelineTrace(msg, outcome, replyError, trace) {
 /** Append web source citations from search grounding to the reply. */
 export function appendSources(text, sources) {
   if (!Array.isArray(sources) || !sources.length) return text;
-  const lines = sources.map((s) => `• [${s.title}](${s.url})`);
-  return `${text.trim()}\n\n🌐 **منابع سرچ:**\n${lines.join("\n")}`;
+  const base = String(text ?? "").trim();
+  const count = sources.length;
+  const faCount = String(count).replace(/\d/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[d]);
+
+  const items = sources.map((s) => {
+    const title = esc(s.title || "منبع وب");
+    const url = s.url || "#";
+    let domain = "";
+    try {
+      domain = new URL(url).hostname.replace(/^www\./, "");
+    } catch {}
+    const domainBadge = domain ? ` <i>(${domain})</i>` : "";
+    return `• <a href="${url}">${title}</a>${domainBadge}`;
+  });
+
+  const sourcesBlock = [
+    `<details><summary>🌐 منابع معتبر جستجو (${faCount})</summary>`,
+    items.join("\n"),
+    `</details>`,
+  ].join("\n");
+
+  return `${base}\n\n${sourcesBlock}`;
 }
 
 /**
@@ -323,9 +343,20 @@ export async function deliverTextReply(token, chatId, text, replyTo, opts = {}) 
     try {
       const isRtl = isRtlText(text);
       const richHtml = mdToRichHtml(text);
-      const res = await sendRichMessage(token, chatId, richHtml, replyTo, isRtl, threadId);
-      if (res?.ok) {
-        return { kind: "rich_message", tgOut: "rich message delivered (Bot API 10.3)" };
+      const chunks = splitRichHtml(richHtml, 3400);
+      let allDelivered = true;
+      for (const chunk of chunks) {
+        const res = await sendRichMessage(token, chatId, chunk, replyTo, isRtl, threadId);
+        if (!res?.ok) {
+          allDelivered = false;
+          break;
+        }
+      }
+      if (allDelivered && chunks.length > 0) {
+        const desc = chunks.length > 1
+          ? `rich message delivered in ${chunks.length} parts (Bot API 10.3)`
+          : "rich message delivered (Bot API 10.3)";
+        return { kind: "rich_message", tgOut: desc };
       }
     } catch {
       // Degrade gracefully to sendLong

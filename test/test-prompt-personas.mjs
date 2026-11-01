@@ -43,4 +43,14 @@ await t("rude persona has biting sarcasm without direct curse slurs", () => {
   assert.ok(!DEFAULT_PERSONAS.rude.includes("خارکصه"));
 });
 
+await t("BASE_RULES contains Bot API 10.3 rich message guidelines", () => {
+  const prompt = buildSystemPrompt({ mode: "smart", personas: DEFAULT_PERSONAS });
+  assert.ok(prompt.includes("Bot API 10.3"), "must mention Bot API 10.3");
+  assert.ok(prompt.includes("<h3>"), "must guide on <h3>");
+  assert.ok(prompt.includes("<table>"), "must guide on <table>");
+  assert.ok(prompt.includes("<details>"), "must guide on <details>");
+  assert.ok(prompt.includes("<tg-button"), "must guide on <tg-button>");
+  assert.ok(prompt.includes("<footer>"), "must guide on <footer>");
+});
+
 done();
